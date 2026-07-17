@@ -1,15 +1,15 @@
 #include "application/DaveApp.h"
 
 #include <imgui.h>
+#include <nfd.h>
 
 #include <cstdio>
 
 namespace dave::application {
 
 DaveApp::~DaveApp() {
-    // Stop audio before tearing down the graph it references.
     audio_.stop();
-    audio_.setGraph(nullptr);
+    audio_.setCompiledGraph(nullptr);
 }
 
 bool DaveApp::init() {
@@ -19,13 +19,12 @@ bool DaveApp::init() {
     if (!imgui_.init(window_)) {
         return false;
     }
-
-    // Start audio first so the graph is prepared at the right sample rate.
     if (!audio_.start(48000.0, 2)) {
-        std::fprintf(stderr, "Dave: audio engine failed to start; continuing without sound\n");
+        std::fprintf(stderr, "Dave: audio engine failed to start\n");
     }
 
     buildGraph();
+    recompileAndPublish();
 
     window_.setFrameCallback([this] {
         imgui_.newFrame();
@@ -36,47 +35,109 @@ bool DaveApp::init() {
 }
 
 void DaveApp::buildGraph() {
-    // UI thread. Build the RB-0 graph: a single SineNode. Publish to the audio
-    // engine, which prepares it and swaps it in at the next block boundary.
+    // Build the RB-1 graph topology. Node handles are kept for UI edits.
+    clip_ = std::make_shared<engine::AudioClipNode>();
     sine_ = std::make_shared<engine::SineNode>();
-    sine_->setFrequency(440.0);
-    sine_->setGain(0.0); // silent until the user hits Play
+    sine_->setGain(0.0); // off until toggled
+    master_ = std::make_shared<engine::GainNode>();
+    master_->setGain(0.8);
 
-    auto graph = std::make_unique<engine::CompiledGraph>();
-    graph->addNode(sine_);
-    audio_.setGraph(std::move(graph));
+    auto sum = std::make_shared<engine::SummingNode>(2);
+
+    // Register nodes; remember IDs for wiring.
+    auto clipId = graph_.addNode(clip_);
+    auto sineId = graph_.addNode(sine_);
+    auto sumId = graph_.addNode(sum);
+    auto masterId = graph_.addNode(master_);
+
+    // Wire: clip/sine → sum(0,1) → master(0) → out (master is the root).
+    graph_.connect(clipId, 0, sumId, 0);
+    graph_.connect(sineId, 0, sumId, 1);
+    graph_.connect(sumId, 0, masterId, 0);
+}
+
+void DaveApp::recompileAndPublish() {
+    auto [compiled, err] = engine::compile(graph_, audio_.sampleRate(), 256);
+    if (err.has_value()) {
+        std::fprintf(stderr, "Dave: graph compile failed: %s\n", err->message.c_str());
+        return;
+    }
+    audio_.setCompiledGraph(std::move(compiled));
 }
 
 void DaveApp::drawUI() {
-    // A full-viewport docking host. RB-0 just proves the pipeline; real DAW UI
-    // (timeline, mixer) lands in RB-2.
     ImGui::DockSpaceOverViewport();
-
     ImGui::Begin("Dave");
-    ImGui::TextUnformatted("Dave — D.A.V.E. (Digital Audio & Video Environment)");
-    ImGui::TextDisabled("RB-0: permissive-stack skeleton");
+
+    ImGui::TextUnformatted("Dave — D.A.V.E.");
+    ImGui::TextDisabled("RB-1: graph engine + WAV playback");
     ImGui::Separator();
 
-    if (audio_.isRunning()) {
-        ImGui::Text("Audio: running @ %.0f Hz", audio_.sampleRate());
-    } else {
-        ImGui::TextDisabled("Audio: not running");
+    // --- Transport bar -----------------------------------------------------
+    auto& transport = audio_.transport();
+    if (ImGui::Button(transport.isPlaying() ? "Stop" : "Play")) {
+        transport.toggle();
     }
+    ImGui::SameLine();
+    ImGui::Text("Pos: %lld", static_cast<long long>(transport.position()));
+    ImGui::Separator();
 
-    ImGui::Spacing();
-    const char* label = playing_ ? "Stop" : "Play 440 Hz";
-    if (ImGui::Button(label, ImVec2(180, 0))) {
-        playing_ = !playing_;
+    // --- File loading ------------------------------------------------------
+    if (ImGui::Button("Load WAV...")) {
+        openFileDialog();
+    }
+    if (!loadedFileName_.empty()) {
+        ImGui::Text("Loaded: %s (%.1fs, %d ch)",
+                    loadedFileName_.c_str(), loadedFileSeconds_,
+                    clip_ ? clip_->numChannels() : 0);
+    } else {
+        ImGui::TextDisabled("(no file loaded)");
+    }
+    ImGui::Separator();
+
+    // --- Sine toggle -------------------------------------------------------
+    if (ImGui::Checkbox("440 Hz tone", &sineOn_)) {
         if (sine_) {
-            // UI-thread parameter edit -> RT-safe atomic store in SineNode.
-            sine_->setGain(playing_ ? 0.2 : 0.0);
+            sine_->setGain(sineOn_ ? 0.15 : 0.0);
+        }
+    }
+    ImGui::Separator();
+
+    // --- Master gain -------------------------------------------------------
+    // ImGui dropped SliderDouble; use SliderFloat and widen to double for the node.
+    float g = static_cast<float>(master_ ? master_->gain() : 0.8);
+    if (ImGui::SliderFloat("Master", &g, 0.0f, 1.5f)) {
+        if (master_) {
+            master_->setGain(static_cast<double>(g));
         }
     }
 
     ImGui::Separator();
-    ImGui::TextDisabled("Stack: miniaudio + Dear ImGui + OpenGL (GLFW). Our own RT graph.");
+    ImGui::TextDisabled("Stack: miniaudio + ImGui + our RT graph (DAG, topo-sorted)");
 
     ImGui::End();
+}
+
+void DaveApp::openFileDialog() {
+    // Native file dialog via nativefiledialog-extended (MIT). Single-select.
+    nfdnchar_t* outPath = nullptr;
+    nfdnfilteritem_t filter{"WAV audio", "wav"};
+    nfdresult_t result = NFD_OpenDialog(&outPath, &filter, 1, nullptr);
+    if (result != NFD_OKAY || outPath == nullptr) {
+        return;
+    }
+    std::string path = outPath;
+    NFD_FreePath(outPath);
+
+    if (clip_ && clip_->loadFromFile(path)) {
+        auto slash = path.find_last_of("/\\");
+        loadedFileName_ = (slash != std::string::npos) ? path.substr(slash + 1) : path;
+        loadedFileSeconds_ = clip_->lengthSamples() / clip_->sampleRate();
+        clip_->setStart(0);
+        audio_.transport().seek(0);
+        std::fprintf(stderr, "Dave: loaded %s (%.1fs)\n",
+                     loadedFileName_.c_str(), loadedFileSeconds_);
+    }
 }
 
 void DaveApp::run() {

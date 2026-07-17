@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.25...4.0)
 project(Dave
     VERSION 0.1.0
     DESCRIPTION "D.A.V.E. — Digital Audio & Video Environment"
-    LANGUAGES C CXX)
+    LANGUAGES C CXX OBJC)  # OBJC needed for nativefiledialog's macOS panels
 
 # ─── Build config ───────────────────────────────────────────────────────────
 set(CMAKE_CXX_STANDARD 20)
@@ -48,6 +48,10 @@ target_include_directories(imgui PUBLIC
     "${THIRD_PARTY}/imgui/backends")
 target_link_libraries(imgui PUBLIC glfw)
 
+# ─── nativefiledialog-extended (file open/save dialogs) ─────────────────────
+set(NFD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+add_subdirectory("${THIRD_PARTY}/nfd" "${CMAKE_BINARY_DIR}/nfd" EXCLUDE_FROM_ALL)
+
 # ─── Dave application ───────────────────────────────────────────────────────
 file(GLOB_RECURSE DAVE_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
@@ -57,22 +61,26 @@ add_executable(Dave ${DAVE_SOURCES})
 
 target_include_directories(Dave PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
-    "${THIRD_PARTY}/miniaudio")
+    "${THIRD_PARTY}/miniaudio")  # miniaudio.h + dr_wav.h live here
 
 target_link_libraries(Dave PRIVATE
     imgui
     glfw
-    glad)
+    glad
+    nfd)
 
 if(APPLE)
     # miniaudio uses CoreAudio/AudioToolbox; OpenGL is the system framework
-    # (deprecated by Apple but functional for our ImGui backend).
+    # (deprecated by Apple but functional for our ImGui backend); NFD uses
+    # AppKit for the native open/save panels.
     find_library(COREAUDIO_LIB CoreAudio REQUIRED)
     find_library(AUDIOTOOLBOX_LIB AudioToolbox REQUIRED)
     find_library(COREFOUNDATION_LIB CoreFoundation REQUIRED)
     find_library(OPENGL_LIB OpenGL REQUIRED)
+    find_library(APPKIT_LIB AppKit REQUIRED)
     target_link_libraries(Dave PRIVATE
-        ${COREAUDIO_LIB} ${AUDIOTOOLBOX_LIB} ${COREFOUNDATION_LIB} ${OPENGL_LIB})
+        ${COREAUDIO_LIB} ${AUDIOTOOLBOX_LIB} ${COREFOUNDATION_LIB}
+        ${OPENGL_LIB} ${APPKIT_LIB})
 endif()
 
 if(WIN32)

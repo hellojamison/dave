@@ -1,53 +1,71 @@
 #pragma once
 
+#include "engine/graph/Types.h"
+
 #include <cstdint>
+#include <string>
 
 namespace dave::engine {
 
-// Forward declarations — fleshed out in later phases.
-struct TimeInfo {
-    double sampleRate = 44100.0;
-    int64_t samplePos = 0;
-    double bpm = 120.0;
-    double ppqPosition = 0.0;
-    bool isPlaying = false;
-    bool isRecording = false;
-    // numSamples lives on ProcessContext, not here.
-};
-
-// ProcessContext is everything a Node sees each block.
-// All buffers are pre-allocated by the host in prepareToPlay — the RT thread
-// must never allocate. See docs/architecture.md §Threading model.
-struct ProcessContext {
+// NodeProcessContext is what a Node sees each block. All buffers are
+// pre-allocated by CompiledGraph — process() must never allocate.
+//
+// `inputs` is indexed by input pin: inputs[pinIndex] is the AudioBus for that
+// pin (already summed across all edges feeding it). `output` is this node's
+// own output bus, pre-zeroed; the node writes (or adds) into it.
+struct NodeProcessContext {
     int numSamples = 0;
-    double sampleRate = 44100.0;
-    const float* const* inChannels = nullptr;  // read-only input
-    float* const* outChannels = nullptr;       // write output
-    int numInChannels = 0;
-    int numOutChannels = 0;
+    double sampleRate = 48000.0;
     const TimeInfo* time = nullptr;
+    // Per-pin input buses. For a generator (no inputs) this is empty.
+    const AudioBus* inputs = nullptr;
+    int numInputs = 0;
+    // This node's output. Pre-zeroed by the host before process() is called.
+    AudioBus output;
 };
 
-// Node is the base DSP unit. Every node implements prepare/process/release.
-// process() runs on the RT audio thread and must obey the RT iron rules.
+// Node is the base DSP unit. A node declares how many input/output pins it has
+// (each pin is a stereo bus for RB-1) and implements process(). It does NOT
+// know its sources or destinations — routing is the Graph's job, expressed as
+// edges between pins. This keeps nodes unit-testable and the graph
+// serializable.
+//
+// Threading: prepare()/release() and any setters run on the UI thread.
+// process() runs on the RT audio thread and must obey the RT iron rules:
+// no allocation, no locks, no syscalls.
 class Node {
 public:
     virtual ~Node() = default;
 
-    // Called on the UI/message thread before processing starts (or when the
-    // graph is recompiled). Allocate here, never in process().
-    virtual void prepare(double sampleRate, int maxBlock) = 0;
-
-    // Called on the RT thread for every block. RT-safe only.
-    virtual void process(ProcessContext& ctx) = 0;
+    // Called on the UI thread before the graph goes live (or when the sample
+    // rate / max block changes). Allocate per-node state here.
+    virtual void prepare(double sampleRate, int maxBlock) {}
 
     // Called on the UI thread when the node leaves the active graph.
-    virtual void release() = 0;
+    virtual void release() {}
 
-    // Number of audio input/output channels this node exposes. Fixed at
-    // compile time so the host can pre-wire buffers.
-    virtual int numInputs() const { return 0; }
-    virtual int numOutputs() const { return 0; }
+    // --- Pin topology (fixed for the node's lifetime) ----------------------
+    // Number of input pins (each is a stereo bus for RB-1). Generators return 0.
+    virtual int numInputPins() const { return 0; }
+    // Number of output pins. Most nodes have 1.
+    virtual int numOutputPins() const { return 1; }
+    // Channels per pin. RB-1 fixes this at 2 (stereo); overridable for mono
+    // sources / surround later.
+    virtual int channelsPerPin() const { return 2; }
+
+    // --- RT processing -----------------------------------------------------
+    // Called on the RT thread for every block. Read from ctx.inputs, write into
+    // ctx.output. RT-safe only.
+    virtual void process(NodeProcessContext& ctx) = 0;
+
+    // Stable identifier for serialization. Subclasses set this in their ctor.
+    const std::string& typeName() const { return typeName_; }
+
+protected:
+    explicit Node(std::string typeName) : typeName_(std::move(typeName)) {}
+
+private:
+    std::string typeName_;
 };
 
 } // namespace dave::engine

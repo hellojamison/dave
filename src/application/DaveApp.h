@@ -1,25 +1,30 @@
 #pragma once
 
-#include "engine/graph/Graph.h"
-#include "engine/nodes/AudioClipNode.h"
-#include "engine/nodes/GainNode.h"
-#include "engine/nodes/SineNode.h"
-#include "engine/nodes/SummingNode.h"
+#include "document/Edit.h"
+#include "editing/Command.h"
+#include "engine/GraphBuilder.h"
+#include "engine/transport/Transport.h"
 #include "gui/ImGuiLayer.h"
+#include "gui/Timeline.h"
 #include "platform/AudioEngine.h"
 #include "platform/Window.h"
 
-#include <memory>
-#include <string>
-
 namespace dave::application {
 
-// DaveApp is the application root. RB-1 builds a real (if tiny) signal graph:
-//   [AudioClipNode]──┐
-//   [SineNode]───────┼──►[SummingNode]──►[GainNode(master)]──► out
+// DaveApp is the application root for RB-2.
 //
-// The UI lets you load a WAV, toggle the sine, play/stop transport, and set
-// master gain. This proves real audio playback through our own graph engine.
+// Architecture (single source of truth):
+//   document::Edit  ── the source of truth (tracks/clips/assets)
+//        │ setChangeListener → rebuild + recompile + publish
+//        ▼
+//   GraphBuilder.build(edit) → engine::Graph → compile() → CompiledGraph
+//        │ atomic publish
+//        ▼
+//   AudioEngine (RT)  ←── Transport advances each block
+//
+// The UI edits the Edit via Commands (UndoStack). Every Edit mutation fires
+// notifyChanged(), which re-derives the graph. The Timeline widget reads the
+// Edit directly (pure view).
 class DaveApp {
 public:
     DaveApp() = default;
@@ -29,26 +34,20 @@ public:
     void run();
 
 private:
-    void buildGraph();
-    void recompileAndPublish();
+    void onEditChanged();           // re-derive + recompile + publish
+    void loadWavIntoEdit(const std::string& path);
     void drawUI();
-    void openFileDialog();
 
-    platform::Window window_{960, 600, "Dave"};
+    platform::Window window_{1100, 700, "Dave"};
     gui::ImGuiLayer imgui_;
     platform::AudioEngine audio_;
 
-    // The mutable graph (UI-thread) and shared node handles for param edits.
-    engine::Graph graph_;
-    std::shared_ptr<engine::AudioClipNode> clip_;
-    std::shared_ptr<engine::SineNode> sine_;
-    std::shared_ptr<engine::GainNode> master_;
+    document::Edit edit_;
+    editing::UndoStack undo_{edit_};
+    engine::GraphBuilder builder_;
 
-    // Loaded file info for display.
-    std::string loadedFileName_;
-    double loadedFileSeconds_ = 0.0;
-
-    bool sineOn_ = false;
+    gui::PeakCache peaks_;
+    gui::TimelineViewState view_;
 };
 
 } // namespace dave::application

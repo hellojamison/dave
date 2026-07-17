@@ -40,7 +40,8 @@ bool AudioClipNode::loadFromFile(const std::string& path) {
         }
     }
 
-    buffer_ = std::move(deinterleaved);
+    ownedBuffer_ = std::move(deinterleaved);
+    buffer_ = &ownedBuffer_;
     sourceSampleRate_ = static_cast<double>(wav.sampleRate);
     return true;
 }

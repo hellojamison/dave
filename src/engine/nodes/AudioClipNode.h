@@ -34,12 +34,33 @@ public:
     // The path is opened with dr_wav; decoded into per-channel float vectors.
     bool loadFromFile(const std::string& path);
 
-    // Place the clip at this timeline position (samples).
+    // Set the decoded buffer directly (used by GraphBuilder, which caches
+    // decoded assets). Copies the buffer reference (no decode). The caller
+    // must keep `buffer` alive for the node's lifetime.
+    void setBuffer(const std::vector<std::vector<float>>& buffer, double sampleRate) {
+        buffer_ = &buffer;
+        sourceSampleRate_ = sampleRate;
+    }
+
+    // Clip placement on the timeline (samples).
     void setStart(int64_t timelineSample) { clipStart_.store(timelineSample, std::memory_order_relaxed); }
     int64_t start() const { return clipStart_.load(std::memory_order_relaxed); }
 
-    int64_t lengthSamples() const { return buffer_.empty() ? 0 : static_cast<int64_t>(buffer_[0].size()); }
-    int numChannels() const { return static_cast<int>(buffer_.size()); }
+    // Where in the source file to start reading (samples). Default 0.
+    void setSourceOffset(int64_t offset) { sourceOffset_ = offset; }
+
+    // How many samples to play. 0 = play the whole buffer from sourceOffset.
+    void setLength(int64_t length) { length_ = length; }
+
+    // Fade in/out lengths (samples).
+    void setFades(int64_t fadeIn, int64_t fadeOut) { fadeIn_ = fadeIn; fadeOut_ = fadeOut; }
+
+    int64_t lengthSamples() const {
+        if (buffer_ == nullptr || buffer_->empty()) return 0;
+        int64_t bufLen = static_cast<int64_t>((*buffer_)[0].size()) - sourceOffset_;
+        return length_ > 0 ? std::min(length_, bufLen) : bufLen;
+    }
+    int numChannels() const { return buffer_ ? static_cast<int>(buffer_->size()) : 0; }
     double sampleRate() const { return sourceSampleRate_; }
 
     void prepare(double /*sampleRate*/, int /*maxBlock*/) override {}
@@ -48,52 +69,52 @@ public:
     void process(NodeProcessContext& ctx) override {
         const int n = ctx.numSamples;
         const int outChans = ctx.output.numChannels;
-        if (buffer_.empty()) {
-            return; // nothing loaded; output stays zero (host pre-zeroes)
+        if (buffer_ == nullptr || buffer_->empty()) {
+            return;
         }
-
         const int64_t clipStart = clipStart_.load(std::memory_order_relaxed);
         const int64_t pos = ctx.time ? ctx.time->samplePos : 0;
         const bool playing = ctx.time ? ctx.time->isPlaying : false;
-        if (!playing) {
-            return;
-        }
+        if (!playing) return;
 
-        const int64_t clipEnd = clipStart + lengthSamples();
+        const int64_t len = lengthSamples();
+        const int64_t clipEnd = clipStart + len;
+        const int inChans = static_cast<int>(buffer_->size());
+        const int64_t bufLen = static_cast<int64_t>((*buffer_)[0].size());
 
         for (int i = 0; i < n; ++i) {
             int64_t timelineSample = pos + i;
-            if (timelineSample < clipStart || timelineSample >= clipEnd) {
-                continue; // outside clip; leave output zero
-            }
-            int64_t bufIdx = timelineSample - clipStart;
-            // Linear fade in/out over the first/last fadeSamples_ samples.
+            if (timelineSample < clipStart || timelineSample >= clipEnd) continue;
+            int64_t bufIdx = sourceOffset_ + (timelineSample - clipStart);
+            if (bufIdx < 0 || bufIdx >= bufLen) continue;
+
+            // Linear fade in/out.
+            int64_t intoClip = timelineSample - clipStart;
             float fadeGain = 1.0f;
-            if (bufIdx < fadeSamples_) {
-                fadeGain = static_cast<float>(bufIdx) / static_cast<float>(fadeSamples_);
-            } else if (bufIdx >= lengthSamples() - fadeSamples_) {
-                int64_t intoTail = lengthSamples() - 1 - bufIdx;
-                fadeGain = static_cast<float>(intoTail) / static_cast<float>(fadeSamples_);
+            if (fadeIn_ > 0 && intoClip < fadeIn_) {
+                fadeGain = static_cast<float>(intoClip) / static_cast<float>(fadeIn_);
+            } else if (fadeOut_ > 0 && intoClip >= len - fadeOut_) {
+                int64_t intoTail = len - 1 - intoClip;
+                fadeGain = static_cast<float>(intoTail) / static_cast<float>(fadeOut_);
             }
-            const int inChans = static_cast<int>(buffer_.size());
             for (int c = 0; c < outChans; ++c) {
-                // If the source has fewer channels than output, duplicate
-                // (mono→stereo) or drop (surround→stereo) as needed.
                 int srcC = (inChans == 1) ? 0 : std::min(c, inChans - 1);
-                ctx.output.channels[c][i] = buffer_[srcC][bufIdx] * fadeGain;
+                ctx.output.channels[c][i] = (*buffer_)[srcC][bufIdx] * fadeGain;
             }
         }
     }
 
 private:
-    // Decoded source: one vector per channel (deinterleaved). Loaded on UI
-    // thread; read-only from RT thread after load completes. A swap-then-
-    // release pattern (replace buffer_ atomically) would be safer for
-    // concurrent reload; RB-1 loads once before the graph runs.
-    std::vector<std::vector<float>> buffer_;
+    // Borrowed pointer to a decoded asset buffer (GraphBuilder owns the cache).
+    // For the loadFromFile() path we own `ownedBuffer_` and point buffer_ at it.
+    const std::vector<std::vector<float>>* buffer_ = nullptr;
+    std::vector<std::vector<float>> ownedBuffer_;
     double sourceSampleRate_ = 48000.0;
     std::atomic<int64_t> clipStart_{0};
-    int64_t fadeSamples_ = 64; // ~1.3ms at 48k
+    int64_t sourceOffset_ = 0;
+    int64_t length_ = 0;
+    int64_t fadeIn_ = 64;
+    int64_t fadeOut_ = 64;
 };
 
 } // namespace dave::engine

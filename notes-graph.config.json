@@ -1,0 +1,20 @@
+{
+  "appName": "Dave",
+  "vaultDir": "Project Notes",
+  "scriptName": "project-notes",
+  "appRel": "Apps/Dave.md",
+  "kitVersion": "0.2.13",
+  "routes": [
+    {
+      "id": "notes-graph-maintenance",
+      "processRel": "Processes/Notes Graph Maintenance.md",
+      "aliases": [
+        "notes",
+        "obsidian",
+        "graph",
+        "vault",
+        "notes graph"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+# Build output
+/build/
+/build-*/
+/out/
+/DerivedData/
+/CMakeFiles/
+/CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.o
+*.obj
+
+# IDE / editor
+.vscode/
+.idea/
+*.xcuserstate
+*.xcworkspace/xcuserdata/
+.xcodeproj/xcuserdata/
+.cache/
+*.swp
+.DS_Store
+
+# Dependencies (vendored via submodules)
+/third_party/*/  !empty
+
+# Project-local cache (content-addressed, rebuildable)
+**/cache/peaks/
+**/cache/thumbs/
+**/cache/render/
+
+# Node (notes-graph-kit)
+node_modules/
+
+# OS junk
+Thumbs.db

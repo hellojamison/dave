@@ -1,0 +1,14 @@
+{
+  "name": "dave",
+  "private": true,
+  "scripts": {
+    "notes": "node scripts/project-notes.cjs",
+    "notes:route": "node scripts/project-notes.cjs route",
+    "notes:new": "node scripts/project-notes.cjs new",
+    "notes:closeout": "node scripts/project-notes.cjs closeout",
+    "notes:validate": "node scripts/validate-project-notes-graph.cjs"
+  },
+  "dependencies": {
+    "js-yaml": "^4.1.0"
+  }
+}

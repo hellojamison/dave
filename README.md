@@ -27,15 +27,20 @@ system, free node-graph routing, and VST3 / AU / CLAP plugin hosting.
 
 ## Foundation
 
-- [JUCE 8](https://github.com/juce-framework/JUCE) — cross-platform audio I/O,
-  plugin hosting, GUI.
-- [Tracktion Engine](https://github.com/Tracktion/tracktion_engine) — DAW
-  primitives (tracks, clips, transport, automation).
-- [FFmpeg](https://ffmpeg.org/) — video decode/encode.
-- [CLAP](https://github.com/free-audio/clap) via
-  [clap-juce-extensions](https://github.com/free-audio/clap-juce-extensions) —
-  modern plugin format.
-- [Rubber Band](https://github.com/breakfastquay/rubberband) — time/pitch.
+Built on a **permissively-licensed** stack so the project stays dual-licensable
+(GPL-3.0+ now, with a commercial option preserved). See
+[`docs/rebuild-plan-permissive.md`](docs/rebuild-plan-permissive.md) for the
+rationale and full dependency matrix.
+
+- [miniaudio](https://github.com/mackron/miniaudio) — cross-platform audio I/O.
+- [PortMidi](https://github.com/PortMidi/portmidi) — MIDI I/O.
+- [Dear ImGui](https://github.com/ocornut/imgui) (docking branch) + OpenGL — GUI.
+- **Our own** real-time node-graph engine and plugin host.
+- [VST3 SDK](https://github.com/steinbergmedia/vst3sdk) (MIT, Oct 2025) +
+  [CLAP](https://github.com/free-audio/clap) (MIT) + Audio Unit (platform SDK) — plugin hosting.
+- [Signalsmith Stretch](https://github.com/Signalsmith-Audio/signalsmith-stretch) — time/pitch.
+- [dr_libs](https://github.com/mackron/dr_libs) + libFLAC — audio formats.
+- [FFmpeg](https://ffmpeg.org/) (LGPL build) + OpenH264 — video.
 - [DAWproject](https://github.com/bitwig/dawproject) — open interchange format.
 
 ## Build

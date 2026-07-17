@@ -31,5 +31,14 @@ Makefile
 # Node (notes-graph-kit)
 node_modules/
 
+# ImGui runtime layout (regenerated per launch)
+imgui.ini
+
+# Agent tooling local state (never commit)
+.claude/
+.codex/
+.cursor/
+.zcode/
+
 # OS junk
 Thumbs.db

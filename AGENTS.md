@@ -6,9 +6,11 @@ focus: full video NLE, a first-class marker system, free node-graph routing, and
 VST3 / AU / CLAP plugin hosting. GPL-3.0-or-later. See `README.md` for the full
 goals and roadmap.
 
-**Status: Phase 0 — Skeleton.** Not yet functional. The app launches, opens an
-audio device, and renders a sine node through our own RT graph to prove the
-threading contract. Tracks, clips, plugins, video, and markers do not exist yet.
+**Status: RB-0 — Permissive skeleton (in progress).** Rebuilding on a
+permissive-licensed stack (miniaudio + ImGui + our own graph/host) to keep the
+commercial licensing option open. The JUCE-based Phase 0 is superseded; our
+`Node`/`CompiledGraph`/`SineNode` survive into RB-0. See
+`docs/rebuild-plan-permissive.md`.
 
 Toolchain: CMake ≥ 3.25, C++20, Apple Clang 15+ (Xcode 16+) on macOS, MSVC 2022
 on Windows. This repo was created on an Apple Silicon Mac.
@@ -25,9 +27,10 @@ on Windows. This repo was created on an Apple Silicon Mac.
   - `src/editing/` — command pattern, transactions, undo journal.
   - `src/application/` — app, transport, view-models, commands.
   - `src/gui/` — JUCE Components, theming, OpenGL.
-- `third_party/` — git submodules (JUCE, tracktion_engine, clap,
-  clap-juce-extensions, rubberband). FFmpeg is linked system/prebuilt, not
-  vendored as source. Not yet populated in Phase 0.
+- `third_party/` — git submodules: miniaudio, imgui (docking branch), PortMidi,
+  implot, imgui-node-editor, signalsmith-stretch, dr_libs, nlohmann_json,
+  Catch2, vst3sdk, clap, Crashpad. FFmpeg/OpenH264 linked as system/dynamic
+  libs, not vendored as source. Populated during RB-0.
 - `tests/` — Catch2 unit tests + headless engine harness (not yet present).
 - `packaging/` — macOS .app bundle + notarization, Windows installer (later).
 - `docs/` — `architecture.md` (the full design), contributing guide.
@@ -35,11 +38,10 @@ on Windows. This repo was created on an Apple Silicon Mac.
 
 ## Commands
 
-- Configure (first run is slow — fetches/builds JUCE + Tracktion):
-  `cmake -B build -DCMAKE_BUILD_TYPE=Debug`
+- Configure: `cmake -B build -DCMAKE_BUILD_TYPE=Debug`
 - Build: `cmake --build build`
-- Run (macOS): `open build/Dave.app` or `./build/Dave.app/Contents/MacOS/Dave`
-- Test: `ctest --test-dir build` (no tests yet in Phase 0)
+- Run (macOS): `./build/Dave` (or the .app bundle once packaging lands)
+- Test: `ctest --test-dir build`
 - Notes (after notes-graph-kit install):
   - `npm run notes:route -- "<task>"`
   - `npm run notes:new -- --title "<title>" --process <alias> --summary "<goal>"`
@@ -57,18 +59,25 @@ on Windows. This repo was created on an Apple Silicon Mac.
 
 ## Hard rules and gotchas
 
-- **License hygiene: GPL-3.0-or-later core.** Do not link GPL-2-only libraries
-  (incompatible). LGPL-2.1+ and permissive (MIT/BSD/Apache/ISC) are fine.
-  FFmpeg must be linked as shared LGPL libraries; GPL-enabled FFmpeg components
-  (libx264/libx265/libfdk_aac) require the whole app to stay GPL-compatible —
-  it does, but flag any dependency that would force a conflict.
-- **ASIO is opt-in and dynamically loaded**, never statically linked — the
-  Steinberg SDK license is not GPL-clean. Keep it behind a runtime dlopen.
+- **License hygiene: permissive-only.** Dave is built to be dual-licensed
+  (GPL-3.0+ now, closed/commercial option preserved for later). Therefore
+  **every dependency must be MIT/BSD/Apache/ISC or LGPL (dynamic-link only)**.
+  GPL/AGPL dependencies are FORBIDDEN — they can never be relicensed and would
+  kill the commercial option permanently. Before adding ANY dependency, verify
+  its SPDX license. See `docs/architecture.md` §Foundational decision and
+  `docs/rebuild-plan-permissive.md`.
+- **Do NOT add JUCE or Tracktion Engine.** Both are GPL-family and were rejected
+  for the licensing reason above, despite being the obvious technical choice.
+  Do not "just use JUCE for X" — it's not an option here.
 - **Do not embed or link openDAW code.** openDAW (AGPL-3.0) is architectural
-  inspiration only. No code, no fork, no shared format. We borrow ideas, not
-  source. This is a hard licensing boundary.
+  inspiration only. No code, no fork, no shared format. We borrow ideas, not source.
 - **openDAW the project is unrelated to Dave.** Do not confuse them; the names
   are similar but the projects are independent.
+- **VST3 SDK is MIT as of October 2025** (Steinberg relicensed) — no fee, no
+  signed agreement. CLAP is MIT. Audio Unit is a platform SDK (link, don't
+  redistribute). All three are hostable in a permissively-licensed app.
+- **FFmpeg must be an LGPL-only build** (no `--enable-gpl`, no libx264/libx265).
+  H.264/H.265 encode uses OpenH264 (BSD) instead. Dynamic-link FFmpeg.
 - **Never allocate on the RT thread.** Pre-allocate all buffers in
   `prepareToPlay`. Use lock-free SPSC queues for UI↔RT communication.
 - The text-based `project.json` document format is intentional for VCS-friendliness

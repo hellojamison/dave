@@ -112,9 +112,10 @@ if(APPLE)
     find_library(COREFOUNDATION_LIB CoreFoundation REQUIRED)
     find_library(OPENGL_LIB OpenGL REQUIRED)
     find_library(APPKIT_LIB AppKit REQUIRED)
+    find_library(FOUNDATION_LIB Foundation REQUIRED)
     target_link_libraries(Dave PRIVATE
         ${COREAUDIO_LIB} ${AUDIOTOOLBOX_LIB} ${COREFOUNDATION_LIB}
-        ${OPENGL_LIB} ${APPKIT_LIB})
+        ${OPENGL_LIB} ${APPKIT_LIB} ${FOUNDATION_LIB})
 endif()
 
 if(WIN32)
@@ -128,3 +129,20 @@ target_compile_definitions(Dave PRIVATE
 # Dave is dual-licensed (GPL-3.0+ now, commercial option preserved). All deps
 # above are permissive (MIT/Zlib/Unlicense/public domain). Do NOT add GPL/AGPL
 # deps (JUCE, Tracktion, etc.) — see docs/architecture.md.
+
+# ─── Test: plugin host end-to-end (sine through a VST3, measure output) ─────
+add_executable(plugin_test tools/plugin_test.cpp
+    src/engine/plugins/PluginHost.cpp
+    src/engine/plugins/PluginInstance.cpp)
+target_include_directories(plugin_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(plugin_test PRIVATE base pluginterfaces sdk sdk_common sdk_hosting)
+if(APPLE)
+    target_sources(plugin_test PRIVATE
+        "${THIRD_PARTY}/vst3sdk/public.sdk/source/vst/hosting/module_mac.mm")
+    set_source_files_properties(
+        "${THIRD_PARTY}/vst3sdk/public.sdk/source/vst/hosting/module_mac.mm" PROPERTIES
+        COMPILE_FLAGS "-fobjc-arc")
+    find_library(CF_LIB CoreFoundation REQUIRED)
+    find_library(FOUNDATION_LIB Foundation REQUIRED)
+    target_link_libraries(plugin_test PRIVATE ${CF_LIB} ${FOUNDATION_LIB})
+endif()

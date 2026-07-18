@@ -90,10 +90,29 @@ bool PluginInstance::load(const PluginDescriptor& desc, double sampleRate, int m
         }
     }
 
-    // 6) Prepare the HostProcessData (sets up bus buffers per the component's
-    //    declared audio buses). We pass maxBlock; the helper allocates buffers.
+    // 6) Activate only the main audio buses (bus 0 in/out). Plugins with extra
+    //    buses (sidechain, aux) need those deactivated, or their unwired
+    //    buffers can crash process(). This is the standard host behavior.
+    int nIn = p_->component->getBusCount(MediaTypes::kAudio, BusDirections::kInput);
+    for (int i = 0; i < nIn; ++i) {
+        p_->component->activateBus(MediaTypes::kAudio, BusDirections::kInput, i,
+                                    (i == 0) ? 1 : 0);
+    }
+    int nOut = p_->component->getBusCount(MediaTypes::kAudio, BusDirections::kOutput);
+    for (int i = 0; i < nOut; ++i) {
+        p_->component->activateBus(MediaTypes::kAudio, BusDirections::kOutput, i,
+                                    (i == 0) ? 1 : 0);
+    }
+
+    // 7) Prepare the HostProcessData. We pass bufferSamples=0 so the helper
+    //    sets up the bus/channel arrays BUT does NOT allocate its own sample
+    //    buffers (channelBufferOwner stays false). That lets our setChannelBuffers
+    //    calls in process() redirect the channel pointers to OUR buffers each
+    //    block. If we passed maxBlock here, the helper would own the buffers and
+    //    silently ignore setChannelBuffers (returning false) — which is exactly
+    //    the bug that produced silent plugin output.
     p_->processData = std::make_unique<HostProcessData>();
-    if (!p_->processData->prepare(*p_->component, maxBlock, kSample32)) {
+    if (!p_->processData->prepare(*p_->component, 0, kSample32)) {
         lastError_ = "HostProcessData::prepare failed";
         unload();
         return false;
@@ -126,10 +145,10 @@ bool PluginInstance::load(const PluginDescriptor& desc, double sampleRate, int m
     }
 
     loaded_ = true;
-    int nIn = p_->component->getBusCount(MediaTypes::kAudio, BusDirections::kInput);
-    int nOut = p_->component->getBusCount(MediaTypes::kAudio, BusDirections::kOutput);
+    int logNIn = p_->component->getBusCount(MediaTypes::kAudio, BusDirections::kInput);
+    int logNOut = p_->component->getBusCount(MediaTypes::kAudio, BusDirections::kOutput);
     std::fprintf(stderr, "Dave[plugins]: loaded '%s' (sr=%.0f block=%d buses in=%d out=%d)\n",
-                 name_.c_str(), sampleRate, maxBlock, nIn, nOut);
+                 name_.c_str(), sampleRate, maxBlock, logNIn, logNOut);
     return true;
 }
 
@@ -143,7 +162,7 @@ void PluginInstance::prepare(double sampleRate, int maxBlock) {
     p_->sampleRate = sampleRate;
     p_->maxBlock = maxBlock;
     p_->processData->unprepare();
-    p_->processData->prepare(*p_->component, maxBlock, kSample32);
+    p_->processData->prepare(*p_->component, 0, kSample32); // 0 = don't own buffers
 
     ProcessSetup setup{kRealtime, kSample32, maxBlock, sampleRate};
     if (p_->processor) p_->processor->setupProcessing(setup);

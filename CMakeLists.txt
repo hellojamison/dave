@@ -52,6 +52,18 @@ target_link_libraries(imgui PUBLIC glfw)
 set(NFD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 add_subdirectory("${THIRD_PARTY}/nfd" "${CMAKE_BINARY_DIR}/nfd" EXCLUDE_FROM_ALL)
 
+# ─── VST3 SDK (plugin HOSTING; MIT since Oct 2025) ──────────────────────────
+# We only need the hosting side (we don't build plugins), so disable plugin
+# examples + VSTGUI (which needs the vstgui4 submodule we didn't init).
+set(SMTG_ENABLE_VST3_PLUGIN_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(SMTG_ENABLE_VST3_HOSTING_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(SMTG_ENABLE_VSTGUI_SUPPORT OFF CACHE BOOL "" FORCE)
+set(SMTG_ENABLE_AUV2_BUILDS OFF CACHE BOOL "" FORCE)
+add_subdirectory("${THIRD_PARTY}/vst3sdk" "${CMAKE_BINARY_DIR}/vst3sdk" EXCLUDE_FROM_ALL)
+# The SDK creates targets: base, pluginterfaces, sdk, sdk_hosting (and
+# sdk_common). We link the hosting-side ones into Dave.
+# On macOS the hosting module loader (module_mac.mm) needs ARC + CoreFoundation.
+
 # ─── Dave application ───────────────────────────────────────────────────────
 file(GLOB_RECURSE DAVE_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
@@ -63,11 +75,33 @@ target_include_directories(Dave PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
     "${THIRD_PARTY}/miniaudio")  # miniaudio.h + dr_wav.h live here
 
+# The VST3 platform module loader (module_mac.mm / module_linux.cpp /
+# module_win32.cpp) is NOT part of the sdk_hosting library — each host app
+# compiles it directly (see the SDK's audiohost/validator samples). It loads
+# .vst3 bundles via dlopen and needs ARC on macOS.
+if(APPLE)
+    target_sources(Dave PRIVATE
+        "${THIRD_PARTY}/vst3sdk/public.sdk/source/vst/hosting/module_mac.mm")
+    set_source_files_properties(
+        "${THIRD_PARTY}/vst3sdk/public.sdk/source/vst/hosting/module_mac.mm" PROPERTIES
+        COMPILE_FLAGS "-fobjc-arc")
+elseif(WIN32)
+    target_sources(Dave PRIVATE
+        "${THIRD_PARTY}/vst3sdk/public.sdk/source/vst/hosting/module_win32.cpp")
+endif()
+
 target_link_libraries(Dave PRIVATE
     imgui
     glfw
     glad
-    nfd)
+    nfd
+    # VST3 hosting (plugin host). These targets come from the vst3sdk
+    # add_subdirectory above.
+    base
+    pluginterfaces
+    sdk
+    sdk_common
+    sdk_hosting)
 
 if(APPLE)
     # miniaudio uses CoreAudio/AudioToolbox; OpenGL is the system framework
@@ -81,10 +115,6 @@ if(APPLE)
     target_link_libraries(Dave PRIVATE
         ${COREAUDIO_LIB} ${AUDIOTOOLBOX_LIB} ${COREFOUNDATION_LIB}
         ${OPENGL_LIB} ${APPKIT_LIB})
-endif()
-
-if(WIN32)
-    target_link_libraries(Dave PRIVATE ole32 winmm)
 endif()
 
 if(WIN32)

@@ -3,6 +3,7 @@
 #include "document/Edit.h"
 #include "editing/Command.h"
 #include "engine/GraphBuilder.h"
+#include "engine/plugins/PluginHost.h"
 #include "engine/transport/Transport.h"
 #include "gui/ImGuiLayer.h"
 #include "gui/Timeline.h"
@@ -47,6 +48,7 @@ private:
     document::Edit edit_;
     editing::UndoStack undo_{edit_};
     engine::GraphBuilder builder_;
+    engine::PluginHost pluginHost_;
 
     gui::PeakCache peaks_;
     gui::TimelineViewState view_;

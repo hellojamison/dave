@@ -7,3 +7,6 @@
 [submodule "third_party/nfd"]
 	path = third_party/nfd
 	url = https://github.com/btzy/nativefiledialog-extended.git
+[submodule "third_party/vst3sdk"]
+	path = third_party/vst3sdk
+	url = https://github.com/steinbergmedia/vst3sdk.git

@@ -23,6 +23,15 @@ bool DaveApp::init() {
         std::fprintf(stderr, "Dave: audio engine failed to start\n");
     }
 
+    // TEMPORARY: scan plugins on startup to verify the VST3 host discovery
+    // works. Remove once the plugin browser UI is in place.
+    pluginHost_.scan();
+    for (const auto& d : pluginHost_.descriptors()) {
+        std::fprintf(stderr, "Dave[plugins]:   %-20s [%s] by %s  uid=%s\n",
+                     d.name.c_str(), d.subCategories.c_str(), d.vendor.c_str(),
+                     d.uidString.c_str());
+    }
+
     // Wire the Edit's change signal to graph re-derivation.
     edit_.setChangeListener([this] { onEditChanged(); });
 

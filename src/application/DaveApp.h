@@ -36,9 +36,11 @@ public:
 private:
     void onEditChanged();           // re-derive + recompile + publish
     void loadWavIntoEdit(const std::string& path);
+    void openWavDialog();
+    void handleShortcuts();
     void drawUI();
 
-    platform::Window window_{1100, 700, "Dave"};
+    platform::Window window_{1280, 800, "Dave"};
     gui::ImGuiLayer imgui_;
     platform::AudioEngine audio_;
 

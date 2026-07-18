@@ -34,26 +34,69 @@ private:
     std::string clipId_;
 };
 
-// MoveClip: changes a clip's timelineStart. Undo restores the old position.
-// Used by drag; each drag can emit one MoveClip on mouse-up (transactional).
+// MoveClip: changes a clip's timelineStart AND optionally its track.
+// Undo restores the original position and track. Used by the timeline drag
+// (which can move a clip sideways and/or drop it onto another track).
 class MoveClipCommand : public Command {
 public:
-    MoveClipCommand(std::string trackId, std::string clipId, int64_t newStart)
-        : trackId_(std::move(trackId)), clipId_(std::move(clipId)), newStart_(newStart) {}
+    MoveClipCommand(std::string trackId, std::string clipId,
+                    int64_t newStart, std::string newTrackId = "")
+        : trackId_(std::move(trackId)), clipId_(std::move(clipId)),
+          newStart_(newStart), newTrackId_(std::move(newTrackId)) {}
+
     void perform(document::Edit& e) override {
+        // Snapshot the original (track + position) so undo can restore it.
         auto* c = e.clip(trackId_, clipId_);
-        if (c) { oldStart_ = c->timelineStart; c->timelineStart = newStart_; e.notifyChanged(); }
+        if (c) {
+            oldStart_ = c->timelineStart;
+            snapshot_ = *c; // captures sourceOffset/length/fades/etc.
+        }
+        // If moving to a different track, remove from old and add to new.
+        if (!newTrackId_.empty() && newTrackId_ != trackId_) {
+            e.removeClip(trackId_, clipId_);
+            // Preserve the original id so references stay stable.
+            snapshot_.id = clipId_;
+            snapshot_.timelineStart = newStart_;
+            e.addClip(newTrackId_, snapshot_);
+            // addClip assigns a NEW id; patch it back to the stable one.
+            auto* moved = e.clip(newTrackId_, clipId_);
+            // The clip is now the one with the new id; rename it.
+            // (Find the last clip on the track and rename.)
+            auto* t = e.track(newTrackId_);
+            if (t && !t->clips.empty()) {
+                t->clips.back().id = clipId_;
+            }
+            (void)moved;
+        } else {
+            // Same-track move: just update position.
+            auto* clip = e.clip(trackId_, clipId_);
+            if (clip) { clip->timelineStart = newStart_; e.notifyChanged(); }
+        }
     }
+
     void undo(document::Edit& e) override {
-        auto* c = e.clip(trackId_, clipId_);
-        if (c) { c->timelineStart = oldStart_; e.notifyChanged(); }
+        // If it moved tracks, reverse: remove from new track, restore to old.
+        if (!newTrackId_.empty() && newTrackId_ != trackId_) {
+            e.removeClip(newTrackId_, clipId_);
+            snapshot_.id = clipId_;
+            e.addClip(trackId_, snapshot_);
+            auto* t = e.track(trackId_);
+            if (t && !t->clips.empty()) t->clips.back().id = clipId_;
+        } else {
+            auto* c = e.clip(trackId_, clipId_);
+            if (c) { c->timelineStart = oldStart_; e.notifyChanged(); }
+        }
     }
+
     std::string name() const override { return "Move Clip"; }
+
 private:
-    std::string trackId_;
+    std::string trackId_;     // original track
     std::string clipId_;
     int64_t newStart_;
+    std::string newTrackId_;  // empty = same track
     int64_t oldStart_ = 0;
+    document::AudioClip snapshot_;
 };
 
 // RemoveClip: deletes a clip. Undo restores it (id + position preserved).

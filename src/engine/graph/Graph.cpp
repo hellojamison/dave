@@ -251,6 +251,16 @@ compile(const Graph& graph, double sampleRate, int maxBlock) {
     result->nodes_.reserve(order.size());
     size_t scratchCounter = 0; // flat index into inputScratch_
 
+    // Map from graph-node index (into gnodes) -> topo-order index (into
+    // result->nodes_). inputSources above stored graph-node indices; we
+    // translate them to topo-order indices below so RT-time lookups index the
+    // right node. (This was the root cause of clip audio being dropped: the
+    // sum node was reading from the wrong source node.)
+    std::vector<size_t> graphIdxToTopo(gnodes.size(), SIZE_MAX);
+    for (size_t ord = 0; ord < order.size(); ++ord) {
+        graphIdxToTopo[order[ord]] = ord;
+    }
+
     // First pass: allocate the output buffer pool and count total input-pins
     // so we can size inputScratch_ precisely (one slot per (node,pin,channel)).
     size_t totalInputSlots = 0;
@@ -272,7 +282,14 @@ compile(const Graph& graph, double sampleRate, int maxBlock) {
         // via atomic members (RT-safe), so shared access is safe.
         cn.owned = nodePtr;
         cn.node = cn.owned.get();
-        cn.inputSources = inputSources[idx]; // copy; inputSources is local
+        // Copy inputSources and translate graph-node indices -> topo-order
+        // indices so RT-time lookups (nodes_[srcIdx]) hit the right node.
+        cn.inputSources = inputSources[idx];
+        for (auto& pinSources : cn.inputSources) {
+            for (auto& src : pinSources) {
+                src.first = graphIdxToTopo[src.first];
+            }
+        }
 
         // Allocate output channels: numOutputPins * chansPerPin.
         int totalOutChans = cn.node->numOutputPins() * chansPerPin;

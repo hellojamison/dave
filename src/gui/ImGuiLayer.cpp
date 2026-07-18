@@ -1,4 +1,5 @@
 #include "gui/ImGuiLayer.h"
+#include "gui/Theme.h"
 
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
@@ -28,16 +29,16 @@ bool ImGuiLayer::init(platform::Window& window) {
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;       // docking branch feature
-    io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;     // multi-viewport (detached windows)
+    // NOTE: multi-viewport (detached OS windows) is DISABLED. For a DAW we want
+    // everything inside the single GLFW window so the layout is predictable and
+    // panels don't float around the OS as separate windows. The docking branch
+    // still gives us dockable panels within the main window.
+    // io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
 
-    ImGui::StyleColorsDark();
-
-    // When viewports are enabled, tweak platform window style to match.
-    ImGuiStyle& style = ImGui::GetStyle();
-    if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
-        style.WindowRounding = 0.0f;
-        style.Colors[ImGuiCol_WindowBg].w = 1.0f;
-    }
+    // Dave's visual identity — replaces the ImGui default (which reads as a
+    // debug tool) with a cohesive pro-audio dark theme.
+    theme::loadDefaultFont(14.0f);
+    theme::applyTheme();
 
     const char* glslVersion = "#version 330";
     if (!ImGui_ImplGlfw_InitForOpenGL(window.handle(), true)) {

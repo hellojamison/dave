@@ -58,12 +58,19 @@ public:
         out.loopEnd = loopEnd_;
 
         // Advance position for the NEXT block (this block covers [pos, pos+n)).
+        // We MUST persist currentPosition_ even when stopped — the UI reads it
+        // to draw the playhead, and seeks while stopped need to be reflected.
         if (out.isPlaying) {
             int64_t next = pos + numSamples;
             if (out.isLooping && next >= out.loopEnd) {
                 next = out.loopStart + (next - out.loopEnd);
             }
             currentPosition_.store(next, std::memory_order_relaxed);
+        } else {
+            // Stopped: still persist the (possibly seeked) position so the UI
+            // sees it. Without this, position() returns stale data after a seek
+            // while stopped, and the playhead never appears to move.
+            currentPosition_.store(pos, std::memory_order_relaxed);
         }
     }
 

@@ -41,6 +41,7 @@ struct TimelineViewState {
     std::string selectedClipId;
     // Transient drag state (held only while a drag is active).
     int64_t dragClipOriginalStart = 0;
+    std::string dragOriginalTrackId;  // track the clip came from
     bool dragging = false;
 };
 

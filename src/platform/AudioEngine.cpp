@@ -15,17 +15,60 @@ bool AudioEngine::start(double sampleRate, int channels) {
     if (running_.load(std::memory_order_acquire)) {
         return true;
     }
+    // Initialize a context for device enumeration + selection.
+    if (!contextInited_) {
+        if (ma_context_init(nullptr, 0, nullptr, &context_) != MA_SUCCESS) {
+            std::fprintf(stderr, "Dave: ma_context_init failed\n");
+            return false;
+        }
+        contextInited_ = true;
+    }
+    return openDevice(-1, sampleRate, channels);
+}
 
+std::vector<std::string> AudioEngine::enumerateDevices() {
+    std::vector<std::string> names;
+    if (!contextInited_) {
+        if (ma_context_init(nullptr, 0, nullptr, &context_) != MA_SUCCESS) return names;
+        contextInited_ = true;
+    }
+    ma_device_info* playback = nullptr;
+    ma_uint32 count = 0;
+    if (ma_context_get_devices(&context_, &playback, &count, nullptr, nullptr) != MA_SUCCESS) {
+        return names;
+    }
+    for (ma_uint32 i = 0; i < count; ++i) {
+        const char* n = playback[i].name;
+        names.emplace_back((n && n[0]) ? n : "(unnamed)");
+    }
+    return names;
+}
+
+bool AudioEngine::selectDevice(int deviceIndex, double sampleRate, int channels) {
+    stop();
+    return openDevice(deviceIndex, sampleRate, channels);
+}
+
+bool AudioEngine::openDevice(int deviceIndex, double sampleRate, int channels) {
     ma_device_config config = ma_device_config_init(ma_device_type_playback);
     config.playback.format = ma_format_f32;
     config.playback.channels = static_cast<ma_uint32>(channels);
     config.sampleRate = static_cast<ma_uint32>(sampleRate);
     config.dataCallback = &AudioEngine::dataCallback;
     config.pUserData = this;
-    // Request a bounded period so our scratch buffer has a known max size.
     config.periodSizeInFrames = 256;
 
-    if (ma_device_init(nullptr, &config, &device_) != MA_SUCCESS) {
+    // If a specific device was requested, look it up by index.
+    if (deviceIndex >= 0) {
+        ma_device_info* playback = nullptr;
+        ma_uint32 count = 0;
+        if (ma_context_get_devices(&context_, &playback, &count, nullptr, nullptr) == MA_SUCCESS &&
+            static_cast<ma_uint32>(deviceIndex) < count) {
+            config.playback.pDeviceID = &playback[deviceIndex].id;
+        }
+    }
+
+    if (ma_device_init(&context_, &config, &device_) != MA_SUCCESS) {
         std::fprintf(stderr, "Dave: failed to init audio device\n");
         return false;
     }
@@ -35,8 +78,6 @@ bool AudioEngine::start(double sampleRate, int channels) {
         return false;
     }
 
-    // Pre-allocate the non-interleaved scratch (one buffer per channel, sized
-    // to a generous max block). 8196 frames covers any reasonable period.
     constexpr int kMaxBlock = 8196;
     scratchStorage_.assign(channels, std::vector<float>(kMaxBlock, 0.0f));
     scratchChannelPtrs_.assign(channels, nullptr);
@@ -47,6 +88,7 @@ bool AudioEngine::start(double sampleRate, int channels) {
     initialized_.store(true, std::memory_order_release);
     running_.store(true, std::memory_order_release);
     sampleRate_.store(sampleRate, std::memory_order_release);
+    currentDeviceIndex_ = deviceIndex;
 
     const char* name = device_.playback.name;
     std::fprintf(stderr, "Dave: audio device \"%s\" opened @ %.0f Hz, %d ch\n",

@@ -38,6 +38,9 @@ Window::Window(int width, int height, const std::string& title) {
         glfwTerminate();
         return;
     }
+
+    // Keep the window from shrinking below a usable DAW size.
+    glfwSetWindowSizeLimits(window_, 900, 540, GLFW_DONT_CARE, GLFW_DONT_CARE);
 }
 
 Window::~Window() {

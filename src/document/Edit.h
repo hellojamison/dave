@@ -2,6 +2,8 @@
 
 #include "document/Types.h"
 
+#include <memory>
+
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -77,6 +79,14 @@ public:
     // (Sample-mode only for RB-4; other modes resolve later.)
     const Marker* activeLoopMarker() const;
 
+    // --- Video (RB-5) ------------------------------------------------------
+    // A project holds at most one video clip for RB-5 (the "reference movie"
+    // model — audio-for-picture). It's separate from audio tracks; the preview
+    // panel renders it locked to the transport. Multi-clip editing is RB-6.
+    const VideoClip* videoClip() const { return videoClip_.get(); }
+    void setVideoClip(VideoClip clip) { videoClip_ = std::make_unique<VideoClip>(std::move(clip)); notifyChanged(); }
+    void clearVideoClip() { videoClip_.reset(); notifyChanged(); }
+
     // --- Change notification ----------------------------------------------
     // Listeners are notified after every mutation (so the engine/UI can
     // re-derive). Notifications fire on the UI thread.
@@ -89,6 +99,7 @@ private:
 
     std::vector<Track> tracks_;
     std::vector<MarkerTrack> markerTracks_;
+    std::unique_ptr<VideoClip> videoClip_;
     std::unordered_map<AssetId, AudioAsset> assets_;
     ChangeCallback onChange_;
     uint64_t idCounter_ = 0;

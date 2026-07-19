@@ -23,6 +23,11 @@ Makefile
 # Dependencies (vendored via submodules)
 /third_party/*/  !empty
 
+# FFmpeg LGPL build artifacts (rebuilt from scripts/build-ffmpeg-lgpl-macos.sh).
+# The ~150MB of source + binaries should never be committed.
+/third_party/ffmpeg-lgpl/
+/third_party/ffmpeg-lgpl-build/
+
 # Project-local cache (content-addressed, rebuildable)
 **/cache/peaks/
 **/cache/thumbs/

@@ -104,6 +104,23 @@ struct MarkerTrack {
     std::vector<Marker> markers;
 };
 
+// ─── Video (RB-5) ───────────────────────────────────────────────────────────
+// A video clip references a movie file (decoded via the LGPL FFmpeg subprocess
+// — see VideoDecoder). It sits on the timeline like an audio clip; its frames
+// show in the VideoPreview panel locked to the audio transport (audio master).
+// RB-5 is playback-only (no editing/transitions — that's RB-6).
+struct VideoClip {
+    std::string id;
+    std::string path;           // movie file
+    std::string name;           // display (filename)
+    std::string codec;          // e.g. "h264", "dnxhd" (probed at import)
+    int64_t timelineStart = 0;  // where on the timeline (samples, @ audio sr)
+    double fps = 0.0;           // native frame rate
+    int width = 0;              // native resolution (probe at import)
+    int height = 0;
+    double durationSeconds = 0.0;
+};
+
 } // namespace dave::document
 
 // Hash for AssetId so it can key an unordered_map.

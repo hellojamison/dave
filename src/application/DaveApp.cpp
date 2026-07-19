@@ -3,6 +3,7 @@
 #include "editing/Commands.h"
 #include "gui/Theme.h"
 
+#include <glad.h>
 #include <imgui.h>
 #include <nfd.h>
 
@@ -157,6 +158,7 @@ void DaveApp::drawUI() {
     if (ImGui::BeginMainMenuBar()) {
         if (ImGui::BeginMenu("File")) {
             if (ImGui::MenuItem("Load WAV...", "Ctrl+O")) openWavDialog();
+            if (ImGui::MenuItem("Load Video...")) openVideoDialog();
             ImGui::Separator();
             if (ImGui::MenuItem("Import Markers (Reaper CSV)...")) importMarkersDialog();
             if (ImGui::MenuItem("Export Markers (Reaper CSV)...")) exportMarkersDialog();
@@ -307,6 +309,9 @@ void DaveApp::drawUI() {
 
     // Plugin browser modal (only when showPluginBrowser_ is true).
     drawPluginBrowser();
+
+    // Video preview panel (RB-5).
+    drawVideoPreview();
 }
 
 void DaveApp::openWavDialog() {
@@ -360,6 +365,142 @@ void DaveApp::exportMarkersDialog() {
 
 void DaveApp::run() {
     window_.run();
+}
+
+void DaveApp::openVideoDialog() {
+    nfdnchar_t* outPath = nullptr;
+    nfdnfilteritem_t filter{"Video", "mp4,mov,mkv,m4v,mxf"};
+    if (NFD_OpenDialog(&outPath, &filter, 1, nullptr) == NFD_OKAY && outPath) {
+        std::string path = outPath;
+        NFD_FreePath(outPath);
+        // Probe the video for format/duration/fps/resolution.
+        engine::VideoInfo info;
+        if (!engine::VideoProbe::probe(path, info)) {
+            std::fprintf(stderr, "Dave: failed to probe video: %s\n", path.c_str());
+            return;
+        }
+        document::VideoClip clip;
+        clip.path = path;
+        auto slash = path.find_last_of("/\\");
+        clip.name = (slash != std::string::npos) ? path.substr(slash + 1) : path;
+        clip.timelineStart = 0;
+        clip.codec = info.codec;
+        clip.fps = info.fps;
+        clip.width = info.width;
+        clip.height = info.height;
+        clip.durationSeconds = info.durationSeconds;
+        edit_.setVideoClip(std::move(clip));
+        // Reset preview state so the decoder/texture get recreated for the new clip.
+        videoDecoder_.close();
+        lastDecodedFrameIndex_ = -1;
+        std::fprintf(stderr, "Dave: loaded video %s (%dx%d @ %.3ffps, %.1fs, %s)\n",
+                     clip.name.c_str(), clip.width, clip.height, clip.fps,
+                     clip.durationSeconds, clip.codec.c_str());
+    }
+}
+
+void DaveApp::drawVideoPreview() {
+    ImGui::Begin("Video");
+
+    const auto* clip = edit_.videoClip();
+    if (!clip) {
+        ImGui::TextDisabled("(no video loaded)");
+        if (ImGui::Button("Load Video...")) openVideoDialog();
+        ImGui::End();
+        return;
+    }
+
+    // Header: name + reload button.
+    ImGui::Text("%s", clip->name.c_str());
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Replace...")) openVideoDialog();
+    ImGui::TextDisabled("%dx%d @ %.3ffps  %.1fs", clip->width, clip->height,
+                        clip->fps, clip->durationSeconds);
+
+    // Compute the target video frame from the transport position (audio master).
+    // timelineStart is in audio samples; sampleRate is 48000.
+    const double audioSr = 48000.0;
+    int64_t playhead = audio_.transport().position();
+    int64_t relSamples = playhead - clip->timelineStart;
+    double videoTimeSec = (relSamples > 0) ? (relSamples / audioSr) : 0.0;
+    bool inRange = (videoTimeSec >= 0.0 && videoTimeSec <= clip->durationSeconds);
+    int64_t frameIndex = (clip->fps > 0.0)
+        ? static_cast<int64_t>(videoTimeSec * clip->fps) : 0;
+
+    // If the frame index changed, decode + upload a new RGBA frame.
+    // Debounce random-access seeks: spawning ffmpeg per scrub-tick floods the
+    // pipe + tanks responsiveness. Allow at most one seek per ~150ms; during
+    // fast scrub we just hold the last decoded frame. Sequential playback
+    // (frameIndex advancing by 1) is NOT throttled — it reuses the process.
+    bool sequential = videoDecoder_.isOpen() && frameIndex == lastDecodedFrameIndex_ + 1;
+    double nowSec = ImGui::GetTime();
+    bool seekAllowed = sequential || (nowSec - lastSeekTime_ >= 0.15);
+    if (inRange && frameIndex != lastDecodedFrameIndex_ && seekAllowed) {
+        lastSeekTime_ = nowSec;
+        // Preview resolution — cap to 480 wide. 1920x1080 RGBA is 8MB/frame and
+        // swamps the pipe + GL upload; 480 wide is ~1MB and plenty for a preview.
+        const int previewMaxW = 480;
+        int pw = clip->width, ph = clip->height;
+        if (pw > previewMaxW) { ph = ph * previewMaxW / pw; pw = previewMaxW; }
+        // Create or resize the GL texture if needed.
+        if (videoTexture_ == 0 || videoTexW_ != pw || videoTexH_ != ph) {
+            if (videoTexture_ == 0) glGenTextures(1, &videoTexture_);
+            glBindTexture(GL_TEXTURE_2D, videoTexture_);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            videoTexW_ = pw;
+            videoTexH_ = ph;
+        }
+        // Decode the frame. Sequential playback keeps the process open; a jump
+        // of >1 frame closes + respawns (seekAndRead).
+        bool got = false;
+        if (sequential) {
+            got = videoDecoder_.readFrame(videoFrameBuf_);
+        }
+        if (!got) {
+            // Random access: close + reopen at the requested time.
+            double seekTo = static_cast<double>(frameIndex) / clip->fps;
+            got = videoDecoder_.seekAndRead(clip->path, seekTo, pw, ph, videoFrameBuf_);
+        }
+        if (got && videoFrameBuf_.size() == static_cast<size_t>(pw * ph * 4)) {
+            glBindTexture(GL_TEXTURE_2D, videoTexture_);
+            // Be explicit about pixel unpack alignment — default (4) is fine for
+            // RGBA but setting it removes a whole class of striping bugs when
+            // row widths change.
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            glPixelStorei(GL_UNPACK_ROW_LENGTH, pw);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, pw, ph, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, videoFrameBuf_.data());
+            glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+            lastDecodedFrameIndex_ = frameIndex;
+        }
+    }
+
+    // Draw the latest frame. Preserve aspect ratio; fit to panel width.
+    if (videoTexture_ != 0 && videoTexW_ > 0 && videoTexH_ > 0) {
+        ImVec2 avail = ImGui::GetContentRegionAvail();
+        float drawW = avail.x;
+        float drawH = drawW * static_cast<float>(videoTexH_) / static_cast<float>(videoTexW_);
+        if (drawH > avail.y) { drawH = avail.y; drawW = drawH * static_cast<float>(videoTexW_) / static_cast<float>(videoTexH_); }
+        ImGui::Image(static_cast<ImTextureID>(videoTexture_),
+                     ImVec2(drawW, drawH));
+    } else {
+        ImGui::TextDisabled("(seek to a position to decode a frame)");
+    }
+
+    // Timecode readout.
+    int mm = static_cast<int>(videoTimeSec) / 60;
+    int ss = static_cast<int>(videoTimeSec) % 60;
+    int ff = (clip->fps > 0.0) ? static_cast<int>((videoTimeSec - static_cast<int>(videoTimeSec)) * clip->fps) : 0;
+    char tc[32];
+    std::snprintf(tc, sizeof(tc), "%02d:%02d:%02d", mm, ss, ff);
+    ImGui::TextDisabled("TC %s  frame %lld  %s", tc,
+                        static_cast<long long>(frameIndex),
+                        inRange ? "" : "(out of range)");
+
+    ImGui::End();
 }
 
 void DaveApp::drawPluginsPanel() {

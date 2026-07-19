@@ -6,14 +6,17 @@
 #include "engine/plugins/PluginEditor.h"
 #include "engine/plugins/PluginHost.h"
 #include "engine/transport/Transport.h"
+#include "engine/video/VideoDecoder.h"
 #include "gui/ImGuiLayer.h"
 #include "gui/Timeline.h"
 #include "platform/AudioEngine.h"
 #include "platform/Window.h"
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace dave::application {
 
@@ -45,10 +48,12 @@ private:
     void openWavDialog();
     void importMarkersDialog();
     void exportMarkersDialog();
+    void openVideoDialog();
     void handleShortcuts();
     void drawUI();
     void drawPluginsPanel();
     void drawPluginBrowser();
+    void drawVideoPreview();        // RB-5: video panel + A/V sync
 
     platform::Window window_{1280, 800, "Dave"};
     gui::ImGuiLayer imgui_;
@@ -69,6 +74,20 @@ private:
 
     // Open plugin editors, keyed by slot id. One floating NSWindow per slot.
     std::unordered_map<std::string, std::unique_ptr<engine::PluginEditor>> editors_;
+
+    // ─── Video preview (RB-5) ───────────────────────────────────────────────
+    // The preview panel keeps a GL texture + a decoder. Each frame (UI thread),
+    // it maps the transport's samplePos to a video time and pulls the right
+    // RGBA frame from the decoder (or reuses the last if we're still in the
+    // same video frame). Sequential playback keeps the ffmpeg process open;
+    // big jumps (seek/scrub) close + respawn.
+    engine::VideoDecoder videoDecoder_;
+    unsigned int videoTexture_ = 0;     // GL texture id (0 = not created yet)
+    int videoTexW_ = 0;                 // texture dimensions (preview-resolution)
+    int videoTexH_ = 0;
+    std::vector<uint8_t> videoFrameBuf_; // scratch for decoded RGBA
+    int64_t lastDecodedFrameIndex_ = -1; // last frame index we uploaded
+    double lastSeekTime_ = 0.0;          // ImGui::GetTime() of last random-access seek (debounce)
 };
 
 } // namespace dave::application

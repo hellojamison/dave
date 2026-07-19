@@ -69,6 +69,41 @@ struct Track {
     std::vector<PluginSlot> plugins;  // effect chain, processed in order
 };
 
+// ─── Markers (RB-4) ─────────────────────────────────────────────────────────
+// Marker kinds drive color and behavior (loop region loops; punch triggers
+// punch-in/out; cue fires MIDI/OSC later). Custom is the escape hatch.
+enum class MarkerKind { Cue, Section, Loop, Punch, CD, Custom };
+
+// How a marker's position is specified. RB-4 fully wires Sample; the others
+// are stored so we don't need a migration when SMPTE/tempo-map/clip-anchored
+// resolution lands. See docs/rb4-markers-design.md.
+enum class MarkerPosMode { Sample, Smpte, Musical, ClipAnchored };
+
+// A marker is a named position (point or region) on a marker track. Regions
+// have length > 0. The metadata field is free-form (cue #, scene, take, etc.)
+// — it's the extension point for cue-list/show-control workflows.
+struct Marker {
+    std::string id;
+    std::string name;
+    MarkerKind kind = MarkerKind::Cue;
+    MarkerPosMode posMode = MarkerPosMode::Sample;
+    int64_t position = 0;        // in posMode units (samples for Sample)
+    int64_t length = 0;          // 0 = point marker; >0 = region
+    std::string color;           // hex "#rrggbb"; empty = default-for-kind
+    std::string clipId;          // parent clip for ClipAnchored
+    std::string metadata;        // free-form JSON-ish string
+};
+
+// A marker track is a category (Cues, Scenes, Loop points, etc.). The Edit
+// holds a list; each can be shown/hidden independently. RB-4 ships one
+// default "Markers" track and lets the user add more.
+struct MarkerTrack {
+    std::string id;
+    std::string name;
+    bool visible = true;
+    std::vector<Marker> markers;
+};
+
 } // namespace dave::document
 
 // Hash for AssetId so it can key an unordered_map.

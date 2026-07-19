@@ -46,6 +46,17 @@ void applyTheme();
 // Falls back to the ImGui default if the embedded font can't load.
 bool loadDefaultFont(float size = 14.0f);
 
+// Type hierarchy (impeccable: fixed rem-like scale, ratio ~1.125–1.2).
+// Push/pop these around headings, captions, etc. for consistent hierarchy
+// without re-deriving sizes at each call site.
+struct TypeScale {
+    int caption = 12;   // muted secondary labels, meta info
+    int body    = 14;   // default body / UI text
+    int label   = 15;   // emphasized labels, section heads
+    int title   = 18;   // panel titles, the rare large heading
+};
+const TypeScale& typeScale();
+
 // Convenience: a hex color -> ImVec4.
 ImVec4 hex(uint32_t rgba);
 

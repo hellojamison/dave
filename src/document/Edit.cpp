@@ -137,4 +137,64 @@ bool Edit::removePlugin(const std::string& trackId, const std::string& slotId) {
     return false;
 }
 
+// ─── Marker tracks ──────────────────────────────────────────────────────────
+
+std::string Edit::addMarkerTrack(const std::string& name) {
+    MarkerTrack mt;
+    mt.id = newId("mtrack_");
+    ++idCounter_;
+    mt.name = name.empty() ? ("Markers " + std::to_string(idCounter_)) : name;
+    markerTracks_.push_back(std::move(mt));
+    notifyChanged();
+    return markerTracks_.back().id;
+}
+
+bool Edit::removeMarkerTrack(const std::string& trackId) {
+    for (auto it = markerTracks_.begin(); it != markerTracks_.end(); ++it) {
+        if (it->id == trackId) {
+            markerTracks_.erase(it);
+            notifyChanged();
+            return true;
+        }
+    }
+    return false;
+}
+
+MarkerTrack* Edit::markerTrack(const std::string& trackId) {
+    for (auto& mt : markerTracks_) if (mt.id == trackId) return &mt;
+    return nullptr;
+}
+
+// ─── Markers ────────────────────────────────────────────────────────────────
+
+std::string Edit::addMarker(const std::string& trackId, Marker marker) {
+    MarkerTrack* mt = markerTrack(trackId);
+    if (mt == nullptr) return "";
+    marker.id = newId("marker_");
+    ++idCounter_;
+    mt->markers.push_back(std::move(marker));
+    notifyChanged();
+    return mt->markers.back().id;
+}
+
+Marker* Edit::marker(const std::string& trackId, const std::string& markerId) {
+    MarkerTrack* mt = markerTrack(trackId);
+    if (mt == nullptr) return nullptr;
+    for (auto& m : mt->markers) if (m.id == markerId) return &m;
+    return nullptr;
+}
+
+bool Edit::removeMarker(const std::string& trackId, const std::string& markerId) {
+    MarkerTrack* mt = markerTrack(trackId);
+    if (mt == nullptr) return false;
+    for (auto it = mt->markers.begin(); it != mt->markers.end(); ++it) {
+        if (it->id == markerId) {
+            mt->markers.erase(it);
+            notifyChanged();
+            return true;
+        }
+    }
+    return false;
+}
+
 } // namespace dave::document

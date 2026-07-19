@@ -31,6 +31,15 @@ bool DaveApp::init() {
     // Seed an initial track so the timeline isn't empty.
     undo_.execute(std::make_unique<editing::AddTrackCommand>("Track 1"));
 
+    // Seed a default marker track so the marker lane is immediately usable —
+    // no "Add marker track" hurdle. The user can still add more tracks later
+    // (Cues, Scenes, etc.) but the common case (just drop a marker) works
+    // out of the box.
+    edit_.addMarkerTrack("Markers");
+    // addMarkerTrack fires notifyChanged which triggers a graph re-derive;
+    // the initial re-derive already happened via AddTrackCommand above, so
+    // this is one extra harmless rebuild.
+
     window_.setFrameCallback([this] {
         imgui_.newFrame();
         handleShortcuts();

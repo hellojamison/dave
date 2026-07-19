@@ -166,4 +166,80 @@ private:
     document::PluginSlot snapshot_;
 };
 
+// ─── Marker commands (RB-4) ─────────────────────────────────────────────────
+
+// Add a marker track. Undo removes it.
+class AddMarkerTrackCommand : public Command {
+public:
+    explicit AddMarkerTrackCommand(std::string name) : name_(std::move(name)) {}
+    void perform(document::Edit& e) override { trackId_ = e.addMarkerTrack(name_); }
+    void undo(document::Edit& e) override { e.removeMarkerTrack(trackId_); }
+    std::string name() const override { return "Add Marker Track"; }
+    const std::string& trackId() const { return trackId_; }
+private:
+    std::string name_;
+    std::string trackId_;
+};
+
+// Add a marker to a marker track. Undo removes it.
+class AddMarkerCommand : public Command {
+public:
+    AddMarkerCommand(std::string trackId, document::Marker marker)
+        : trackId_(std::move(trackId)), marker_(std::move(marker)) {}
+    void perform(document::Edit& e) override { markerId_ = e.addMarker(trackId_, marker_); }
+    void undo(document::Edit& e) override { e.removeMarker(trackId_, markerId_); }
+    std::string name() const override { return "Add Marker"; }
+    const std::string& markerId() const { return markerId_; }
+private:
+    std::string trackId_;
+    document::Marker marker_;
+    std::string markerId_;
+};
+
+// Move a marker (position and/or length). Undo restores both.
+class MoveMarkerCommand : public Command {
+public:
+    MoveMarkerCommand(std::string trackId, std::string markerId,
+                      int64_t newPosition, int64_t newLength)
+        : trackId_(std::move(trackId)), markerId_(std::move(markerId)),
+          newPosition_(newPosition), newLength_(newLength) {}
+    void perform(document::Edit& e) override {
+        auto* m = e.marker(trackId_, markerId_);
+        if (m) { oldPosition_ = m->position; oldLength_ = m->length;
+                 m->position = newPosition_; m->length = newLength_; e.notifyChanged(); }
+    }
+    void undo(document::Edit& e) override {
+        auto* m = e.marker(trackId_, markerId_);
+        if (m) { m->position = oldPosition_; m->length = oldLength_; e.notifyChanged(); }
+    }
+    std::string name() const override { return "Move Marker"; }
+private:
+    std::string trackId_;
+    std::string markerId_;
+    int64_t newPosition_;
+    int64_t newLength_;
+    int64_t oldPosition_ = 0;
+    int64_t oldLength_ = 0;
+};
+
+// Remove a marker. Undo restores it (id + position + length preserved).
+class RemoveMarkerCommand : public Command {
+public:
+    RemoveMarkerCommand(std::string trackId, std::string markerId)
+        : trackId_(std::move(trackId)), markerId_(std::move(markerId)) {}
+    void perform(document::Edit& e) override {
+        if (auto* m = e.marker(trackId_, markerId_)) snapshot_ = *m;
+        e.removeMarker(trackId_, markerId_);
+    }
+    void undo(document::Edit& e) override {
+        std::string newId = e.addMarker(trackId_, snapshot_);
+        if (auto* m = e.marker(trackId_, newId)) m->id = markerId_;
+    }
+    std::string name() const override { return "Remove Marker"; }
+private:
+    std::string trackId_;
+    std::string markerId_;
+    document::Marker snapshot_;
+};
+
 } // namespace dave::editing

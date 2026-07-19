@@ -66,11 +66,21 @@ void drawTimeline(const document::Edit& edit,
     const float totalHeight = avail.y;
     const auto& pal = theme::palette();
 
-    // Reserve the full timeline area as an invisible interaction widget so
-    // ImGui accounts for the space (and we get hover/click hit-testing).
+    // Reserve the marker lane FIRST so its "Add marker track" button gets
+    // interaction space before the timeline's big InvisibleButton claims the
+    // whole region. The marker lane returns how much vertical space it used.
+    const float markerLaneHeight = drawMarkerLane(edit, undo, transport, view,
+        ImVec2(origin.x, origin.y + timelineHeight), totalWidth, gutterWidth,
+        view.scrollSamples, view.samplesPerPixel);
+
+    // Reserve the TRACK ROWS area as an invisible interaction widget. This
+    // must NOT cover the ruler or marker lane, or it eats their clicks.
+    // We account for the cursor advance the marker lane already did.
+    const float tracksRegionHeight = totalHeight - timelineHeight - markerLaneHeight;
     char areaBtn[32];
     std::snprintf(areaBtn, sizeof(areaBtn), "##timeline_area_%p", &view);
-    ImGui::InvisibleButton(areaBtn, ImVec2(totalWidth, totalHeight));
+    ImGui::SetCursorScreenPos(ImVec2(origin.x, origin.y + timelineHeight + markerLaneHeight));
+    ImGui::InvisibleButton(areaBtn, ImVec2(totalWidth, tracksRegionHeight));
     const ImVec2 mouse = ImGui::GetIO().MousePos;
     const bool areaHovered = ImGui::IsItemHovered();
 
@@ -107,8 +117,10 @@ void drawTimeline(const document::Edit& edit,
     }
 
     const auto& tracks = edit.tracks();
-    const float tracksTop = origin.y + timelineHeight;
-    const float tracksAreaHeight = totalHeight - timelineHeight;
+    // Marker lane was already drawn above (before the InvisibleButton). Reuse
+    // its height to compute the track-row region.
+    const float tracksTop = origin.y + timelineHeight + markerLaneHeight;
+    const float tracksAreaHeight = totalHeight - timelineHeight - markerLaneHeight;
 
     // Tracks + clips.
     for (size_t ti = 0; ti < tracks.size(); ++ti) {
@@ -333,6 +345,219 @@ void drawTimeline(const document::Edit& edit,
             view.scrollSamples = std::max(0.0, view.scrollSamples - wheel * view.samplesPerPixel * 20.0);
         }
     }
+}
+
+// ─── Marker lane ────────────────────────────────────────────────────────────
+
+namespace {
+
+// Default color per marker kind (used when Marker::color is empty).
+ImU32 markerColor(document::MarkerKind k) {
+    switch (k) {
+        case document::MarkerKind::Cue:     return IM_COL32(245, 166,  35, 255); // amber
+        case document::MarkerKind::Section: return IM_COL32(180,  90, 220, 255); // purple
+        case document::MarkerKind::Loop:    return IM_COL32( 80, 200, 120, 255); // green
+        case document::MarkerKind::Punch:   return IM_COL32(220,  80,  80, 255); // red
+        case document::MarkerKind::CD:      return IM_COL32( 90, 160, 220, 255); // blue
+        default:                            return IM_COL32(160, 160, 170, 255); // grey (Custom)
+    }
+}
+
+ImU32 parseHexColor(const std::string& hex, ImU32 fallback) {
+    if (hex.size() != 7 || hex[0] != '#') return fallback;
+    auto nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    int r = nib(hex[1]) * 16 + nib(hex[2]);
+    int g = nib(hex[3]) * 16 + nib(hex[4]);
+    int b = nib(hex[5]) * 16 + nib(hex[6]);
+    if (r < 0 || g < 0 || b < 0) return fallback;
+    return IM_COL32(r, g, b, 255);
+}
+
+const char* markerKindLabel(document::MarkerKind k) {
+    switch (k) {
+        case document::MarkerKind::Cue:     return "Cue";
+        case document::MarkerKind::Section: return "Section";
+        case document::MarkerKind::Loop:    return "Loop";
+        case document::MarkerKind::Punch:   return "Punch";
+        case document::MarkerKind::CD:      return "CD";
+        default:                            return "Custom";
+    }
+}
+
+} // namespace
+
+float drawMarkerLane(const document::Edit& edit,
+                     editing::UndoStack& undo,
+                     engine::Transport& transport,
+                     TimelineViewState& view,
+                     ImVec2 origin, float totalWidth, float gutterWidth,
+                     double scrollSamples, double samplesPerPixel) {
+    using namespace dave::document;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float laneHeight = 28.0f;
+    const auto& pal = theme::palette();
+
+    // Background — distinct from the ruler above and tracks below.
+    dl->AddRectFilled(origin, ImVec2(origin.x + totalWidth, origin.y + laneHeight),
+                      C(pal.panel));
+    dl->AddLine(ImVec2(origin.x, origin.y + laneHeight),
+                ImVec2(origin.x + totalWidth, origin.y + laneHeight),
+                C(pal.border));
+    // "Markers" label in the gutter.
+    dl->AddText(ImVec2(origin.x + 10, origin.y + 6), C(pal.textMuted), "Markers");
+
+    // If no marker track exists, prompt with a hint and offer creation.
+    if (edit.markerTracks().empty()) {
+        ImGui::SetCursorScreenPos(ImVec2(origin.x + gutterWidth + 8, origin.y + 4));
+        if (ImGui::SmallButton("Add marker track")) {
+            undo.execute(std::make_unique<editing::AddMarkerTrackCommand>("Markers"));
+        }
+        return laneHeight;
+    }
+
+    // Flatten visible markers across all visible marker tracks. For RB-4 they
+    // all render in one lane; per-track stacking comes later.
+    struct MarkedItem { const Marker* m; const MarkerTrack* t; };
+    std::vector<MarkedItem> items;
+    for (const auto& mt : edit.markerTracks()) {
+        if (!mt.visible) continue;
+        for (const auto& m : mt.markers) {
+            // RB-4 only wires Sample-mode positions; skip others (they'd
+            // misplace). Resolution for other modes lands later.
+            if (m.posMode != MarkerPosMode::Sample) continue;
+            items.push_back({&m, &mt});
+        }
+    }
+
+    const ImVec2 mouse = ImGui::GetIO().MousePos;
+    const bool laneHovered =
+        mouse.x >= origin.x + gutterWidth && mouse.x <= origin.x + totalWidth &&
+        mouse.y >= origin.y && mouse.y <= origin.y + laneHeight;
+
+    // Draw markers.
+    for (const auto& [m, mt] : items) {
+        ImU32 col = parseHexColor(m->color, markerColor(m->kind));
+        // Compute the marker's X. If this marker is the one being dragged,
+        // apply a live offset from the drag start so it visually follows the
+        // mouse before the commit lands on release.
+        int64_t renderPos = m->position;
+        bool isBeingDragged = view.dragging && view.selectedClipId == m->id;
+        if (isBeingDragged) {
+            double dxPx = mouse.x - view.markerDragStartX;
+            renderPos += static_cast<int64_t>(dxPx * samplesPerPixel);
+        }
+        double mx = origin.x + gutterWidth +
+            (renderPos - scrollSamples) / samplesPerPixel;
+        bool isRegion = m->length > 0;
+        bool selected = view.selectedClipId == m->id;
+
+        if (isRegion) {
+            double mw = static_cast<double>(m->length) / samplesPerPixel;
+            if (mx + mw < origin.x + gutterWidth) continue;
+            if (mx > origin.x + totalWidth) continue;
+            // Region bar — translucent fill (alpha 90) + opaque border.
+            // IM_COL32 is (R,G,B,A) packed; we already have col as ImU32, so
+            // build the translucent variant by repacking with reduced alpha.
+            // col layout (ImGui's IM_COL32): A<<24 | B<<16 | G<<8 | R.
+            ImU32 fillCol = (col & 0x00FFFFFF) | (90u << 24);
+            dl->AddRectFilled(ImVec2(mx, origin.y + 6),
+                              ImVec2(mx + mw, origin.y + laneHeight - 4), fillCol);
+            dl->AddRect(ImVec2(mx, origin.y + 6),
+                        ImVec2(mx + mw, origin.y + laneHeight - 4), col);
+        } else {
+            if (mx < origin.x + gutterWidth) continue;
+            if (mx > origin.x + totalWidth) continue;
+            // Flag triangle pointing down.
+            dl->AddTriangleFilled(ImVec2(mx - 5, origin.y + 2),
+                                  ImVec2(mx + 5, origin.y + 2),
+                                  ImVec2(mx,     origin.y + 10), col);
+            dl->AddLine(ImVec2(mx, origin.y + 10),
+                        ImVec2(mx, origin.y + laneHeight - 2), col);
+        }
+
+        // Label (right of the marker).
+        if (!m->name.empty() && mx + 8 < origin.x + totalWidth) {
+            dl->AddText(ImVec2(mx + 8, origin.y + 4),
+                        C(pal.text), m->name.c_str());
+        }
+
+        // Hit-test + drag.
+        struct Rect { ImVec2 a, b; bool hit(ImVec2 p) const {
+            return p.x >= a.x && p.x <= b.x && p.y >= a.y && p.y <= b.y; } };
+        Rect hit = isRegion
+            ? Rect{ImVec2(mx, origin.y + 4), ImVec2(mx + std::max(8.0, static_cast<double>(m->length) / samplesPerPixel), origin.y + laneHeight - 4)}
+            : Rect{ImVec2(mx - 6, origin.y), ImVec2(mx + 6, origin.y + laneHeight)};
+        if (laneHovered && hit.hit(mouse) && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            view.selectedClipId = m->id;     // reuse the selection field
+            view.dragClipOriginalStart = m->position;
+            view.dragging = true;
+            view.dragOriginalTrackId = mt->id; // reuse for marker track id
+            view.markerDragStartX = mouse.x;   // for live drag feedback
+        }
+    }
+
+    // Handle active marker drag (commit on release).
+    if (view.dragging && !view.selectedClipId.empty()) {
+        if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+            // Find the selected marker and compute its new position from mouse X.
+            for (const auto& mt : edit.markerTracks()) {
+                for (const auto& m : mt.markers) {
+                    if (m.id == view.selectedClipId) {
+                        double localX = mouse.x - (origin.x + gutterWidth);
+                        int64_t newPos = static_cast<int64_t>(
+                            std::max(0.0, scrollSamples + localX * samplesPerPixel));
+                        undo.execute(std::make_unique<editing::MoveMarkerCommand>(
+                            mt.id, m.id, newPos, m.length));
+                        break;
+                    }
+                }
+            }
+            view.dragging = false;
+            view.selectedClipId.clear();
+            view.dragOriginalTrackId.clear();
+        }
+    }
+
+    // Double-click empty lane to add a point marker on the first marker track.
+    if (laneHovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        // Make sure we didn't hit an existing marker (those capture the click).
+        bool hitMarker = false;
+        for (const auto& [m, mt] : items) {
+            double mx = origin.x + gutterWidth +
+                (m->position - scrollSamples) / samplesPerPixel;
+            if (std::fabs(mouse.x - mx) < 8.0) { hitMarker = true; break; }
+        }
+        if (!hitMarker) {
+            const auto& target = edit.markerTracks().front();
+            double localX = mouse.x - (origin.x + gutterWidth);
+            int64_t pos = static_cast<int64_t>(
+                std::max(0.0, scrollSamples + localX * samplesPerPixel));
+            Marker marker;
+            marker.name = "Marker";
+            marker.position = pos;
+            undo.execute(std::make_unique<editing::AddMarkerCommand>(target.id, marker));
+        }
+    }
+
+    // Single-click on a marker seeks the transport to it (navigation). Skipped
+    // during a drag so the playhead doesn't jump while you're moving a marker.
+    if (laneHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !view.dragging) {
+        for (const auto& [m, mt] : items) {
+            double mx = origin.x + gutterWidth +
+                (m->position - scrollSamples) / samplesPerPixel;
+            if (std::fabs(mouse.x - mx) < 8.0) {
+                transport.seek(m->position);
+                break;
+            }
+        }
+    }
+
+    return laneHeight;
 }
 
 } // namespace dave::gui

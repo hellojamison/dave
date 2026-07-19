@@ -4,6 +4,8 @@
 #include "editing/Command.h"
 #include "engine/transport/Transport.h"
 
+#include <imgui.h>
+
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -43,6 +45,9 @@ struct TimelineViewState {
     int64_t dragClipOriginalStart = 0;
     std::string dragOriginalTrackId;  // track the clip came from
     bool dragging = false;
+    // Marker drag: the screen-X where the drag started, so we can show the
+    // marker moving live (offset from dragClipOriginalStart) before commit.
+    float markerDragStartX = 0.0f;
 };
 
 // Draw the timeline widget. Caller passes everything in; the widget holds no
@@ -57,5 +62,19 @@ void drawTimeline(const document::Edit& edit,
                       std::vector<std::vector<float>>>& assetBuffers,
                   float trackHeight = 80.0f,
                   float timelineHeight = 28.0f);
+
+// Draw the marker lane (a strip above the track rows showing markers as flags
+// and regions). Returns the height it consumed (caller reserves that much
+// vertical space above the tracks). Interactions: double-click adds a marker,
+// drag moves, right-click opens a context menu, click seeks.
+float drawMarkerLane(const document::Edit& edit,
+                     editing::UndoStack& undo,
+                     engine::Transport& transport,
+                     TimelineViewState& view,
+                     ImVec2 origin,     // top-left of the lane (screen space)
+                     float totalWidth,  // available width
+                     float gutterWidth, // left gutter (track-name column)
+                     double scrollSamples,
+                     double samplesPerPixel);
 
 } // namespace dave::gui

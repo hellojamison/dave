@@ -57,6 +57,21 @@ public:
     std::string addPlugin(const std::string& trackId, PluginSlot slot);
     bool removePlugin(const std::string& trackId, const std::string& slotId);
 
+    // --- Marker tracks -----------------------------------------------------
+    // Marker tracks are category layers (Cues, Scenes, etc.). The Edit owns a
+    // list; addMarkerTrack returns the new track's id.
+    std::string addMarkerTrack(const std::string& name);
+    bool removeMarkerTrack(const std::string& trackId);
+    MarkerTrack* markerTrack(const std::string& trackId);
+    const std::vector<MarkerTrack>& markerTracks() const { return markerTracks_; }
+
+    // --- Markers -----------------------------------------------------------
+    // Add a marker to a marker track. Assigns a stable id; returns it (or
+    // empty string if the track doesn't exist).
+    std::string addMarker(const std::string& trackId, Marker marker);
+    Marker* marker(const std::string& trackId, const std::string& markerId);
+    bool removeMarker(const std::string& trackId, const std::string& markerId);
+
     // --- Change notification ----------------------------------------------
     // Listeners are notified after every mutation (so the engine/UI can
     // re-derive). Notifications fire on the UI thread.
@@ -68,6 +83,7 @@ private:
     std::string newId(const char* prefix) const;
 
     std::vector<Track> tracks_;
+    std::vector<MarkerTrack> markerTracks_;
     std::unordered_map<AssetId, AudioAsset> assets_;
     ChangeCallback onChange_;
     uint64_t idCounter_ = 0;

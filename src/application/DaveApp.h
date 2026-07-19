@@ -43,6 +43,8 @@ private:
     void onEditChanged();           // re-derive + recompile + publish
     void loadWavIntoEdit(const std::string& path);
     void openWavDialog();
+    void importMarkersDialog();
+    void exportMarkersDialog();
     void handleShortcuts();
     void drawUI();
     void drawPluginsPanel();

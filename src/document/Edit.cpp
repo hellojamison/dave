@@ -197,4 +197,16 @@ bool Edit::removeMarker(const std::string& trackId, const std::string& markerId)
     return false;
 }
 
+const Marker* Edit::activeLoopMarker() const {
+    for (const auto& mt : markerTracks_) {
+        for (const auto& m : mt.markers) {
+            if (m.kind == MarkerKind::Loop && m.length > 0 &&
+                m.posMode == MarkerPosMode::Sample) {
+                return &m;
+            }
+        }
+    }
+    return nullptr;
+}
+
 } // namespace dave::document

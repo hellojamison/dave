@@ -72,6 +72,11 @@ public:
     Marker* marker(const std::string& trackId, const std::string& markerId);
     bool removeMarker(const std::string& trackId, const std::string& markerId);
 
+    // Find the first active Loop-kind region marker (length > 0). Used by the
+    // transport to sync its loop region. Returns nullptr if none.
+    // (Sample-mode only for RB-4; other modes resolve later.)
+    const Marker* activeLoopMarker() const;
+
     // --- Change notification ----------------------------------------------
     // Listeners are notified after every mutation (so the engine/UI can
     // re-derive). Notifications fire on the UI thread.

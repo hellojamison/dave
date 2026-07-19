@@ -544,6 +544,44 @@ float drawMarkerLane(const document::Edit& edit,
         }
     }
 
+    // Right-click the lane for a context menu: add point marker, add loop
+    // region (default 1s), or clear loop.
+    if (laneHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+        double localX = mouse.x - (origin.x + gutterWidth);
+        int64_t clickPos = static_cast<int64_t>(
+            std::max(0.0, scrollSamples + localX * samplesPerPixel));
+        ImGui::OpenPopup("##marker_ctx");
+        // Stash the click position for the menu handlers.
+        view.dragClipOriginalStart = clickPos; // reuse as temp scratch
+    }
+    if (ImGui::BeginPopup("##marker_ctx")) {
+        int64_t pos = view.dragClipOriginalStart; // the stashed click position
+        const auto& target = edit.markerTracks().front();
+        if (ImGui::MenuItem("Add point marker")) {
+            Marker m; m.name = "Marker"; m.position = pos;
+            undo.execute(std::make_unique<editing::AddMarkerCommand>(target.id, m));
+        }
+        if (ImGui::MenuItem("Add loop region (1s)")) {
+            Marker m;
+            m.name = "Loop";
+            m.kind = MarkerKind::Loop;
+            m.position = pos;
+            m.length = 48000; // 1s @ 48k
+            undo.execute(std::make_unique<editing::AddMarkerCommand>(target.id, m));
+        }
+        if (edit.activeLoopMarker() && ImGui::MenuItem("Clear loop")) {
+            // Remove all loop markers.
+            for (const auto& mt : edit.markerTracks()) {
+                for (const auto& m : mt.markers) {
+                    if (m.kind == MarkerKind::Loop) {
+                        undo.execute(std::make_unique<editing::RemoveMarkerCommand>(mt.id, m.id));
+                    }
+                }
+            }
+        }
+        ImGui::EndPopup();
+    }
+
     // Single-click on a marker seeks the transport to it (navigation). Skipped
     // during a drag so the playhead doesn't jump while you're moving a marker.
     if (laneHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !view.dragging) {

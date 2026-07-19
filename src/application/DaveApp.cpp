@@ -1,4 +1,5 @@
 #include "application/DaveApp.h"
+#include "document/MarkerCsv.h"
 #include "editing/Commands.h"
 #include "gui/Theme.h"
 
@@ -8,6 +9,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <fstream>
 #include <string>
 
 namespace dave::application {
@@ -86,6 +88,16 @@ void DaveApp::onEditChanged() {
         return;
     }
     audio_.setCompiledGraph(std::move(compiled));
+
+    // Sync the transport's loop region from the first active Loop marker (if
+    // any). Adding/moving/removing a loop region marker updates transport
+    // looping behavior immediately.
+    auto& transport = audio_.transport();
+    if (const auto* loop = edit_.activeLoopMarker()) {
+        transport.setLoop(loop->position, loop->position + loop->length);
+    } else {
+        transport.clearLoop();
+    }
 }
 
 void DaveApp::loadWavIntoEdit(const std::string& path) {
@@ -145,6 +157,9 @@ void DaveApp::drawUI() {
     if (ImGui::BeginMainMenuBar()) {
         if (ImGui::BeginMenu("File")) {
             if (ImGui::MenuItem("Load WAV...", "Ctrl+O")) openWavDialog();
+            ImGui::Separator();
+            if (ImGui::MenuItem("Import Markers (Reaper CSV)...")) importMarkersDialog();
+            if (ImGui::MenuItem("Export Markers (Reaper CSV)...")) exportMarkersDialog();
             ImGui::Separator();
             if (ImGui::MenuItem("Quit", "Ctrl+Q")) window_.close();
             ImGui::EndMenu();
@@ -301,6 +316,45 @@ void DaveApp::openWavDialog() {
         std::string p = outPath;
         NFD_FreePath(outPath);
         loadWavIntoEdit(p);
+    }
+}
+
+void DaveApp::importMarkersDialog() {
+    nfdnchar_t* outPath = nullptr;
+    nfdnfilteritem_t filter{"Reaper marker CSV", "csv"};
+    if (NFD_OpenDialog(&outPath, &filter, 1, nullptr) == NFD_OKAY && outPath) {
+        std::string path = outPath;
+        NFD_FreePath(outPath);
+        std::ifstream f(path);
+        if (!f) { std::fprintf(stderr, "Dave: could not open %s\n", path.c_str()); return; }
+        std::string csv((std::istreambuf_iterator<char>(f)),
+                         std::istreambuf_iterator<char>());
+        // Import into the first existing marker track (the default "Markers"),
+        // or create an "Imported" track if none.
+        std::string targetId;
+        if (!edit_.markerTracks().empty()) targetId = edit_.markerTracks().front().id;
+        std::string usedId = document::importMarkersReaperCsv(
+            edit_, audio_.sampleRate(), csv, targetId);
+        if (!usedId.empty()) {
+            std::fprintf(stderr, "Dave: imported markers into track '%s'\n", usedId.c_str());
+        } else {
+            std::fprintf(stderr, "Dave: marker CSV had no parseable rows\n");
+        }
+    }
+}
+
+void DaveApp::exportMarkersDialog() {
+    nfdnchar_t* outPath = nullptr;
+    nfdnfilteritem_t filter{"Reaper marker CSV", "csv"};
+    if (NFD_SaveDialog(&outPath, &filter, 1, nullptr, "markers.csv") == NFD_OKAY && outPath) {
+        std::string path = outPath;
+        NFD_FreePath(outPath);
+        std::string csv = document::exportMarkersReaperCsv(edit_, audio_.sampleRate());
+        std::ofstream f(path);
+        if (!f) { std::fprintf(stderr, "Dave: could not write %s\n", path.c_str()); return; }
+        f << csv;
+        std::fprintf(stderr, "Dave: exported markers to %s (%zu bytes)\n",
+                     path.c_str(), csv.size());
     }
 }
 

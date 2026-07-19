@@ -6,7 +6,9 @@
 #include <nfd.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
+#include <string>
 
 namespace dave::application {
 
@@ -21,15 +23,6 @@ bool DaveApp::init() {
     }
     if (!audio_.start(48000.0, 2)) {
         std::fprintf(stderr, "Dave: audio engine failed to start\n");
-    }
-
-    // TEMPORARY: scan plugins on startup to verify the VST3 host discovery
-    // works. Remove once the plugin browser UI is in place.
-    pluginHost_.scan();
-    for (const auto& d : pluginHost_.descriptors()) {
-        std::fprintf(stderr, "Dave[plugins]:   %-20s [%s] by %s  uid=%s\n",
-                     d.name.c_str(), d.subCategories.c_str(), d.vendor.c_str(),
-                     d.uidString.c_str());
     }
 
     // Wire the Edit's change signal to graph re-derivation.
@@ -266,16 +259,30 @@ void DaveApp::drawUI() {
     ImGui::End();
     ImGui::PopStyleVar();
 
-    // --- Timeline (fills the rest) ----------------------------------------
-    ImGui::SetNextWindowPos(ImVec2(0, ImGui::GetMainViewport()->WorkPos.y + 56),
-                            ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(ImGui::GetMainViewport()->WorkSize.x,
-                                    ImGui::GetMainViewport()->WorkSize.y - 56),
-                             ImGuiCond_Always);
+    // --- Layout: Timeline on the left, Plugins panel docked on the right ----
+    // Reserve a fixed-width column on the right for the Plugins panel so it
+    // can't be hidden behind the Timeline (which previously filled everything).
+    const float pluginsPanelWidth = 280.0f;
+    const float workW = ImGui::GetMainViewport()->WorkSize.x;
+    const float workH = ImGui::GetMainViewport()->WorkSize.y;
+    const float workY = ImGui::GetMainViewport()->WorkPos.y;
+    const float timelineWidth = workW - pluginsPanelWidth;
+
+    // --- Timeline (left, fills width minus the plugins column) -------------
+    ImGui::SetNextWindowPos(ImVec2(0, workY + 56), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(timelineWidth, workH - 56), ImGuiCond_Always);
     ImGui::Begin("Timeline", nullptr,
                  ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar);
     gui::drawTimeline(edit_, undo_, transport, peaks_, view_, builder_.assetBuffers());
     ImGui::End();
+
+    // --- Plugins panel (right column) -------------------------------------
+    ImGui::SetNextWindowPos(ImVec2(timelineWidth, workY + 56), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(pluginsPanelWidth, workH - 56), ImGuiCond_Always);
+    drawPluginsPanel();
+
+    // Plugin browser modal (only when showPluginBrowser_ is true).
+    drawPluginBrowser();
 }
 
 void DaveApp::openWavDialog() {
@@ -290,6 +297,126 @@ void DaveApp::openWavDialog() {
 
 void DaveApp::run() {
     window_.run();
+}
+
+void DaveApp::drawPluginsPanel() {
+    // NoTitleBar + NoMove: it's a fixed dock column, not a floating window.
+    ImGui::Begin("Plugins", nullptr,
+                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove |
+                 ImGuiWindowFlags_NoCollapse);
+
+    // Operate on the currently-selected track (selectedTrackIndex in the view).
+    int sel = view_.selectedTrackIndex;
+    if (sel < 0 || sel >= static_cast<int>(edit_.tracks().size())) {
+        ImGui::TextDisabled("Select a track to manage its plugins.");
+        ImGui::End();
+        return;
+    }
+
+    const auto& track = edit_.tracks()[sel];
+    ImGui::Text("Track: %s", track.name.c_str());
+    ImGui::Separator();
+
+    // The plugin chain.
+    if (track.plugins.empty()) {
+        ImGui::TextDisabled("(no plugins)");
+    }
+    int slotIdx = 0;
+    for (const auto& slot : track.plugins) {
+        ImGui::PushID(slotIdx);
+        // Bypass checkbox + name + Edit + Remove.
+        bool bypass = slot.bypass;
+        if (ImGui::Checkbox("##bypass", &bypass)) {
+            const_cast<document::PluginSlot&>(slot).bypass = bypass;
+            edit_.notifyChanged();
+        }
+        ImGui::SameLine();
+        if (slot.bypass) ImGui::TextDisabled("%s", slot.name.c_str());
+        else             ImGui::Text("%s", slot.name.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Edit")) {
+            // Open (or focus) the plugin's editor window. The PluginInstance is
+            // owned by GraphBuilder, keyed by slot id — we look it up there.
+            auto inst = builder_.pluginInstance(slot.id);
+            if (inst) {
+                auto& ed = editors_[slot.id];
+                if (!ed) ed = std::make_unique<engine::PluginEditor>();
+                if (!ed->isOpen()) {
+                    ed->open(*inst, slot.name);
+                }
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Remove")) {
+            undo_.execute(std::make_unique<editing::RemovePluginCommand>(track.id, slot.id));
+            editors_.erase(slot.id); // close its editor if open
+        }
+        ImGui::PopID();
+        ++slotIdx;
+    }
+
+    ImGui::Separator();
+    if (ImGui::Button("Add Plugin")) {
+        // Scan if not already done, then open the browser targeting this track.
+        if (pluginHost_.descriptors().empty()) {
+            pluginHost_.scan();
+        }
+        browserTargetTrackId_ = track.id;
+        showPluginBrowser_ = true;
+    }
+
+    ImGui::End();
+}
+
+void DaveApp::drawPluginBrowser() {
+    if (!showPluginBrowser_) return;
+
+    ImGui::SetNextWindowSize(ImVec2(500, 360), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_FirstUseEver,
+                            ImVec2(0.5f, 0.5f));
+    if (ImGui::Begin("Add Plugin", &showPluginBrowser_,
+                     ImGuiWindowFlags_NoDocking)) {
+        ImGui::Text("Available VST3 plugins");
+        ImGui::SameLine();
+        ImGui::TextDisabled("(%zu found)", pluginHost_.descriptors().size());
+        ImGui::InputText("##filter", browserFilter_, sizeof(browserFilter_));
+        ImGui::Separator();
+
+        // List plugins; clicking one adds it to the target track.
+        // Use the loop index for PushID to guarantee unique widget IDs (the
+        // 'Add' button + Text appear in every row, so they'd collide without
+        // a per-row ID scope).
+        int pluginIdx = 0;
+        for (const auto& d : pluginHost_.descriptors()) {
+            if (browserFilter_[0] != '\0') {
+                std::string name = d.name;
+                std::string filt = browserFilter_;
+                std::transform(name.begin(), name.end(), name.begin(), ::tolower);
+                std::transform(filt.begin(), filt.end(), filt.begin(), ::tolower);
+                if (name.find(filt) == std::string::npos) { ++pluginIdx; continue; }
+            }
+            ImGui::PushID(pluginIdx);
+            ImGui::Bullet();
+            ImGui::SameLine();
+            ImGui::Text("%s", d.name.c_str());
+            ImGui::SameLine();
+            ImGui::TextDisabled("[%s] %s", d.subCategories.c_str(), d.vendor.c_str());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Add")) {
+                document::PluginSlot slot;
+                slot.name = d.name;
+                slot.uidString = d.uidString;
+                slot.path = d.path;
+                slot.bypass = false;
+                undo_.execute(std::make_unique<editing::AddPluginCommand>(
+                    browserTargetTrackId_, slot));
+                showPluginBrowser_ = false;
+            }
+            ImGui::PopID();
+            ++pluginIdx;
+        }
+    }
+    ImGui::End();
 }
 
 } // namespace dave::application

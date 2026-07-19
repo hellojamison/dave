@@ -56,6 +56,11 @@ public:
     const std::string& name() const { return name_; }
     const std::string& lastError() const { return lastError_; }
 
+    // Access the edit controller as an opaque FUnknown* (for PluginEditor to
+    // call createView). Returns nullptr if no controller. The pointer is only
+    // valid while the instance is loaded. Main thread.
+    void* editControllerAsUnknown() const;
+
 private:
     struct Impl; // hides SDK-owned types from the header
     std::unique_ptr<Impl> p_;

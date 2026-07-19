@@ -81,9 +81,11 @@ target_include_directories(Dave PRIVATE
 # .vst3 bundles via dlopen and needs ARC on macOS.
 if(APPLE)
     target_sources(Dave PRIVATE
-        "${THIRD_PARTY}/vst3sdk/public.sdk/source/vst/hosting/module_mac.mm")
+        "${THIRD_PARTY}/vst3sdk/public.sdk/source/vst/hosting/module_mac.mm"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/engine/plugins/PluginEditor_mac.mm")
     set_source_files_properties(
-        "${THIRD_PARTY}/vst3sdk/public.sdk/source/vst/hosting/module_mac.mm" PROPERTIES
+        "${THIRD_PARTY}/vst3sdk/public.sdk/source/vst/hosting/module_mac.mm"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/engine/plugins/PluginEditor_mac.mm" PROPERTIES
         COMPILE_FLAGS "-fobjc-arc")
 elseif(WIN32)
     target_sources(Dave PRIVATE

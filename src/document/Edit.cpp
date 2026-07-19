@@ -114,4 +114,27 @@ bool Edit::removeClip(const std::string& trackId, const std::string& clipId) {
     return false;
 }
 
+std::string Edit::addPlugin(const std::string& trackId, PluginSlot slot) {
+    Track* t = track(trackId);
+    if (t == nullptr) return "";
+    slot.id = newId("plugin_");
+    ++idCounter_;
+    t->plugins.push_back(std::move(slot));
+    notifyChanged();
+    return t->plugins.back().id;
+}
+
+bool Edit::removePlugin(const std::string& trackId, const std::string& slotId) {
+    Track* t = track(trackId);
+    if (t == nullptr) return false;
+    for (auto it = t->plugins.begin(); it != t->plugins.end(); ++it) {
+        if (it->id == slotId) {
+            t->plugins.erase(it);
+            notifyChanged();
+            return true;
+        }
+    }
+    return false;
+}
+
 } // namespace dave::document

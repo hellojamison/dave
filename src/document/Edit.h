@@ -51,6 +51,12 @@ public:
     AudioClip* clip(const std::string& trackId, const std::string& clipId);
     bool removeClip(const std::string& trackId, const std::string& clipId);
 
+    // --- Plugins (effect chain) -------------------------------------------
+    // Append a plugin slot to a track's chain. Assigns a stable id and returns
+    // it. Returns empty string if the track doesn't exist.
+    std::string addPlugin(const std::string& trackId, PluginSlot slot);
+    bool removePlugin(const std::string& trackId, const std::string& slotId);
+
     // --- Change notification ----------------------------------------------
     // Listeners are notified after every mutation (so the engine/UI can
     // re-derive). Notifications fire on the UI thread.

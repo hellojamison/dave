@@ -131,9 +131,26 @@ void drawTimeline(const document::Edit& edit,
         dl->AddLine(ImVec2(origin.x, y + trackHeight),
                     ImVec2(origin.x + totalWidth, y + trackHeight),
                     C(pal.border));
+        // If selected, highlight the gutter with an accent stripe so it's
+        // obvious which track the Plugins panel is targeting.
+        if (selected) {
+            dl->AddRectFilled(ImVec2(origin.x, y),
+                              ImVec2(origin.x + 4, y + trackHeight),
+                              C(pal.accent));
+        }
         // Track header (in the gutter).
         dl->AddText(ImVec2(origin.x + 10, y + 9),
                     C(pal.text), track.name.c_str());
+
+        // Click the gutter (track header) to select this track. This matters
+        // for empty tracks — they have no clip to click, so without this the
+        // Plugins panel ("select a track...") could never target them.
+        if (areaHovered &&
+            mouse.x >= origin.x && mouse.x <= origin.x + gutterWidth &&
+            mouse.y >= y && mouse.y <= y + trackHeight &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            view.selectedTrackIndex = static_cast<int>(ti);
+        }
         // Mini gain meter placeholder in the header.
         char gainLabel[16];
         std::snprintf(gainLabel, sizeof(gainLabel), "%.1f dB",

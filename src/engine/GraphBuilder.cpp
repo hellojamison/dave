@@ -4,6 +4,7 @@
 #include <dr_wav.h>
 
 #include <cstdio>
+#include <unordered_set>
 
 namespace dave::engine {
 
@@ -33,19 +34,29 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit, double sa
         auto gainId = graph->addNode(gain);
         trackGains_[track.id] = gain;
 
+        // The "chain source" is what feeds the plugin chain (and ultimately the
+        // track gain). For a track with clips it's the clip summing node; for
+        // an empty track (clips but possibly plugins) we still need a node to
+        // anchor the chain, so we use a silent SummingNode with 0 inputs.
+        // (Previously this `continue`d on empty clips, which skipped the plugin
+        // chain entirely — a bug that meant plugins on clip-less tracks never
+        // loaded and Edit failed.)
+        NodeId chainSource;
+        std::shared_ptr<SummingNode> trackSum;
         if (track.clips.empty()) {
-            graph->connect(gainId, 0, masterSumId, trackIndex);
-            ++trackIndex;
-            continue;
-        }
+            // Silent source: a sum with no inputs produces silence. Plugins on
+            // an empty track thus process silence (audible only once a clip is
+            // added, but the chain + instance exist so Edit works immediately).
+            trackSum = std::make_shared<SummingNode>(1);
+            chainSource = graph->addNode(trackSum);
+        } else {
+            trackSum = std::make_shared<SummingNode>(static_cast<int>(track.clips.size()));
+            chainSource = graph->addNode(trackSum);
 
-        auto trackSum = std::make_shared<SummingNode>(static_cast<int>(track.clips.size()));
-        auto trackSumId = graph->addNode(trackSum);
-
-        int clipIdx = 0;
-        for (const auto& clip : track.clips) {
-            const auto* asset = edit.asset(clip.asset);
-            if (asset == nullptr) continue;
+            int clipIdx = 0;
+            for (const auto& clip : track.clips) {
+                const auto* asset = edit.asset(clip.asset);
+                if (asset == nullptr) continue;
 
             // Cache the decoded buffer by asset id so re-derives don't reload.
             auto cacheIt = assetCache_.buffers.find(asset->id.sha256);
@@ -81,16 +92,63 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit, double sa
             node->setFades(clip.fadeIn, clip.fadeOut);
             auto nodeId = graph->addNode(node);
             clipNodes_[clip.id] = node;
-            graph->connect(nodeId, 0, trackSumId, clipIdx);
-            ++clipIdx;
+            graph->connect(nodeId, 0, chainSource, clipIdx);
+                ++clipIdx;
+            }
+        } // end else (track has clips)
+
+        // Build the plugin chain: chainSource → plugin[0] → ... → plugin[n-1] → gain.
+        // chainSource was set above (clip sum, or silent sum for empty tracks).
+        for (const auto& slot : track.plugins) {
+            if (slot.bypass) continue; // skip bypassed plugins
+
+            // Get-or-create the cached PluginInstance for this slot.
+            auto& inst = pluginInstances_[slot.id];
+            if (!inst) {
+                inst = std::make_shared<PluginInstance>();
+                PluginDescriptor desc;
+                desc.name = slot.name;
+                desc.path = slot.path;
+                desc.uidString = slot.uidString;
+                if (!inst->load(desc, sampleRate, 256)) {
+                    std::fprintf(stderr, "Dave: failed to load plugin '%s': %s\n",
+                                 slot.name.c_str(), inst->lastError().c_str());
+                    inst.reset();
+                    continue;
+                }
+            }
+
+            auto node = std::make_shared<PluginNode>(inst);
+            auto nodeId = graph->addNode(node);
+            graph->connect(chainSource, 0, nodeId, 0);
+            chainSource = nodeId;
         }
 
-        graph->connect(trackSumId, 0, gainId, 0);
+        graph->connect(chainSource, 0, gainId, 0);
         graph->connect(gainId, 0, masterSumId, trackIndex);
         ++trackIndex;
     }
 
+    // Prune cached plugin instances for slots that no longer exist (the slot
+    // was removed from the Edit). Collect live slot ids first.
+    std::unordered_set<std::string> liveSlots;
+    for (const auto& track : edit.tracks()) {
+        for (const auto& slot : track.plugins) {
+            liveSlots.insert(slot.id);
+        }
+    }
+    for (auto it = pluginInstances_.begin(); it != pluginInstances_.end();) {
+        if (liveSlots.count(it->first) == 0) {
+            if (it->second) it->second->unload();
+            it = pluginInstances_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
     return graph;
 }
+
+GraphBuilder::~GraphBuilder() = default;
 
 } // namespace dave::engine

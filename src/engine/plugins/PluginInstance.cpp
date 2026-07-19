@@ -79,15 +79,33 @@ bool PluginInstance::load(const PluginDescriptor& desc, double sampleRate, int m
         return false;
     }
 
-    // 5) Create the edit controller (found via the component's controllerCID).
-    //    getControllerClassId writes a raw TUID (int8[16]); convert to VST3::UID.
+    // 5) Create the edit controller. Two paths (per Steinberg's host guidance):
+    //    a) getControllerClassId returns a CID → instantiate it from the factory.
+    //    b) Fallback: query the COMPONENT directly for IEditController. Many
+    //       plugins (single-binary, or "simple" ones) implement both the
+    //       processor and the controller on the same object, and don't report
+    //       a separate controllerCID. Without this fallback, Melodyne (and
+    //       others) load fine but have no editor.
     TUID controllerCID;
     if (p_->component->getControllerClassId(controllerCID) == kResultTrue) {
         VST3::UID ctrlUid = VST3::UID::fromTUID(controllerCID);
         p_->controller = factory.createInstance<IEditController>(ctrlUid);
         if (p_->controller) {
             p_->controller->initialize(ctx);
+            // Per VST3 spec, connect the controller to the component so parameter
+            // changes propagate. (Best-effort; not all plugins need it.)
+            FUnknownPtr<IConnectionPoint> componentCP(p_->component);
+            FUnknownPtr<IConnectionPoint> controllerCP(p_->controller);
+            if (componentCP && controllerCP) {
+                componentCP->connect(controllerCP);
+            }
         }
+    }
+    if (!p_->controller) {
+        // Fallback: the component may itself implement IEditController.
+        p_->controller = FUnknownPtr<IEditController>(p_->component);
+        // Note: do NOT call initialize on a component-obtained controller — it
+        // shares the component's already-initialized state.
     }
 
     // 6) Activate only the main audio buses (bus 0 in/out). Plugins with extra
@@ -220,6 +238,13 @@ void PluginInstance::unload() {
     p_->hostContext = nullptr;
     p_->module.reset();
     loaded_ = false;
+}
+
+void* PluginInstance::editControllerAsUnknown() const {
+    // Return the controller as FUnknown*. PluginEditor queries it for IPlugView.
+    if (!loaded_ || !p_->controller) return nullptr;
+    Steinberg::FUnknown* fu = static_cast<Steinberg::Vst::IEditController*>(p_->controller.get());
+    return fu;
 }
 
 } // namespace dave::engine

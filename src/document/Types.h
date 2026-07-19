@@ -40,14 +40,33 @@ struct AudioClip {
     int64_t fadeOut = 0;         // fade-out length in samples
 };
 
-// A track holds an ordered list of clips and a gain/pan. RB-2: one track type
-// (audio). MIDI tracks come later.
+// A plugin slot is one entry in a track's effect chain. It references the
+// plugin by descriptor (uid + path + name) so it survives save/load, and holds
+// a (runtime-only, non-serialized) instance pointer once the GraphBuilder has
+// instantiated it. The chain is processed in order: clip sum -> slot[0] ->
+// slot[1] -> ... -> track output.
+struct PluginSlot {
+    std::string id;              // stable id within the track
+    std::string name;            // display name (e.g. "Melodyne")
+    std::string uidString;       // VST3 class UID (identifies which plugin)
+    std::string path;            // .vst3 bundle path (for reload)
+    bool bypass = false;
+    // Runtime instance — set by GraphBuilder on re-derive, not serialized.
+    // Raw pointer is fine: GraphBuilder owns the PluginInstance (in its cache),
+    // and the slot's pointer is invalidated + repopulated each re-derive.
+    // (For RB-3 the instance lives as long as the slot; deletion-on-remove is
+    // handled when the slot is removed from the chain.)
+};
+
+// A track holds an ordered list of clips, a plugin chain, and a gain/pan.
+// RB-2: one track type (audio). MIDI tracks come later.
 struct Track {
     std::string id;              // stable id
     std::string name;
     double gain = 1.0;
     double pan = 0.0;            // -1 (L) .. +1 (R)
     std::vector<AudioClip> clips;
+    std::vector<PluginSlot> plugins;  // effect chain, processed in order
 };
 
 } // namespace dave::document

@@ -3,12 +3,17 @@
 #include "document/Edit.h"
 #include "editing/Command.h"
 #include "engine/GraphBuilder.h"
+#include "engine/plugins/PluginEditor.h"
 #include "engine/plugins/PluginHost.h"
 #include "engine/transport/Transport.h"
 #include "gui/ImGuiLayer.h"
 #include "gui/Timeline.h"
 #include "platform/AudioEngine.h"
 #include "platform/Window.h"
+
+#include <memory>
+#include <string>
+#include <unordered_map>
 
 namespace dave::application {
 
@@ -40,6 +45,8 @@ private:
     void openWavDialog();
     void handleShortcuts();
     void drawUI();
+    void drawPluginsPanel();
+    void drawPluginBrowser();
 
     platform::Window window_{1280, 800, "Dave"};
     gui::ImGuiLayer imgui_;
@@ -52,6 +59,14 @@ private:
 
     gui::PeakCache peaks_;
     gui::TimelineViewState view_;
+
+    // Plugin browser modal state.
+    bool showPluginBrowser_ = false;
+    std::string browserTargetTrackId_;  // track to add the plugin to
+    char browserFilter_[128] = "";
+
+    // Open plugin editors, keyed by slot id. One floating NSWindow per slot.
+    std::unordered_map<std::string, std::unique_ptr<engine::PluginEditor>> editors_;
 };
 
 } // namespace dave::application

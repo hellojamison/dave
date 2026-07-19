@@ -122,4 +122,48 @@ private:
     document::AudioClip snapshot_;
 };
 
+// AddPlugin: appends a plugin slot to a track's effect chain. Undo removes it.
+class AddPluginCommand : public Command {
+public:
+    AddPluginCommand(std::string trackId, document::PluginSlot slot)
+        : trackId_(std::move(trackId)), slot_(std::move(slot)) {}
+    void perform(document::Edit& e) override { slotId_ = e.addPlugin(trackId_, slot_); }
+    void undo(document::Edit& e) override { e.removePlugin(trackId_, slotId_); }
+    std::string name() const override { return "Add Plugin"; }
+    const std::string& slotId() const { return slotId_; }
+private:
+    std::string trackId_;
+    document::PluginSlot slot_;
+    std::string slotId_;
+};
+
+// RemovePlugin: deletes a plugin slot. Undo restores it.
+class RemovePluginCommand : public Command {
+public:
+    RemovePluginCommand(std::string trackId, std::string slotId)
+        : trackId_(std::move(trackId)), slotId_(std::move(slotId)) {}
+    void perform(document::Edit& e) override {
+        // Snapshot the slot for undo.
+        const auto* t = e.track(trackId_);
+        if (t) for (const auto& s : t->plugins) if (s.id == slotId_) { snapshot_ = s; break; }
+        e.removePlugin(trackId_, slotId_);
+    }
+    void undo(document::Edit& e) override {
+        std::string newId = e.addPlugin(trackId_, snapshot_);
+        if (const auto* t = e.track(trackId_)) {
+            for (const auto& s : t->plugins) {
+                if (s.id == newId) {
+                    const_cast<document::PluginSlot&>(s).id = slotId_;
+                    break;
+                }
+            }
+        }
+    }
+    std::string name() const override { return "Remove Plugin"; }
+private:
+    std::string trackId_;
+    std::string slotId_;
+    document::PluginSlot snapshot_;
+};
+
 } // namespace dave::editing

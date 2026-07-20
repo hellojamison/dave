@@ -168,27 +168,37 @@ void drawTimeline(const document::Edit& edit,
         }
 
         // Interactive gain + pan controls in the gutter.
-        // Gain uses the Pro Tools dB scale: -inf to +6 dB. Internally stored
-        // as linear gain (0-2.0), displayed/slidered as dB.
+        // Option-click (Alt-click) resets to default: gain=0 dB, pan=center.
         ImGui::PushID(static_cast<int>(ti));
         {
             // Gain: dB slider from -60 to +6 dB. Convert to/from linear.
             ImGui::SetCursorScreenPos(ImVec2(origin.x + 10, y + trackHeight - 38));
             float gainDb = 20.0f * std::log10(std::max(0.0001f, static_cast<float>(track.gain)));
             ImGui::PushItemWidth(gutterWidth - 50);
+            // Option-click resets gain to 0 dB (unity).
             if (ImGui::SliderFloat("##gain", &gainDb, -60.0f, 6.0f, "%.1f dB")) {
                 float linear = std::pow(10.0f, gainDb / 20.0f);
                 const_cast<document::Track&>(track).gain = linear;
                 const_cast<document::Edit&>(edit).notifyChanged();
             }
+            if (ImGui::IsItemClicked() && ImGui::GetIO().KeyAlt) {
+                gainDb = 0.0f;
+                const_cast<document::Track&>(track).gain = 1.0f;
+                const_cast<document::Edit&>(edit).notifyChanged();
+            }
             ImGui::PopItemWidth();
         }
-        // Pan: -1=L to +1=R (same as before, Pro Tools uses L/C/R convention).
+        // Pan: -1=L to +1=R. Option-click resets to center (0.0).
         ImGui::SetCursorScreenPos(ImVec2(origin.x + 10, y + trackHeight - 18));
         float panVal = static_cast<float>(track.pan);
         ImGui::PushItemWidth(gutterWidth - 50);
         if (ImGui::SliderFloat("##pan", &panVal, -1.0f, 1.0f, "Pan %.1f")) {
             const_cast<document::Track&>(track).pan = panVal;
+            const_cast<document::Edit&>(edit).notifyChanged();
+        }
+        if (ImGui::IsItemClicked() && ImGui::GetIO().KeyAlt) {
+            panVal = 0.0f;
+            const_cast<document::Track&>(track).pan = 0.0f;
             const_cast<document::Edit&>(edit).notifyChanged();
         }
         ImGui::PopItemWidth();

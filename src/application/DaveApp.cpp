@@ -562,9 +562,6 @@ void DaveApp::saveProject(bool saveAs) {
 void DaveApp::drawVideoPreview() { drawVideoPreviewContent(); }
 
 void DaveApp::drawVideoPreviewContent() {
-
-
-    // Find the video clip active at the current playhead (RB-6: multi-clip).
     int64_t playhead = audio_.transport().position();
     const auto* clip = edit_.videoClipAt(playhead);
 
@@ -577,14 +574,10 @@ void DaveApp::drawVideoPreviewContent() {
     ImGui::Text("%s", clip->name.c_str());
     ImGui::SameLine();
     if (ImGui::SmallButton("Add Video...")) openVideoDialog();
-    ImGui::TextDisabled("%dx%d @ %.3ffps  %.1fs", clip->width, clip->height,
-                        clip->fps, clip->durationSeconds);
+    ImGui::TextDisabled("%dx%d @ %.3ffps", clip->width, clip->height, clip->fps);
 
-    // Compute the target video frame. relSamples includes sourceOffset so
-    // trimmed clips play from the right point in the source.
     const double audioSr = 48000.0;
-    int64_t relSamples = (playhead - clip->timelineStart) +
-                         (clip->sourceOffset / 1); // both in audio samples
+    int64_t relSamples = (playhead - clip->timelineStart) + clip->sourceOffset;
     double videoTimeSec = (relSamples > 0) ? (relSamples / audioSr) : 0.0;
     double clipDurationSec = (clip->length > 0)
         ? (clip->length / audioSr) : clip->durationSeconds;
@@ -592,21 +585,27 @@ void DaveApp::drawVideoPreviewContent() {
     int64_t frameIndex = (clip->fps > 0.0)
         ? static_cast<int64_t>(videoTimeSec * clip->fps) : 0;
 
-    // If the active clip changed, force a re-decode (close the old process).
+    // If the active clip changed, reset state.
     if (lastVideoClipId_ != clip->id) {
-        videoDecoder_.close();
         lastDecodedFrameIndex_ = -1;
         lastVideoClipId_ = clip->id;
     }
 
-    bool sequential = videoDecoder_.isOpen() && frameIndex == lastDecodedFrameIndex_ + 1;
-    double nowSec = ImGui::GetTime();
-    bool seekAllowed = sequential || (nowSec - lastSeekTime_ >= 0.15);
-    if (inRange && frameIndex != lastDecodedFrameIndex_ && seekAllowed) {
-        lastSeekTime_ = nowSec;
+    // Request a frame from the async decoder if the frame index changed
+    // and the decoder isn't already busy with a request.
+    if (inRange && frameIndex != lastDecodedFrameIndex_ && !asyncDecoder_.isBusy()) {
         const int previewMaxW = 480;
         int pw = clip->width, ph = clip->height;
         if (pw > previewMaxW) { ph = ph * previewMaxW / pw; pw = previewMaxW; }
+        double seekTo = static_cast<double>(frameIndex) / clip->fps;
+        asyncDecoder_.requestFrame(clip->path, seekTo, pw, ph, clip->fps);
+    }
+
+    // Check if the async decoder has a new frame ready.
+    engine::VideoFrame frame;
+    if (asyncDecoder_.getLatestFrame(frame) && frame.frameIndex == frameIndex) {
+        int pw = frame.width;
+        int ph = frame.height;
         if (videoTexture_ == 0 || videoTexW_ != pw || videoTexH_ != ph) {
             if (videoTexture_ == 0) glGenTextures(1, &videoTexture_);
             glBindTexture(GL_TEXTURE_2D, videoTexture_);
@@ -617,23 +616,13 @@ void DaveApp::drawVideoPreviewContent() {
             videoTexW_ = pw;
             videoTexH_ = ph;
         }
-        bool got = false;
-        if (sequential) {
-            got = videoDecoder_.readFrame(videoFrameBuf_);
-        }
-        if (!got) {
-            double seekTo = static_cast<double>(frameIndex) / clip->fps;
-            got = videoDecoder_.seekAndRead(clip->path, seekTo, pw, ph, videoFrameBuf_);
-        }
-        if (got && videoFrameBuf_.size() == static_cast<size_t>(pw * ph * 4)) {
-            glBindTexture(GL_TEXTURE_2D, videoTexture_);
-            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-            glPixelStorei(GL_UNPACK_ROW_LENGTH, pw);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, pw, ph, 0,
-                         GL_RGBA, GL_UNSIGNED_BYTE, videoFrameBuf_.data());
-            glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-            lastDecodedFrameIndex_ = frameIndex;
-        }
+        glBindTexture(GL_TEXTURE_2D, videoTexture_);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, pw);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, pw, ph, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, frame.rgba.data());
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+        lastDecodedFrameIndex_ = frameIndex;
     }
 
     if (videoTexture_ != 0 && videoTexW_ > 0 && videoTexH_ > 0) {
@@ -644,19 +633,13 @@ void DaveApp::drawVideoPreviewContent() {
         ImGui::Image(static_cast<ImTextureID>(videoTexture_),
                      ImVec2(drawW, drawH));
     } else {
-        ImGui::TextDisabled("(seek to a position to decode a frame)");
+        ImGui::TextDisabled("(loading...)");
     }
 
-    int mm = static_cast<int>(videoTimeSec) / 60;
-    int ss = static_cast<int>(videoTimeSec) % 60;
-    int ff = (clip->fps > 0.0) ? static_cast<int>((videoTimeSec - static_cast<int>(videoTimeSec)) * clip->fps) : 0;
-    char tc[32];
-    std::snprintf(tc, sizeof(tc), "%02d:%02d:%02d", mm, ss, ff);
-    ImGui::TextDisabled("TC %s  frame %lld  %s", tc,
-                        static_cast<long long>(frameIndex),
-                        inRange ? "" : "(out of range)");
-
-
+    ImGui::TextDisabled("%s  frame %lld  %s",
+        gui::formatTimecode(playhead, view_.tcMode).c_str(),
+        static_cast<long long>(frameIndex),
+        inRange ? "" : "(out of range)");
 }
 
 void DaveApp::drawPluginsPanel() { drawPluginsPanelContent(); }

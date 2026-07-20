@@ -6,6 +6,7 @@
 #include "engine/plugins/PluginEditor.h"
 #include "engine/plugins/PluginHost.h"
 #include "engine/transport/Transport.h"
+#include "engine/video/AsyncVideoDecoder.h"
 #include "engine/video/VideoDecoder.h"
 #include "gui/ImGuiLayer.h"
 #include "gui/Timeline.h"
@@ -87,6 +88,7 @@ private:
     // same video frame). Sequential playback keeps the ffmpeg process open;
     // big jumps (seek/scrub) close + respawn.
     engine::VideoDecoder videoDecoder_;
+    engine::AsyncVideoDecoder asyncDecoder_;  // background frame decode (no UI stall)
     unsigned int videoTexture_ = 0;     // GL texture id (0 = not created yet)
     int videoTexW_ = 0;                 // texture dimensions (preview-resolution)
     int videoTexH_ = 0;

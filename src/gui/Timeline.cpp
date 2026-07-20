@@ -702,12 +702,41 @@ float drawVideoLane(const document::Edit& edit,
                 dl->AddText(ImVec2(clipX + 6, origin.y + 10),
                             C(pal.text), clip.name.c_str());
             }
+            // Drag to move: start drag on click.
+            if (laneHovered && mouse.x >= clipX && mouse.x <= clipX + clipW &&
+                ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                view.selectedClipId = clip.id;
+                view.dragging = true;
+                view.dragOriginalTrackId = vt.id;
+                view.dragClipOriginalStart = clip.timelineStart;
+                view.markerDragStartX = mouse.x;
+            }
             ++clipCount;
         }
     }
 
-    // Click empty lane area to seek; click a clip to select.
-    if (laneHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+    // Handle active video clip drag (live move + commit on release).
+    if (view.dragging && !view.selectedClipId.empty()) {
+        if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+            // Find the selected video clip and move it.
+            double localX = mouse.x - (origin.x + gutterWidth);
+            int64_t newPos = static_cast<int64_t>(
+                std::max(0.0, scrollSamples + localX * samplesPerPixel));
+            for (auto& vt : const_cast<std::vector<document::VideoTrack>&>(edit.videoTracks())) {
+                for (auto& c : vt.clips) {
+                    if (c.id == view.selectedClipId) {
+                        c.timelineStart = std::max<int64_t>(0, newPos);
+                        break;
+                    }
+                }
+            }
+            view.dragging = false;
+            view.selectedClipId.clear();
+        }
+    }
+
+    // Click empty lane area to seek (only if not dragging a clip).
+    if (laneHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !view.dragging) {
         bool hitClip = false;
         for (const auto& vt : edit.videoTracks()) {
             for (const auto& clip : vt.clips) {
@@ -718,7 +747,6 @@ float drawVideoLane(const document::Edit& edit,
                     : static_cast<int64_t>(clip.durationSeconds * 48000.0);
                 double cw = static_cast<double>(len) / samplesPerPixel;
                 if (mouse.x >= cx && mouse.x <= cx + cw) {
-                    view.selectedClipId = clip.id;
                     hitClip = true;
                     break;
                 }

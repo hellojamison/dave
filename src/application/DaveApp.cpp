@@ -340,8 +340,18 @@ void DaveApp::drawUI() {
     drawPluginBrowser();
 
     // ─── Auto-stop ───────────────────────────────────────────────────────
+    // Only auto-stop if there's actual content (clips) on the timeline. An
+    // empty timeline has contentEnd=24000 (just the 0.5s tail), which would
+    // instantly stop playback before the user can do anything.
     if (audio_.transport().isPlaying()) {
-        if (audio_.transport().position() > edit_.contentEndSamples())
+        int64_t end = edit_.contentEndSamples();
+        bool hasClips = false;
+        for (const auto& t : edit_.tracks())
+            if (!t.clips.empty()) { hasClips = true; break; }
+        if (!edit_.videoTracks().empty())
+            for (const auto& vt : edit_.videoTracks())
+                if (!vt.clips.empty()) { hasClips = true; break; }
+        if (hasClips && audio_.transport().position() > end)
             audio_.transport().stop();
     }
 }

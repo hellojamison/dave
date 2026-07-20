@@ -11,30 +11,26 @@ namespace {
 Palette g_palette;
 
 // Build the palette once. Pro Tools-inspired light-neutral theme: steel-gray
-// toolbars over a light slate body, amber selection/playhead, blue clips.
-// Coherent neutral ramp (one hue, evenly-spaced steps) + one accent, per
-// impeccable's Restrained strategy — just on a LIGHT ground instead of dark.
+// Dark neutral theme — the readable choice for long mixing sessions. The light
+// "Pro Tools" palette had amber accent text on light slate = unreadable. Dark
+// bg with amber accent gives high contrast for both text and UI highlights.
 Palette makePalette() {
     Palette p;
-    // Neutral ramp — light cool slate (Pro Tools is one of the lighter DAWs).
-    // 6 steps; each panel/toolbar reads as a distinct layer without becoming
-    // unrelated greys.
-    p.bg               = hex(0xb8bcc4ff); // ramp[0]: timeline body (mid slate)
-    p.panel            = hex(0xcdd1d8ff); // ramp[1]: child panels
-    p.bgAlt            = hex(0xa8aeb8ff); // ramp[2]: alternating rows, frames
-    p.bgElevated       = hex(0x8e939bff); // ramp[3]: toolbars/menus (steel gray)
-    p.trackSelected    = hex(0xd9bd6eff); // ramp[4]: warm amber tint for selection
-    p.border           = hex(0x6f747cff); // ramp[5]: dark separators
-    // Text — dark on light (verified ≥4.5:1 against bg, impeccable's #1 rule).
-    p.text             = hex(0x1a1c20ff); // ~13:1 on bg
-    p.textMuted        = hex(0x4a4f57ff); // ~6.5:1 on bg
-    // Accent — amber. Selection, playhead, active transport, primary actions.
-    p.accent           = hex(0xe8a517ff);
-    p.accentHover      = hex(0xf5bc3eff);
-    // Clips — blue body so they don't read as "selected" by default; clearly
-    // distinct from the amber accent.
-    p.clipAudio        = hex(0x3a6db4ff);
-    p.clipAudioBorder  = hex(0x2a5288ff);
+    // Neutral ramp — dark cool (6 steps).
+    p.bg               = hex(0x1e1f23ff);
+    p.panel            = hex(0x25272dff);
+    p.bgAlt            = hex(0x2c2e36ff);
+    p.bgElevated       = hex(0x34373fff);
+    p.trackSelected    = hex(0x3a3d47ff);
+    p.border           = hex(0x444852ff);
+    // Text — near-white on dark, high contrast.
+    p.text             = hex(0xe8e9edff);
+    p.textMuted        = hex(0x9da2acff);
+    // Accent — amber. Readable as text on dark bg (unlike on light).
+    p.accent           = hex(0xf5a623ff);
+    p.accentHover      = hex(0xffb84dff);
+    p.clipAudio        = hex(0x4a7fc4ff);
+    p.clipAudioBorder  = hex(0x6a9fe4ff);
     return p;
 }
 } // namespace

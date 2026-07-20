@@ -48,6 +48,8 @@ struct TimelineViewState {
     // Marker drag: the screen-X where the drag started, so we can show the
     // marker moving live (offset from dragClipOriginalStart) before commit.
     float markerDragStartX = 0.0f;
+    // Snap-to-marker: when true, clip drags + seeks snap to nearby markers.
+    bool snapToMarkers = false;
 };
 
 // Draw the timeline widget. Caller passes everything in; the widget holds no

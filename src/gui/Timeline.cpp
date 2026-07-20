@@ -269,6 +269,24 @@ void drawTimeline(const document::Edit& edit,
         ImGui::EndPopup();
     }
 
+    // Snap helper: if snapToMarkers is on, snap a sample position to the
+    // nearest marker within a threshold (8px worth of samples).
+    auto snapPosition = [&](int64_t pos) -> int64_t {
+        if (!view.snapToMarkers) return pos;
+        int64_t threshold = static_cast<int64_t>(8.0 * view.samplesPerPixel);
+        int64_t best = pos;
+        int64_t bestDist = threshold;
+        for (const auto& mt : edit.markerTracks()) {
+            if (!mt.visible) continue;
+            for (const auto& m : mt.markers) {
+                if (m.posMode != document::MarkerPosMode::Sample) continue;
+                int64_t d = std::abs(m.position - pos);
+                if (d < bestDist) { bestDist = d; best = m.position; }
+            }
+        }
+        return best;
+    };
+
     // Handle drag delta for the active drag (committed on release).
     static int64_t dragStartMouseX = 0;
     static int64_t dragStartMouseY = 0;
@@ -293,7 +311,8 @@ void drawTimeline(const document::Edit& edit,
         for (auto& track : const_cast<std::vector<document::Track>&>(tracks)) {
             for (auto& clip : track.clips) {
                 if (clip.id == view.selectedClipId) {
-                    clip.timelineStart = std::max<int64_t>(0, view.dragClipOriginalStart + dxSamples);
+                    int64_t raw = std::max<int64_t>(0, view.dragClipOriginalStart + dxSamples);
+                    clip.timelineStart = snapPosition(raw);
                     break;
                 }
             }
@@ -337,7 +356,7 @@ void drawTimeline(const document::Edit& edit,
         double localX = mouse.x - (origin.x + gutterWidth);
         int64_t seekTo = static_cast<int64_t>(
             view.scrollSamples + std::max(0.0, localX) * view.samplesPerPixel);
-        transport.seek(seekTo);
+        transport.seek(snapPosition(seekTo));
     };
 
     // Ruler: click seeks; drag scrubs (continuous seek while held).

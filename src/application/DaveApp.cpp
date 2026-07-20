@@ -284,6 +284,10 @@ void DaveApp::drawUI() {
         if (ImGui::Button("+Track", btnSize))
             undo_.execute(std::make_unique<editing::AddTrackCommand>("Track"));
 
+        // Snap-to-marker toggle.
+        ImGui::SameLine();
+        ImGui::Checkbox("Snap", &view_.snapToMarkers);
+
         // Output device picker (far right, in the sidebar area).
         ImGui::SameLine();
         static int selectedDevice = -1;

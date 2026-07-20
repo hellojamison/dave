@@ -55,6 +55,9 @@ struct TimelineViewState {
     int64_t selectionStart = 0;
     int64_t selectionEnd = 0;
     bool isSelecting = false;
+    // Inline rename state.
+    bool isRenaming = false;
+    int renameTrackIndex = -1;
 };
 
 // Draw the timeline widget. Caller passes everything in; the widget holds no

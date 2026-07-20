@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 
 namespace dave::gui {
 
@@ -156,8 +157,55 @@ void drawTimeline(const document::Edit& edit,
                               C(pal.accent));
         }
         // Track header (in the gutter): name + gain slider + pan slider.
-        dl->AddText(ImVec2(origin.x + 10, y + 6),
-                    C(pal.text), track.name.c_str());
+        // Double-click the name to rename (inline text input).
+        {
+            // Unique ID for the rename input so each track has its own state.
+            char renameId[32];
+            std::snprintf(renameId, sizeof(renameId), "##rename_%zu", ti);
+            // Check if this track is being renamed.
+            bool& renaming = const_cast<bool&>(view.isRenaming); // reuse single flag
+            int& renameIdx = const_cast<int&>(view.renameTrackIndex);
+            bool thisRenaming = renaming && renameIdx == static_cast<int>(ti);
+
+            if (thisRenaming) {
+                // Show an InputText in place of the name.
+                ImGui::SetCursorScreenPos(ImVec2(origin.x + 8, y + 4));
+                ImGui::PushItemWidth(gutterWidth - 16);
+                ImGui::SetKeyboardFocusHere();
+                char nameBuf[128];
+                std::strncpy(nameBuf, track.name.c_str(), sizeof(nameBuf) - 1);
+                nameBuf[sizeof(nameBuf) - 1] = '\0';
+                ImGui::PushID(static_cast<int>(ti) + 1000);
+                if (ImGui::InputText(renameId, nameBuf, sizeof(nameBuf),
+                                     ImGuiInputTextFlags_EnterReturnsTrue |
+                                     ImGuiInputTextFlags_AutoSelectAll)) {
+                    const_cast<document::Track&>(track).name = nameBuf;
+                    const_cast<document::Edit&>(edit).notifyChanged();
+                    renaming = false;
+                }
+                // Lose focus (click away / Escape) = cancel rename.
+                if (!ImGui::IsItemActive() &&
+                    (ImGui::IsMouseClicked(ImGuiMouseButton_Left) ||
+                     ImGui::IsKeyPressed(ImGuiKey_Escape))) {
+                    renaming = false;
+                }
+                ImGui::PopID();
+                ImGui::PopItemWidth();
+            } else {
+                // Normal: draw the name as text.
+                dl->AddText(ImVec2(origin.x + 10, y + 6),
+                            C(pal.text), track.name.c_str());
+            }
+            // Double-click on the name area starts rename mode.
+            if (areaHovered &&
+                mouse.x >= origin.x && mouse.x <= origin.x + gutterWidth &&
+                mouse.y >= y && mouse.y <= y + 24 &&
+                ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                renaming = true;
+                renameIdx = static_cast<int>(ti);
+                view.selectedTrackIndex = static_cast<int>(ti);
+            }
+        }
 
         // Click the gutter to select this track.
         if (areaHovered &&

@@ -73,7 +73,8 @@ add_executable(Dave ${DAVE_SOURCES})
 
 target_include_directories(Dave PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
-    "${THIRD_PARTY}/miniaudio")  # miniaudio.h + dr_wav.h live here
+    "${THIRD_PARTY}/miniaudio"                      # miniaudio.h + dr_wav.h
+    "${THIRD_PARTY}/nlohmann_json/single_include")  # nlohmann/json.hpp
 
 # The VST3 platform module loader (module_mac.mm / module_linux.cpp /
 # module_win32.cpp) is NOT part of the sdk_hosting library — each host app

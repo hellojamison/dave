@@ -1,9 +1,12 @@
 #include "application/DaveApp.h"
 #include "document/MarkerCsv.h"
+#include "document/ProjectFile.h"
 #include "editing/Commands.h"
 #include "gui/Theme.h"
 
 #include <glad.h>
+#define GLFW_INCLUDE_NONE
+#include <GLFW/glfw3.h>
 #include <imgui.h>
 #include <nfd.h>
 
@@ -75,6 +78,14 @@ void DaveApp::handleShortcuts() {
         undo_.redo();
     } else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_O, false)) {
         openWavDialog();
+    } else if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_O, false)) {
+        openProjectDialog();
+    } else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_S, false)) {
+        saveProject(false);
+    } else if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_S, false)) {
+        saveProject(true);
+    } else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_N, false)) {
+        newProject();
     } else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Q, false)) {
         window_.close();
     }
@@ -82,6 +93,7 @@ void DaveApp::handleShortcuts() {
 
 void DaveApp::onEditChanged() {
     // UI thread. Re-derive the engine graph from the Edit, compile, publish.
+    dirty_ = true; // any edit marks the project dirty
     auto graph = builder_.build(edit_, audio_.sampleRate());
     auto [compiled, err] = engine::compile(*graph, audio_.sampleRate(), 256);
     if (err.has_value()) {
@@ -154,9 +166,30 @@ void DaveApp::drawUI() {
     auto& transport = audio_.transport();
     const auto& pal = gui::theme::palette();
 
+    // Update the window title to show project name + dirty indicator.
+    // ( glfwSetWindowTitle is cheap; calling it every frame is fine. )
+    {
+        std::string title = "Dave";
+        if (!projectPath_.empty()) {
+            // Show just the bundle name, not the full path.
+            auto slash = projectPath_.find_last_of("/\\");
+            title += " — " + ((slash != std::string::npos) ? projectPath_.substr(slash + 1) : projectPath_);
+        } else {
+            title += " — Untitled";
+        }
+        if (dirty_) title += " *";
+        glfwSetWindowTitle(window_.handle(), title.c_str());
+    }
+
     // --- Main menu bar -----------------------------------------------------
     if (ImGui::BeginMainMenuBar()) {
         if (ImGui::BeginMenu("File")) {
+            if (ImGui::MenuItem("New", "Ctrl+N")) newProject();
+            if (ImGui::MenuItem("Open...", "Ctrl+Shift+O")) openProjectDialog();
+            ImGui::Separator();
+            if (ImGui::MenuItem("Save", "Ctrl+S", false, !projectPath_.empty())) saveProject(false);
+            if (ImGui::MenuItem("Save As...", "Ctrl+Shift+S")) saveProject(true);
+            ImGui::Separator();
             if (ImGui::MenuItem("Load WAV...", "Ctrl+O")) openWavDialog();
             if (ImGui::MenuItem("Load Video...")) openVideoDialog();
             ImGui::Separator();
@@ -397,6 +430,70 @@ void DaveApp::openVideoDialog() {
                      clip.name.c_str(), clip.width, clip.height, clip.fps,
                      clip.durationSeconds, clip.codec.c_str());
     }
+}
+
+void DaveApp::newProject() {
+    // Clear the Edit and reset everything to a fresh state.
+    edit_.tracksMut().clear();
+    edit_.clearMarkerTracks_();
+    edit_.clearVideoClip();
+    builder_ = {};  // drop cached plugin instances / asset buffers
+    videoDecoder_.close();
+    lastDecodedFrameIndex_ = -1;
+    projectPath_.clear();
+    dirty_ = false;
+    undo_.clear();
+    // Re-seed a default track + marker track (matches init()).
+    undo_.execute(std::make_unique<editing::AddTrackCommand>("Track 1"));
+    edit_.addMarkerTrack("Markers");
+    audio_.transport().stop();
+    audio_.transport().seek(0);
+}
+
+void DaveApp::openProjectDialog() {
+    nfdnchar_t* outPath = nullptr;
+    nfdnfilteritem_t filter{"Dave project", "dave"};
+    // NFD's folder picker is more correct for a bundle (it's a directory), but
+    // most users expect to pick a "file". We allow .dave which on disk is a
+    // dir; NFD will return the path either way.
+    if (NFD_PickFolder(&outPath, nullptr) == NFD_OKAY && outPath) {
+        std::string path = outPath;
+        NFD_FreePath(outPath);
+        auto r = document::loadBundle(path, edit_);
+        if (!r.ok) {
+            std::fprintf(stderr, "Dave: open failed: %s\n", r.message.c_str());
+            return;
+        }
+        builder_ = {};  // force re-derive with fresh plugin instances
+        videoDecoder_.close();
+        lastDecodedFrameIndex_ = -1;
+        projectPath_ = path;
+        dirty_ = false;
+        undo_.clear();
+        onEditChanged();  // rebuild graph for the loaded Edit
+        std::fprintf(stderr, "Dave: opened %s\n", path.c_str());
+    }
+}
+
+void DaveApp::saveProject(bool saveAs) {
+    std::string path = projectPath_;
+    if (saveAs || path.empty()) {
+        // Pick a folder to save the bundle into.
+        nfdnchar_t* outPath = nullptr;
+        if (NFD_PickFolder(&outPath, nullptr) != NFD_OKAY || !outPath) return;
+        std::string dir = outPath;
+        NFD_FreePath(outPath);
+        // Append a default name.
+        path = dir + "/Untitled.dave";
+    }
+    auto r = document::saveBundle(path, edit_);
+    if (!r.ok) {
+        std::fprintf(stderr, "Dave: save failed: %s\n", r.message.c_str());
+        return;
+    }
+    projectPath_ = path;
+    dirty_ = false;
+    std::fprintf(stderr, "Dave: saved %s\n", path.c_str());
 }
 
 void DaveApp::drawVideoPreview() {

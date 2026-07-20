@@ -55,6 +55,13 @@ public:
 
     size_t undoDepth() const { return done_.size(); }
 
+    // Clear the undo/redo stacks (used by New/Open Project). Keeps the Edit
+    // reference (it's the same Edit, just emptied of history).
+    void clear() {
+        done_.clear();
+        redo_.clear();
+    }
+
 private:
     document::Edit& edit_;
     std::vector<std::unique_ptr<Command>> done_;

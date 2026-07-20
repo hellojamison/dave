@@ -87,6 +87,15 @@ public:
     void setVideoClip(VideoClip clip) { videoClip_ = std::make_unique<VideoClip>(std::move(clip)); notifyChanged(); }
     void clearVideoClip() { videoClip_.reset(); notifyChanged(); }
 
+    // --- Persistence helpers (load-time only; don't fire change notifications)
+    // Used by ProjectFile::deserializeEdit to rebuild an Edit from JSON without
+    // triggering re-derives mid-load.
+    void loadAsset_(AudioAsset a) { assets_.emplace(a.id, std::move(a)); }
+    void loadMarkerTrack_(MarkerTrack mt) { markerTracks_.push_back(std::move(mt)); }
+    void clearMarkerTracks_() { markerTracks_.clear(); }
+    void clearVideoClip_() { videoClip_.reset(); }
+    std::unordered_map<AssetId, AudioAsset>& assets() { return assets_; }
+
     // --- Change notification ----------------------------------------------
     // Listeners are notified after every mutation (so the engine/UI can
     // re-derive). Notifications fire on the UI thread.

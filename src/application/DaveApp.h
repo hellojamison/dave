@@ -49,6 +49,9 @@ private:
     void importMarkersDialog();
     void exportMarkersDialog();
     void openVideoDialog();
+    void newProject();
+    void openProjectDialog();
+    void saveProject(bool saveAs);
     void handleShortcuts();
     void drawUI();
     void drawPluginsPanel();
@@ -88,6 +91,10 @@ private:
     std::vector<uint8_t> videoFrameBuf_; // scratch for decoded RGBA
     int64_t lastDecodedFrameIndex_ = -1; // last frame index we uploaded
     double lastSeekTime_ = 0.0;          // ImGui::GetTime() of last random-access seek (debounce)
+
+    // ─── Project persistence ────────────────────────────────────────────────
+    std::string projectPath_;            // current .dave bundle path (empty = untitled)
+    bool dirty_ = false;                 // unsaved changes?
 };
 
 } // namespace dave::application

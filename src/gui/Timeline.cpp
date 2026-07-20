@@ -167,20 +167,23 @@ void drawTimeline(const document::Edit& edit,
             view.selectedTrackIndex = static_cast<int>(ti);
         }
 
-        // Interactive gain + pan controls in the gutter. Use ImGui widgets
-        // positioned via SetCursorScreenPos so they render inside the gutter
-        // area (not the clip lane).
+        // Interactive gain + pan controls in the gutter.
+        // Gain uses the Pro Tools dB scale: -inf to +6 dB. Internally stored
+        // as linear gain (0-2.0), displayed/slidered as dB.
         ImGui::PushID(static_cast<int>(ti));
-        // Gain slider (horizontal, compact).
-        ImGui::SetCursorScreenPos(ImVec2(origin.x + 10, y + trackHeight - 38));
-        float gainVal = static_cast<float>(track.gain);
-        ImGui::PushItemWidth(gutterWidth - 50);
-        if (ImGui::SliderFloat("##gain", &gainVal, 0.0f, 2.0f, "%.1f")) {
-            const_cast<document::Track&>(track).gain = gainVal;
-            const_cast<document::Edit&>(edit).notifyChanged();
+        {
+            // Gain: dB slider from -60 to +6 dB. Convert to/from linear.
+            ImGui::SetCursorScreenPos(ImVec2(origin.x + 10, y + trackHeight - 38));
+            float gainDb = 20.0f * std::log10(std::max(0.0001f, static_cast<float>(track.gain)));
+            ImGui::PushItemWidth(gutterWidth - 50);
+            if (ImGui::SliderFloat("##gain", &gainDb, -60.0f, 6.0f, "%.1f dB")) {
+                float linear = std::pow(10.0f, gainDb / 20.0f);
+                const_cast<document::Track&>(track).gain = linear;
+                const_cast<document::Edit&>(edit).notifyChanged();
+            }
+            ImGui::PopItemWidth();
         }
-        ImGui::PopItemWidth();
-        // Pan slider (horizontal, -1=L to +1=R).
+        // Pan: -1=L to +1=R (same as before, Pro Tools uses L/C/R convention).
         ImGui::SetCursorScreenPos(ImVec2(origin.x + 10, y + trackHeight - 18));
         float panVal = static_cast<float>(track.pan);
         ImGui::PushItemWidth(gutterWidth - 50);

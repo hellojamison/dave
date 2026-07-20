@@ -11,6 +11,52 @@
 
 namespace dave::gui {
 
+// Format a sample position into the selected timecode mode.
+// sr=48000, fps=24 (default), bpm=120, beatsPerBar=4.
+std::string formatTimecode(int64_t samples, TimecodeMode mode,
+                           double sr, double fps, double bpm) {
+    char buf[32];
+    switch (mode) {
+        case TimecodeMode::MinSec: {
+            double sec = samples / sr;
+            int mm = static_cast<int>(sec) / 60;
+            double ss = sec - mm * 60;
+            std::snprintf(buf, sizeof(buf), "%d:%05.2f", mm, ss);
+            break;
+        }
+        case TimecodeMode::Smpte: {
+            double totalSec = samples / sr;
+            int hh = static_cast<int>(totalSec / 3600);
+            int mm = static_cast<int>(totalSec / 60) % 60;
+            int ss = static_cast<int>(totalSec) % 60;
+            int ff = static_cast<int>((totalSec - static_cast<int>(totalSec)) * fps);
+            std::snprintf(buf, sizeof(buf), "%02d:%02d:%02d:%02d", hh, mm, ss, ff);
+            break;
+        }
+        case TimecodeMode::BarsBeats: {
+            double beatsPerSec = bpm / 60.0;
+            double totalBeats = (samples / sr) * beatsPerSec;
+            int bars = static_cast<int>(totalBeats / 4) + 1;  // 1-indexed
+            int beats = static_cast<int>(totalBeats) % 4 + 1;
+            int ticks = static_cast<int>((totalBeats - static_cast<int>(totalBeats)) * 960);
+            std::snprintf(buf, sizeof(buf), "%d.%d.%03d", bars, beats, ticks);
+            break;
+        }
+        case TimecodeMode::FeetFrames: {
+            double totalFrames = (samples / sr) * fps;
+            int feet = static_cast<int>(totalFrames / 16);
+            int frames = static_cast<int>(totalFrames) % 16;
+            std::snprintf(buf, sizeof(buf), "%d+%02d", feet, frames);
+            break;
+        }
+        case TimecodeMode::Samples: {
+            std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(samples));
+            break;
+        }
+    }
+    return buf;
+}
+
 // Helpers converting Palette ImVec4 -> ImU32 (ImDrawList wants packed colors).
 static inline ImU32 C(const ImVec4& v) {
     return IM_COL32(
@@ -117,9 +163,8 @@ void drawTimeline(const document::Edit& edit,
         if (x < origin.x + gutterWidth) continue;
         dl->AddLine(ImVec2(x, origin.y), ImVec2(x, origin.y + timelineHeight),
                     C(pal.border));
-        char label[16];
-        std::snprintf(label, sizeof(label), "%llds", static_cast<long long>(s));
-        dl->AddText(ImVec2(x + 4, origin.y + 6), C(pal.textMuted), label);
+        std::string label = formatTimecode(s * secStep, view.tcMode);
+        dl->AddText(ImVec2(x + 4, origin.y + 6), C(pal.textMuted), label.c_str());
     }
 
     const auto& tracks = edit.tracks();

@@ -33,6 +33,15 @@ private:
     std::string key(const std::string& id, int spp) const { return id + ":" + std::to_string(spp); }
 };
 
+// Timecode display modes for the ruler + transport readout.
+enum class TimecodeMode {
+    MinSec,      // mm:ss.ms
+    Smpte,       // HH:MM:SS:FF (needs fps)
+    BarsBeats,   // bars.beats.ticks (needs tempo/bpm)
+    FeetFrames,  // feet+frames (film convention, 16 frames/foot)
+    Samples      // raw sample count
+};
+
 // TimelineViewState holds the user's view: horizontal scroll + zoom level.
 // Timeline itself is a pure function of (Edit, viewState) and reports any
 // interaction (drag, seek) back via the UndoStack + Transport.
@@ -58,7 +67,14 @@ struct TimelineViewState {
     // Inline rename state.
     bool isRenaming = false;
     int renameTrackIndex = -1;
+    // Timecode display mode for the ruler + position readout.
+    TimecodeMode tcMode = TimecodeMode::MinSec;
 };
+
+// Format a sample position into a timecode string for the selected mode.
+std::string formatTimecode(int64_t samples, TimecodeMode mode,
+                           double sr = 48000.0, double fps = 24.0,
+                           double bpm = 120.0);
 
 // Draw the timeline widget. Caller passes everything in; the widget holds no
 // state itself (immediate-mode). Interactions fire commands on the UndoStack

@@ -304,13 +304,17 @@ void DaveApp::drawUI() {
         if (ImGui::Button("Rewind", btnSize)) { transport.stop(); transport.seek(0); }
         ImGui::SameLine(0, 20);
 
-        // Position readout.
+        // Position readout (uses the selected timecode mode).
         int64_t pos = transport.position();
-        int totalSec = static_cast<int>(pos / 48000);
-        ImGui::TextColored(pal.accent, "%02d:%05.2f",
-                           totalSec / 60,
-                           static_cast<double>(totalSec % 60) +
-                               static_cast<double>(pos % 48000) / 48000.0);
+        const char* tcModes[] = {"min:sec", "timecode", "bars|beats", "feet+frames", "samples"};
+        int tcIdx = static_cast<int>(view_.tcMode);
+        ImGui::TextColored(pal.accent, "%s",
+            gui::formatTimecode(pos, view_.tcMode).c_str());
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(95);
+        if (ImGui::Combo("##tcmode", &tcIdx, tcModes, 5)) {
+            view_.tcMode = static_cast<gui::TimecodeMode>(tcIdx);
+        }
 
         // Right-aligned buttons.
         ImGui::SameLine(timelineW - btnSize.x * 3 - 20);

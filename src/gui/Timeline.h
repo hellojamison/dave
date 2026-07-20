@@ -50,6 +50,11 @@ struct TimelineViewState {
     float markerDragStartX = 0.0f;
     // Snap-to-marker: when true, clip drags + seeks snap to nearby markers.
     bool snapToMarkers = false;
+    // Selection region (click-drag on empty timeline to create).
+    bool hasSelection = false;
+    int64_t selectionStart = 0;
+    int64_t selectionEnd = 0;
+    bool isSelecting = false;
 };
 
 // Draw the timeline widget. Caller passes everything in; the widget holds no

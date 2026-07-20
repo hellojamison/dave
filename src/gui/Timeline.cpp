@@ -395,7 +395,59 @@ void drawTimeline(const document::Edit& edit,
             if (hitClip) break;
         }
         if (!hitClip) {
-            seekToMouseX();
+            // Start a selection drag (instead of just seeking).
+            double localX = mouse.x - (origin.x + gutterWidth);
+            int64_t s = static_cast<int64_t>(
+                view.scrollSamples + std::max(0.0, localX) * view.samplesPerPixel);
+            view.selectionStart = s;
+            view.selectionEnd = s;
+            view.isSelecting = true;
+            view.hasSelection = true;
+        }
+    }
+
+    // Update selection end while dragging.
+    if (view.isSelecting && areaHovered && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        double localX = mouse.x - (origin.x + gutterWidth);
+        view.selectionEnd = static_cast<int64_t>(
+            view.scrollSamples + std::max(0.0, localX) * view.samplesPerPixel);
+    }
+    // End selection on mouse release.
+    if (view.isSelecting && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+        view.isSelecting = false;
+        // If the selection is tiny (just a click, not a drag), treat as seek + clear selection.
+        if (std::abs(view.selectionEnd - view.selectionStart) <
+            static_cast<int64_t>(4 * view.samplesPerPixel)) {
+            transport.seek(view.selectionStart);
+            view.hasSelection = false;
+        }
+    }
+    // Clear selection on Escape or clicking elsewhere.
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        view.hasSelection = false;
+    }
+
+    // Draw selection region (translucent highlight).
+    if (view.hasSelection) {
+        int64_t selMin = std::min(view.selectionStart, view.selectionEnd);
+        int64_t selMax = std::max(view.selectionStart, view.selectionEnd);
+        double selX1 = origin.x + gutterWidth + (selMin - view.scrollSamples) / view.samplesPerPixel;
+        double selX2 = origin.x + gutterWidth + (selMax - view.scrollSamples) / view.samplesPerPixel;
+        if (selX2 > selX1) {
+            dl->AddRectFilled(
+                ImVec2(selX1, origin.y + timelineHeight),
+                ImVec2(selX2, origin.y + totalHeight),
+                C(ImVec4(pal.accent.x, pal.accent.y, pal.accent.z, 0.15f)));
+            dl->AddRect(
+                ImVec2(selX1, origin.y + timelineHeight),
+                ImVec2(selX2, origin.y + totalHeight),
+                C(ImVec4(pal.accent.x, pal.accent.y, pal.accent.z, 0.5f)));
+            // Time readout at the top of the selection.
+            double durSec = (selMax - selMin) / 48000.0;
+            char selLabel[32];
+            std::snprintf(selLabel, sizeof(selLabel), "%.2fs", durSec);
+            dl->AddText(ImVec2((selX1 + selX2) / 2 - 15, origin.y + timelineHeight + 2),
+                        C(pal.accent), selLabel);
         }
     }
 

@@ -377,12 +377,8 @@ void DaveApp::drawUI() {
             view_.tcMode = static_cast<gui::TimecodeMode>(tcIdx);
         }
 
-        // Right-aligned buttons.
-        ImGui::SameLine(timelineW - btnSize.x * 3 - 20);
-        if (ImGui::Button("Undo", btnSize)) undo_.undo();
-        ImGui::SameLine();
-        if (ImGui::Button("Redo", btnSize)) undo_.redo();
-        ImGui::SameLine();
+        // +Track button (right-aligned). Undo/Redo are Cmd+Z / Cmd+Shift+Z only.
+        ImGui::SameLine(timelineW - btnSize.x - 20);
         if (ImGui::Button("+Track", btnSize))
             undo_.execute(std::make_unique<editing::AddTrackCommand>("Track"));
 

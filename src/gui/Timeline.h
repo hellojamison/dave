@@ -77,4 +77,16 @@ float drawMarkerLane(const document::Edit& edit,
                      double scrollSamples,
                      double samplesPerPixel);
 
+// Draw the video lane (below the audio tracks). Shows video clips as colored
+// blocks with names, positioned on the timeline. Click a clip to select it;
+// click empty lane to seek. Returns the height consumed.
+float drawVideoLane(const document::Edit& edit,
+                    engine::Transport& transport,
+                    TimelineViewState& view,
+                    ImVec2 origin,
+                    float totalWidth,
+                    float gutterWidth,
+                    double scrollSamples,
+                    double samplesPerPixel);
+
 } // namespace dave::gui

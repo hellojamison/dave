@@ -336,6 +336,16 @@ void drawTimeline(const document::Edit& edit,
             ImVec2(playheadX, origin.y + 7), C(pal.accent));
     }
 
+    // Video lane — a strip at the bottom of the timeline showing video clips.
+    // Placed below the track rows, above the scroll/zoom handler.
+    {
+        float videoLaneY = tracksTop + static_cast<float>(tracks.size()) * trackHeight;
+        drawVideoLane(edit, transport, view,
+                      ImVec2(origin.x, videoLaneY),
+                      totalWidth, gutterWidth,
+                      view.scrollSamples, view.samplesPerPixel);
+    }
+
     // Scroll / zoom.
     double wheel = ImGui::GetIO().MouseWheel;
     if (areaHovered && wheel != 0.0) {
@@ -592,6 +602,109 @@ float drawMarkerLane(const document::Edit& edit,
                 transport.seek(m->position);
                 break;
             }
+        }
+    }
+
+    return laneHeight;
+}
+
+// ─── Video lane ─────────────────────────────────────────────────────────────
+
+float drawVideoLane(const document::Edit& edit,
+                    engine::Transport& transport,
+                    TimelineViewState& view,
+                    ImVec2 origin,
+                    float totalWidth,
+                    float gutterWidth,
+                    double scrollSamples,
+                    double samplesPerPixel) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float laneHeight = 40.0f;
+    const auto& pal = theme::palette();
+
+    // Background — distinct from tracks (slightly darker).
+    dl->AddRectFilled(origin, ImVec2(origin.x + totalWidth, origin.y + laneHeight),
+                      C(pal.bgElevated));
+    dl->AddLine(ImVec2(origin.x, origin.y + laneHeight),
+                ImVec2(origin.x + totalWidth, origin.y + laneHeight),
+                C(pal.border));
+    // Gutter label.
+    dl->AddText(ImVec2(origin.x + 10, origin.y + 6), C(pal.textMuted), "Video");
+
+    // No video tracks → hint.
+    if (edit.videoTracks().empty()) {
+        dl->AddText(ImVec2(origin.x + gutterWidth + 8, origin.y + 6),
+                    C(pal.textMuted), "(no video — File > Load Video)");
+        return laneHeight;
+    }
+
+    const ImVec2 mouse = ImGui::GetIO().MousePos;
+    const bool laneHovered =
+        mouse.x >= origin.x + gutterWidth && mouse.x <= origin.x + totalWidth &&
+        mouse.y >= origin.y && mouse.y <= origin.y + laneHeight;
+
+    // Draw all video clips across all visible video tracks (flattened into
+    // one lane for RB-6 — per-track stacking comes if multi-track is needed).
+    int clipCount = 0;
+    for (const auto& vt : edit.videoTracks()) {
+        if (!vt.visible) continue;
+        for (const auto& clip : vt.clips) {
+            double clipX = origin.x + gutterWidth +
+                (clip.timelineStart - scrollSamples) / samplesPerPixel;
+            int64_t len = (clip.length > 0)
+                ? clip.length
+                : static_cast<int64_t>(clip.durationSeconds * 48000.0);
+            double clipW = static_cast<double>(len) / samplesPerPixel;
+            if (clipW < 2) clipW = 2;
+            if (clipX + clipW < origin.x + gutterWidth) { ++clipCount; continue; }
+            if (clipX > origin.x + totalWidth) { ++clipCount; continue; }
+
+            // Clip block — dark teal body (distinct from blue audio clips).
+            ImU32 bodyCol = IM_COL32(45, 90, 85, 255);
+            ImU32 borderCol = IM_COL32(80, 140, 130, 255);
+            bool isSel = view.selectedClipId == clip.id;
+            if (isSel) {
+                borderCol = C(pal.accent);
+            }
+            dl->AddRectFilled(ImVec2(clipX, origin.y + 6),
+                              ImVec2(clipX + clipW, origin.y + laneHeight - 4),
+                              bodyCol, 2.0f);
+            dl->AddRect(ImVec2(clipX, origin.y + 6),
+                        ImVec2(clipX + clipW, origin.y + laneHeight - 4),
+                        borderCol, 2.0f);
+            // Name label (truncated to clip width).
+            if (clipW > 30) {
+                dl->AddText(ImVec2(clipX + 6, origin.y + 10),
+                            C(pal.text), clip.name.c_str());
+            }
+            ++clipCount;
+        }
+    }
+
+    // Click empty lane area to seek; click a clip to select.
+    if (laneHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        bool hitClip = false;
+        for (const auto& vt : edit.videoTracks()) {
+            for (const auto& clip : vt.clips) {
+                double cx = origin.x + gutterWidth +
+                    (clip.timelineStart - scrollSamples) / samplesPerPixel;
+                int64_t len = (clip.length > 0)
+                    ? clip.length
+                    : static_cast<int64_t>(clip.durationSeconds * 48000.0);
+                double cw = static_cast<double>(len) / samplesPerPixel;
+                if (mouse.x >= cx && mouse.x <= cx + cw) {
+                    view.selectedClipId = clip.id;
+                    hitClip = true;
+                    break;
+                }
+            }
+            if (hitClip) break;
+        }
+        if (!hitClip) {
+            double localX = mouse.x - (origin.x + gutterWidth);
+            int64_t seekTo = static_cast<int64_t>(
+                std::max(0.0, scrollSamples + localX * samplesPerPixel));
+            transport.seek(seekTo);
         }
     }
 

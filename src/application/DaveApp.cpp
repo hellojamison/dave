@@ -106,8 +106,10 @@ void DaveApp::handleShortcuts() {
         saveProject(false);
     } else if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_S, false)) {
         saveProject(true);
-    } else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_N, false)) {
+    } else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_N, false) && !shift) {
         newProject();
+    } else if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_N, false)) {
+        undo_.execute(std::make_unique<editing::AddTrackCommand>("Track"));
     } else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Q, false)) {
         window_.close();
     } else if (ImGui::IsKeyPressed(ImGuiKey_T, false)) {

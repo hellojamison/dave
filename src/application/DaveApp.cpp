@@ -251,14 +251,17 @@ void DaveApp::drawUI() {
     ImGui::Begin("Transport", nullptr, panelFlags);
     {
         const ImVec2 btnSize(60, 30);
-        // Play/Stop with accent when active.
-        if (transport.isPlaying()) {
+        // Play/Stop with accent when active. Capture the state BEFORE the
+        // button click — if toggle() fires during the click, the push/pop
+        // must still balance (push if was playing, pop regardless).
+        bool wasPlaying = transport.isPlaying();
+        if (wasPlaying) {
             ImGui::PushStyleColor(ImGuiCol_Button, pal.accent);
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, pal.accentHover);
         }
-        if (ImGui::Button(transport.isPlaying() ? "Stop" : "Play", btnSize))
+        if (ImGui::Button(wasPlaying ? "Stop" : "Play", btnSize))
             transport.toggle();
-        if (transport.isPlaying()) ImGui::PopStyleColor(2);
+        if (wasPlaying) ImGui::PopStyleColor(2);
 
         ImGui::SameLine();
         if (ImGui::Button("Rewind", btnSize)) { transport.stop(); transport.seek(0); }

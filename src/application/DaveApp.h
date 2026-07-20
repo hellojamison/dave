@@ -54,9 +54,11 @@ private:
     void saveProject(bool saveAs);
     void handleShortcuts();
     void drawUI();
-    void drawPluginsPanel();
+    void drawPluginsPanel();        // legacy wrapper (unused — see drawPluginsPanelContent)
+    void drawPluginsPanelContent(); // content only (caller manages Begin/End)
     void drawPluginBrowser();
-    void drawVideoPreview();        // RB-5: video panel + A/V sync
+    void drawVideoPreview();        // legacy wrapper
+    void drawVideoPreviewContent(); // content only (caller manages Begin/End)
 
     platform::Window window_{1280, 800, "Dave"};
     gui::ImGuiLayer imgui_;

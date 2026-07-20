@@ -1,5 +1,6 @@
 #include "engine/plugins/PluginInstance.h"
 
+#include <public.sdk/source/common/memorystream.h>
 #include <public.sdk/source/vst/hosting/hostclasses.h>
 #include <public.sdk/source/vst/hosting/module.h>
 #include <public.sdk/source/vst/hosting/processdata.h>
@@ -241,10 +242,90 @@ void PluginInstance::unload() {
 }
 
 void* PluginInstance::editControllerAsUnknown() const {
-    // Return the controller as FUnknown*. PluginEditor queries it for IPlugView.
     if (!loaded_ || !p_->controller) return nullptr;
     Steinberg::FUnknown* fu = static_cast<Steinberg::Vst::IEditController*>(p_->controller.get());
     return fu;
+}
+
+// ─── State save/restore ─────────────────────────────────────────────────────
+// Minimal base64 encoder (no external dep). Public domain implementation.
+namespace {
+const char b64Table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+std::string base64Encode(const uint8_t* data, size_t len) {
+    std::string out;
+    out.reserve(((len + 2) / 3) * 4);
+    for (size_t i = 0; i < len; i += 3) {
+        uint32_t n = data[i] << 16;
+        if (i + 1 < len) n |= data[i + 1] << 8;
+        if (i + 2 < len) n |= data[i + 2];
+        out += b64Table[(n >> 18) & 63];
+        out += b64Table[(n >> 12) & 63];
+        out += (i + 1 < len) ? b64Table[(n >> 6) & 63] : '=';
+        out += (i + 2 < len) ? b64Table[n & 63] : '=';
+    }
+    return out;
+}
+int b64Val(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+std::vector<uint8_t> base64Decode(const std::string& s) {
+    std::vector<uint8_t> out;
+    int val = 0, bits = 0;
+    for (char c : s) {
+        if (c == '=') break;
+        int d = b64Val(c);
+        if (d < 0) continue;
+        val = (val << 6) | d;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<uint8_t>((val >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
+} // namespace
+
+std::string PluginInstance::getStateBase64() const {
+    if (!loaded_ || !p_->component) return "";
+    auto* memStream = new Steinberg::MemoryStream;
+    Steinberg::IBStream* stream = static_cast<Steinberg::IBStream*>(memStream);
+    p_->component->setActive(false);
+    auto res = p_->component->getState(stream);
+    p_->component->setActive(true);
+    if (res != Steinberg::kResultOk) { memStream->release(); return ""; }
+    auto* data = memStream->getData();
+    auto size = memStream->getSize();
+    std::string result;
+    if (data && size > 0) {
+        result = base64Encode(reinterpret_cast<const uint8_t*>(data), static_cast<size_t>(size));
+    }
+    memStream->release();
+    return result;
+}
+
+bool PluginInstance::setStateBase64(const std::string& b64) {
+    if (!loaded_ || !p_->component || b64.empty()) return false;
+    auto bytes = base64Decode(b64);
+    if (bytes.empty()) return false;
+    auto* memStream = new Steinberg::MemoryStream(
+        bytes.data(), static_cast<Steinberg::TSize>(bytes.size()));
+    Steinberg::IBStream* stream = memStream;
+    auto res = p_->component->setState(stream);
+    if (p_->controller && res == Steinberg::kResultOk) {
+        auto* memStream2 = new Steinberg::MemoryStream(
+            bytes.data(), static_cast<Steinberg::TSize>(bytes.size()));
+        Steinberg::IBStream* stream2 = memStream2;
+        p_->controller->setComponentState(stream2);
+        memStream2->release();
+    }
+    memStream->release();
+    return res == Steinberg::kResultOk;
 }
 
 } // namespace dave::engine

@@ -51,11 +51,7 @@ struct PluginSlot {
     std::string uidString;       // VST3 class UID (identifies which plugin)
     std::string path;            // .vst3 bundle path (for reload)
     bool bypass = false;
-    // Runtime instance — set by GraphBuilder on re-derive, not serialized.
-    // Raw pointer is fine: GraphBuilder owns the PluginInstance (in its cache),
-    // and the slot's pointer is invalidated + repopulated each re-derive.
-    // (For RB-3 the instance lives as long as the slot; deletion-on-remove is
-    // handled when the slot is removed from the chain.)
+    std::string stateBase64;     // VST3 state chunk (base64-encoded) for persistence
 };
 
 // A track holds an ordered list of clips, a plugin chain, and a gain/pan.

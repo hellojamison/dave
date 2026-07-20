@@ -116,6 +116,10 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit, double sa
                     inst.reset();
                     continue;
                 }
+                // Restore saved parameter state if present (RB-7 persistence).
+                if (!slot.stateBase64.empty()) {
+                    inst->setStateBase64(slot.stateBase64);
+                }
             }
 
             auto node = std::make_shared<PluginNode>(inst);

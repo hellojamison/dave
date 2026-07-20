@@ -61,6 +61,12 @@ public:
     // valid while the instance is loaded. Main thread.
     void* editControllerAsUnknown() const;
 
+    // Save/restore the plugin's full state (all params + internal). getState
+    // returns a base64-encoded binary chunk; setState applies it. Main thread.
+    // Used by project persistence so plugin settings survive save/load.
+    std::string getStateBase64() const;
+    bool setStateBase64(const std::string& b64);
+
 private:
     struct Impl; // hides SDK-owned types from the header
     std::unique_ptr<Impl> p_;

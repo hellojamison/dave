@@ -85,6 +85,7 @@ std::string serializeEdit(const Edit& edit) {
                 {"uidString", p.uidString},
                 {"path", p.path},
                 {"bypass", p.bypass},
+                {"stateBase64", p.stateBase64},
             });
         }
         jt["plugins"] = plugins;
@@ -210,6 +211,7 @@ ProjectResult deserializeEdit(const std::string& text, Edit& edit) {
                     p.uidString = jp.value("uidString", "");
                     p.path = jp.value("path", "");
                     p.bypass = jp.value("bypass", false);
+                    p.stateBase64 = jp.value("stateBase64", "");
                     t.plugins.push_back(std::move(p));
                 }
             }

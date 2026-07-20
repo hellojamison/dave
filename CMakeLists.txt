@@ -83,6 +83,7 @@ target_include_directories(Dave PRIVATE
 if(APPLE)
     target_sources(Dave PRIVATE
         "${THIRD_PARTY}/vst3sdk/public.sdk/source/vst/hosting/module_mac.mm"
+        "${THIRD_PARTY}/vst3sdk/public.sdk/source/common/memorystream.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/engine/plugins/PluginEditor_mac.mm")
     set_source_files_properties(
         "${THIRD_PARTY}/vst3sdk/public.sdk/source/vst/hosting/module_mac.mm"
@@ -136,7 +137,8 @@ target_compile_definitions(Dave PRIVATE
 # ─── Test: plugin host end-to-end (sine through a VST3, measure output) ─────
 add_executable(plugin_test tools/plugin_test.cpp
     src/engine/plugins/PluginHost.cpp
-    src/engine/plugins/PluginInstance.cpp)
+    src/engine/plugins/PluginInstance.cpp
+    "${THIRD_PARTY}/vst3sdk/public.sdk/source/common/memorystream.cpp")
 target_include_directories(plugin_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(plugin_test PRIVATE base pluginterfaces sdk sdk_common sdk_hosting)
 if(APPLE)

@@ -474,6 +474,17 @@ void DaveApp::openProjectDialog() {
 }
 
 void DaveApp::saveProject(bool saveAs) {
+    // Capture plugin states before serializing — get each loaded plugin's
+    // current parameter/internal state and stash it in the slot.
+    for (auto& track : edit_.tracksMut()) {
+        for (auto& slot : track.plugins) {
+            auto inst = builder_.pluginInstance(slot.id);
+            if (inst && inst->isLoaded()) {
+                slot.stateBase64 = inst->getStateBase64();
+            }
+        }
+    }
+
     std::string path = projectPath_;
     if (saveAs || path.empty()) {
         // Pick a folder to save the bundle into.

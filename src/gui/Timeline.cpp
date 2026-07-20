@@ -212,17 +212,42 @@ void drawTimeline(const document::Edit& edit,
 
             // Interaction: drag to move.
             const bool clipHovered = clipRect.contains(mouse);
-            // Use the clipRect as a hit region via the area button's drag.
-            // (Simpler than per-clip invisible buttons given we already have
-            //  one big InvisibleButton covering the area.)
             if (areaHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && clipHovered) {
                 view.selectedClipId = clip.id;
                 view.selectedTrackIndex = static_cast<int>(ti);
                 view.dragClipOriginalStart = clip.timelineStart;
-                view.dragOriginalTrackId = track.id;  // remember source for cross-track move
+                view.dragOriginalTrackId = track.id;
                 view.dragging = true;
             }
+            // Right-click: context menu (split, delete).
+            if (areaHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right) && clipHovered) {
+                view.selectedClipId = clip.id;
+                view.selectedTrackIndex = static_cast<int>(ti);
+                ImGui::OpenPopup("##clip_ctx");
+            }
         }
+    }
+
+    // Clip context menu (right-click on a clip).
+    if (ImGui::BeginPopup("##clip_ctx")) {
+        if (!view.selectedClipId.empty() && view.selectedTrackIndex >= 0) {
+            const auto& tracks = edit.tracks();
+            if (view.selectedTrackIndex < static_cast<int>(tracks.size())) {
+                const auto& trk = tracks[view.selectedTrackIndex];
+                int64_t playhead = transport.position();
+                if (ImGui::MenuItem("Split at Playhead")) {
+                    undo.execute(std::make_unique<editing::SplitClipCommand>(
+                        trk.id, view.selectedClipId, playhead));
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Delete Clip")) {
+                    undo.execute(std::make_unique<editing::RemoveClipCommand>(
+                        trk.id, view.selectedClipId));
+                    view.selectedClipId.clear();
+                }
+            }
+        }
+        ImGui::EndPopup();
     }
 
     // Handle drag delta for the active drag (committed on release).

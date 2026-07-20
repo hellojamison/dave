@@ -1,8 +1,10 @@
 #include "document/Edit.h"
 #include "document/Sha256.h"
 
-#define DR_WAV_NO_IMPLEMENTATION  // AudioClipNode.cpp owns the impl TU
+#define DR_WAV_NO_IMPLEMENTATION
 #include <dr_wav.h>
+
+#include <algorithm>
 
 #include <cstdio>
 
@@ -265,6 +267,24 @@ const VideoClip* Edit::videoClipAt(int64_t timelineSample) const {
         }
     }
     return nullptr;
+}
+
+int64_t Edit::contentEndSamples() const {
+    int64_t end = 0;
+    for (const auto& t : tracks_) {
+        for (const auto& c : t.clips) {
+            end = std::max(end, c.timelineStart + c.length);
+        }
+    }
+    for (const auto& vt : videoTracks_) {
+        for (const auto& c : vt.clips) {
+            int64_t len = (c.length > 0) ? c.length
+                : static_cast<int64_t>(c.durationSeconds * 48000.0);
+            end = std::max(end, c.timelineStart + len);
+        }
+    }
+    // Add a small tail (0.5s) so the last frame/sample isn't cut.
+    return end + 24000;
 }
 
 } // namespace dave::document

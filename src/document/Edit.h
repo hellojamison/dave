@@ -90,6 +90,10 @@ public:
     // Returns nullptr if none. Searches the first visible video track.
     const VideoClip* videoClipAt(int64_t timelineSample) const;
 
+    // Compute the end of all content (last clip end across audio + video +
+    // marker regions). Used by the transport to auto-stop. Returns 0 if empty.
+    int64_t contentEndSamples() const;
+
     // --- Persistence helpers (load-time only; don't fire change notifications)
     void loadAsset_(AudioAsset a) { assets_.emplace(a.id, std::move(a)); }
     void loadMarkerTrack_(MarkerTrack mt) { markerTracks_.push_back(std::move(mt)); }

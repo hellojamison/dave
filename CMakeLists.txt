@@ -69,7 +69,15 @@ file(GLOB_RECURSE DAVE_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.h")
 
+# On macOS, build as a .app bundle with Info.plist + icon.
 add_executable(Dave ${DAVE_SOURCES})
+if(APPLE)
+    set_target_properties(Dave PROPERTIES
+        MACOSX_BUNDLE TRUE
+        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/packaging/Info.plist.in")
+    # The Info.plist template uses @DAVE_VERSION@.
+    set_target_properties(Dave PROPERTIES MACOSX_BUNDLE_GUI_IDENTIFIER "com.takeoneaudio.dave")
+endif()
 
 target_include_directories(Dave PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
@@ -128,6 +136,24 @@ endif()
 
 target_compile_definitions(Dave PRIVATE
     DAVE_VERSION="0.1.0")
+
+# ─── macOS .app post-build: copy bundled ffmpeg into Helpers/ ───────────────
+# The LGPL ffmpeg binary lives in third_party/ffmpeg-lgpl/bin. In a packaged
+# .app it goes in Contents/Helpers/ so the VideoDecoder can find it at runtime
+# (resolveVideoTools checks Contents/Helpers/ffmpeg).
+if(APPLE)
+    set(FFMPEG_BIN "${THIRD_PARTY}/ffmpeg-lgpl/bin/ffmpeg")
+    set(FFPROBE_BIN "${THIRD_PARTY}/ffmpeg-lgpl/bin/ffprobe")
+    add_custom_command(TARGET Dave POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            "$<TARGET_FILE_DIR:Dave>/../Helpers"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${FFMPEG_BIN}" "$<TARGET_FILE_DIR:Dave>/../Helpers/ffmpeg"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${FFPROBE_BIN}" "$<TARGET_FILE_DIR:Dave>/../Helpers/ffprobe"
+        COMMENT "Copying LGPL ffmpeg/ffprobe into .app bundle"
+        VERBATIM)
+endif()
 
 # ─── Permissive-license enforcement ─────────────────────────────────────────
 # Dave is dual-licensed (GPL-3.0+ now, commercial option preserved). All deps

@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Dave</string>
+    <key>CFBundleDisplayName</key>
+    <string>Dave</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.takeoneaudio.dave</string>
+    <key>CFBundleVersion</key>
+    <string>@DAVE_VERSION@</string>
+    <key>CFBundleShortVersionString</key>
+    <string>@DAVE_VERSION@</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleSignature</key>
+    <string>????</string>
+    <key>CFBundleExecutable</key>
+    <string>Dave</string>
+    <key>CFBundleIconFile</key>
+    <string>DaveIcon</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Dave needs microphone access for audio recording.</string>
+    <key>NSDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Dave Project</string>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>com.takeoneaudio.dave.project</string>
+            </array>
+        </dict>
+    </array>
+    <key>UTExportedTypeDeclarations</key>
+    <array>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>com.takeoneaudio.dave.project</string>
+            <key>UTTypeDescription</key>
+            <string>Dave Project Bundle</string>
+            <key>UTTypeConformsTo</key>
+            <array>
+                <string>public.folder</string>
+            </array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array>
+                    <string>dave</string>
+                </array>
+            </dict>
+        </dict>
+    </array>
+</dict>
+</plist>

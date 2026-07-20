@@ -345,6 +345,16 @@ void DaveApp::drawUI() {
 
     // Video preview panel (RB-5).
     drawVideoPreview();
+
+    // Transport auto-stop: if playing past the end of all content, stop.
+    // Checked once per frame (UI thread). Gives a natural "play to end"
+    // behavior without the user hitting Stop manually.
+    if (audio_.transport().isPlaying()) {
+        int64_t pos = audio_.transport().position();
+        if (pos > edit_.contentEndSamples()) {
+            audio_.transport().stop();
+        }
+    }
 }
 
 void DaveApp::openWavDialog() {

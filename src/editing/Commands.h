@@ -137,6 +137,46 @@ private:
     std::string slotId_;
 };
 
+// Split a clip at a given timeline position. Creates two clips from one:
+// the left half keeps the original id+position; the right half is a new clip
+// with sourceOffset adjusted. Undo removes the right clip (restoring one).
+class SplitClipCommand : public Command {
+public:
+    SplitClipCommand(std::string trackId, std::string clipId, int64_t atSample)
+        : trackId_(std::move(trackId)), clipId_(std::move(clipId)), atSample_(atSample) {}
+    void perform(document::Edit& e) override {
+        auto* c = e.clip(trackId_, clipId_);
+        if (!c) return;
+        // Left clip: trim length. Right clip: new clip starting at atSample.
+        document::AudioClip right = *c;
+        right.timelineStart = atSample_;
+        right.sourceOffset = c->sourceOffset + (atSample_ - c->timelineStart);
+        right.length = c->timelineStart + c->length - atSample_;
+        c->length = atSample_ - c->timelineStart;
+        e.notifyChanged();
+        // Add the right clip (assigns a new id).
+        rightId_ = e.addClip(trackId_, right);
+    }
+    void undo(document::Edit& e) override {
+        if (rightId_.empty()) return;
+        // Remove the right clip, restore the left clip's original length.
+        auto* c = e.clip(trackId_, clipId_);
+        if (c) { c->length += /* right length */ 0; } // simplified; the right
+        // clip's length was the remainder. We re-merge by reading the right
+        // clip before removing.
+        auto* r = e.clip(trackId_, rightId_);
+        if (r && c) { c->length = c->length + r->length; }
+        e.removeClip(trackId_, rightId_);
+        rightId_.clear();
+    }
+    std::string name() const override { return "Split Clip"; }
+private:
+    std::string trackId_;
+    std::string clipId_;
+    int64_t atSample_;
+    std::string rightId_; // id of the right half (for undo)
+};
+
 // RemovePlugin: deletes a plugin slot. Undo restores it.
 class RemovePluginCommand : public Command {
 public:

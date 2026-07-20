@@ -8,6 +8,9 @@
 
 #if defined(__APPLE__) || defined(__linux__)
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>  // _NSGetExecutablePath
+#endif
 #define DAVE_POPEN popen
 #define DAVE_PCLOSE pclose
 #else
@@ -28,16 +31,6 @@ constexpr const char* kBundledDir =
 VideoToolPaths resolveVideoTools() {
     VideoToolPaths p;
     p.bundled = false;
-    // 1) Bundled LGPL build (relative to the repo root / cwd in dev).
-    //    Try absolute path first, then relative.
-    // We resolve relative to the current working directory; in dev that's the
-    // repo root. In a packaged app the launcher sets cwd appropriately or we
-    // add a binary-relative resolver later.
-    const char* env = std::getenv("DAVE_FFMPEG_DIR");
-    std::string dir = env ? env : kBundledDir;
-    p.ffmpeg = dir + "/ffmpeg";
-    p.ffprobe = dir + "/ffprobe";
-    // Quick existence check via access().
     auto exists = [](const std::string& path) {
 #if defined(__APPLE__) || defined(__linux__)
         return ::access(path.c_str(), X_OK) == 0;
@@ -45,11 +38,53 @@ VideoToolPaths resolveVideoTools() {
         return GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES;
 #endif
     };
-    if (exists(p.ffmpeg) && exists(p.ffprobe)) {
-        p.bundled = true;
-        return p;
+
+    // 1) Env override (dev convenience).
+    const char* env = std::getenv("DAVE_FFMPEG_DIR");
+    if (env) {
+        p.ffmpeg = std::string(env) + "/ffmpeg";
+        p.ffprobe = std::string(env) + "/ffprobe";
+        if (exists(p.ffmpeg) && exists(p.ffprobe)) { p.bundled = true; return p; }
     }
-    // 2) System fallback (dev convenience; NOT the license-clean one we ship).
+
+    // 2) .app bundle: Contents/Helpers/ (the packaged location — CMake copies
+    //    the LGPL build there in the post-build step).
+    //    On macOS, the executable is at Contents/MacOS/Dave; Helpers is a
+    //    sibling: ../Helpers/ffmpeg relative to the binary. We discover the
+    //    binary path via /proc/self/exe (Linux) or _NSGetExecutablePath (Mac).
+#if defined(__APPLE__)
+    {
+        char path[4096];
+        uint32_t size = sizeof(path);
+        if (_NSGetExecutablePath(path, &size) == 0) {
+            // path = .../Dave.app/Contents/MacOS/Dave
+            // Helpers dir = .../Dave.app/Contents/Helpers
+            std::string exePath(path);
+            auto slash = exePath.find_last_of('/');
+            if (slash != std::string::npos) {
+                std::string macosDir = exePath.substr(0, slash); // .../MacOS
+                slash = macosDir.find_last_of('/');
+                if (slash != std::string::npos) {
+                    std::string contentsDir = macosDir.substr(0, slash); // .../Contents
+                    std::string helpersDir = contentsDir + "/Helpers";
+                    p.ffmpeg = helpersDir + "/ffmpeg";
+                    p.ffprobe = helpersDir + "/ffprobe";
+                    if (exists(p.ffmpeg) && exists(p.ffprobe)) {
+                        p.bundled = true;
+                        return p;
+                    }
+                }
+            }
+        }
+    }
+#endif
+
+    // 3) Dev location: third_party/ffmpeg-lgpl/bin (relative to cwd).
+    p.ffmpeg = std::string(kBundledDir) + "/ffmpeg";
+    p.ffprobe = std::string(kBundledDir) + "/ffprobe";
+    if (exists(p.ffmpeg) && exists(p.ffprobe)) { p.bundled = true; return p; }
+
+    // 4) System fallback (NOT the license-clean one we ship — dev convenience).
     p.ffmpeg = "ffmpeg";
     p.ffprobe = "ffprobe";
     p.bundled = false;

@@ -99,6 +99,8 @@ void DaveApp::handleShortcuts() {
     } else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Z, false) && shift && undo_.canRedo()) {
         undo_.redo();
     } else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_O, false)) {
+        // Cmd+O: open project (audio import is Cmd+I now).
+    } else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_I, false)) {
         openWavDialog();
     } else if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_O, false)) {
         openProjectDialog();

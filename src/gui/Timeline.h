@@ -69,6 +69,9 @@ struct TimelineViewState {
     int renameTrackIndex = -1;
     // Timecode display mode for the ruler + position readout.
     TimecodeMode tcMode = TimecodeMode::MinSec;
+    // Editable position display state.
+    bool editingPosition = false;
+    char positionInput[64] = {};
 };
 
 // Format a sample position into a timecode string for the selected mode.

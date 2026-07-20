@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <string>
 
@@ -304,12 +305,72 @@ void DaveApp::drawUI() {
         if (ImGui::Button("Rewind", btnSize)) { transport.stop(); transport.seek(0); }
         ImGui::SameLine(0, 20);
 
-        // Position readout (uses the selected timecode mode).
+        // Position readout — double-click to edit (type a timecode to seek).
         int64_t pos = transport.position();
         const char* tcModes[] = {"min:sec", "timecode", "bars|beats", "feet+frames", "samples"};
         int tcIdx = static_cast<int>(view_.tcMode);
-        ImGui::TextColored(pal.accent, "%s",
-            gui::formatTimecode(pos, view_.tcMode).c_str());
+        // Display the current position; double-click converts to an editable
+        // InputText where the user types a timecode string to seek.
+        if (!view_.editingPosition) {
+            std::string tcStr = gui::formatTimecode(pos, view_.tcMode);
+            ImGui::TextColored(pal.accent, "%s", tcStr.c_str());
+            if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                view_.editingPosition = true;
+                // Pre-fill the input with the current timecode.
+                std::strncpy(view_.positionInput, tcStr.c_str(), sizeof(view_.positionInput) - 1);
+                view_.positionInput[sizeof(view_.positionInput) - 1] = '\0';
+            }
+        } else {
+            // Editable input. Enter = seek, Escape = cancel.
+            ImGui::SetNextItemWidth(100);
+            ImGui::SetKeyboardFocusHere();
+            if (ImGui::InputText("##posedit", view_.positionInput,
+                                 sizeof(view_.positionInput),
+                                 ImGuiInputTextFlags_EnterReturnsTrue)) {
+                // Parse the timecode back to samples based on the current mode.
+                int64_t target = -1;
+                double sr = 48000.0;
+                switch (view_.tcMode) {
+                    case gui::TimecodeMode::MinSec: {
+                        int mm; double ss;
+                        if (std::sscanf(view_.positionInput, "%d:%lf", &mm, &ss) == 2)
+                            target = static_cast<int64_t>((mm * 60 + ss) * sr);
+                        break;
+                    }
+                    case gui::TimecodeMode::Smpte: {
+                        int hh, mm, ss2, ff;
+                        if (std::sscanf(view_.positionInput, "%d:%d:%d:%d", &hh, &mm, &ss2, &ff) == 4)
+                            target = static_cast<int64_t>((hh * 3600 + mm * 60 + ss2 + ff / 24.0) * sr);
+                        break;
+                    }
+                    case gui::TimecodeMode::BarsBeats: {
+                        int bars, beats, ticks;
+                        if (std::sscanf(view_.positionInput, "%d.%d.%d", &bars, &beats, &ticks) == 3) {
+                            double bpm = 120.0;
+                            double beatsTotal = (bars - 1) * 4 + (beats - 1) + ticks / 960.0;
+                            target = static_cast<int64_t>(beatsTotal * 60.0 / bpm * sr);
+                        }
+                        break;
+                    }
+                    case gui::TimecodeMode::FeetFrames: {
+                        int feet, ff2;
+                        if (std::sscanf(view_.positionInput, "%d+%d", &feet, &ff2) == 2)
+                            target = static_cast<int64_t>((feet * 16 + ff2) / 24.0 * sr);
+                        break;
+                    }
+                    case gui::TimecodeMode::Samples: {
+                        long long s;
+                        if (std::sscanf(view_.positionInput, "%lld", &s) == 1)
+                            target = s;
+                        break;
+                    }
+                }
+                if (target >= 0) transport.seek(target);
+                view_.editingPosition = false;
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape))
+                view_.editingPosition = false;
+        }
         ImGui::SameLine();
         ImGui::SetNextItemWidth(95);
         if (ImGui::Combo("##tcmode", &tcIdx, tcModes, 5)) {

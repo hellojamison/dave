@@ -84,8 +84,11 @@ void drawTimeline(const document::Edit& edit,
     const ImVec2 mouse = ImGui::GetIO().MousePos;
     const bool areaHovered = ImGui::IsItemHovered();
 
-    // Is the mouse over the ruler region? (Used for hover highlight + seek.)
-    const bool rulerHovered = areaHovered &&
+    // Is the mouse over the ruler region? Check independently of areaHovered
+    // (the InvisibleButton only covers the track-rows area, but the ruler is
+    // above it and needs its own hover detection for click-to-seek).
+    const bool windowHovered = ImGui::IsWindowHovered();
+    const bool rulerHovered = windowHovered &&
         mouse.y >= origin.y && mouse.y <= origin.y + timelineHeight &&
         mouse.x >= origin.x + gutterWidth;
 

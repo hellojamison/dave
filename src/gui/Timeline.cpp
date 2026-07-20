@@ -79,8 +79,10 @@ void drawTimeline(const document::Edit& edit,
     const float tracksRegionHeight = totalHeight - timelineHeight - markerLaneHeight;
     char areaBtn[32];
     std::snprintf(areaBtn, sizeof(areaBtn), "##timeline_area_%p", &view);
-    ImGui::SetCursorScreenPos(ImVec2(origin.x, origin.y + timelineHeight + markerLaneHeight));
-    ImGui::InvisibleButton(areaBtn, ImVec2(totalWidth, tracksRegionHeight));
+    // The InvisibleButton covers the clip lane (right of the gutter) so it
+    // doesn't eat clicks meant for the gutter's gain/pan sliders.
+    ImGui::SetCursorScreenPos(ImVec2(origin.x + gutterWidth, origin.y + timelineHeight + markerLaneHeight));
+    ImGui::InvisibleButton(areaBtn, ImVec2(totalWidth - gutterWidth, tracksRegionHeight));
     const ImVec2 mouse = ImGui::GetIO().MousePos;
     const bool areaHovered = ImGui::IsItemHovered();
 

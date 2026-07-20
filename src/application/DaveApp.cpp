@@ -3,6 +3,7 @@
 #include "document/ProjectFile.h"
 #include "editing/Commands.h"
 #include "gui/Theme.h"
+#include "platform/MacMenuBar.h"
 
 #include <glad.h>
 #define GLFW_INCLUDE_NONE
@@ -27,6 +28,26 @@ bool DaveApp::init() {
     if (!window_.valid() || !imgui_.init(window_)) {
         return false;
     }
+
+    // ─── macOS native menu bar ───────────────────────────────────────────
+    // On macOS the menu bar belongs at the top of the screen, not inside the
+    // window. Set up a native NSApplication menu bar and wire the callbacks.
+#ifdef __APPLE__
+    platform::g_menuNew          = [this](){ newProject(); };
+    platform::g_menuOpen         = [this](){ openProjectDialog(); };
+    platform::g_menuSave         = [this](){ saveProject(false); };
+    platform::g_menuSaveAs       = [this](){ saveProject(true); };
+    platform::g_menuLoadWav      = [this](){ openWavDialog(); };
+    platform::g_menuLoadVideo    = [this](){ openVideoDialog(); };
+    platform::g_menuImportMarkers= [this](){ importMarkersDialog(); };
+    platform::g_menuExportMarkers= [this](){ exportMarkersDialog(); };
+    platform::g_menuUndo         = [this](){ undo_.undo(); };
+    platform::g_menuRedo         = [this](){ undo_.redo(); };
+    platform::g_menuPlayStop     = [this](){ audio_.transport().toggle(); };
+    platform::g_menuReturnToStart= [this](){ audio_.transport().seek(0); };
+    platform::g_menuQuit         = [this](){ window_.close(); };
+    platform::setupMacMenuBar();
+#endif
     if (!audio_.start(48000.0, 2)) {
         std::fprintf(stderr, "Dave: audio engine failed to start\n");
     }
@@ -188,7 +209,15 @@ void DaveApp::drawUI() {
     // NO floating windows, NO dockspace — everything is computed from the
     // viewport and locked with NoMove+NoResize+NoTitleBar.
     const ImGuiViewport* vp = ImGui::GetMainViewport();
-    const float menuH = vp->WorkPos.y;                   // below the menu bar
+    // menuH = space consumed by the menu bar. On macOS the menu is at the top
+    // of the SCREEN (not in-window), so menuH = 0 and the transport bar starts
+    // at the very top of the window. On Windows/Linux the in-window ImGui menu
+    // bar consumes ~24px.
+#ifdef __APPLE__
+    const float menuH = 0.0f;
+#else
+    const float menuH = vp->WorkPos.y;
+#endif
     const float toolbarH = 48.0f;
     const float sidebarW = 300.0f;
     const float videoPanelH = 240.0f;
@@ -204,7 +233,8 @@ void DaveApp::drawUI() {
         ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus |
         ImGuiWindowFlags_NoDocking;
 
-    // ─── Main menu bar ───────────────────────────────────────────────────
+    // ─── Main menu bar (Windows/Linux only — macOS uses native screen-top) ─
+#ifndef __APPLE__
     if (ImGui::BeginMainMenuBar()) {
         if (ImGui::BeginMenu("File")) {
             if (ImGui::MenuItem("New", "Ctrl+N")) newProject();
@@ -244,6 +274,7 @@ void DaveApp::drawUI() {
         }
         ImGui::EndMainMenuBar();
     }
+#endif // __APPLE__
 
     // ─── Transport bar (full width, below menu) ──────────────────────────
     ImGui::SetNextWindowPos(ImVec2(0, menuH), ImGuiCond_Always);

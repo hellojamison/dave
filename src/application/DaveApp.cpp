@@ -109,6 +109,12 @@ void DaveApp::handleShortcuts() {
         newProject();
     } else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Q, false)) {
         window_.close();
+    } else if (ImGui::IsKeyPressed(ImGuiKey_T, false)) {
+        // T = zoom in (Pro Tools convention).
+        view_.samplesPerPixel = std::max(4.0, view_.samplesPerPixel * 0.5);
+    } else if (ImGui::IsKeyPressed(ImGuiKey_R, false)) {
+        // R = zoom out.
+        view_.samplesPerPixel = std::min(50000.0, view_.samplesPerPixel * 2.0);
     }
 }
 

@@ -91,6 +91,7 @@ private:
     std::vector<uint8_t> videoFrameBuf_; // scratch for decoded RGBA
     int64_t lastDecodedFrameIndex_ = -1; // last frame index we uploaded
     double lastSeekTime_ = 0.0;          // ImGui::GetTime() of last random-access seek (debounce)
+    std::string lastVideoClipId_;       // which clip the decoder is open for (RB-6 multi-clip)
 
     // ─── Project persistence ────────────────────────────────────────────────
     std::string projectPath_;            // current .dave bundle path (empty = untitled)

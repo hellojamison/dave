@@ -131,19 +131,33 @@ std::string serializeEdit(const Edit& edit) {
     }
     j["markerTracks"] = mtracks;
 
-    // Video clip (optional).
-    if (const auto* v = edit.videoClip()) {
-        j["videoClip"] = {
-            {"path", v->path},
-            {"name", v->name},
-            {"codec", v->codec},
-            {"timelineStart", v->timelineStart},
-            {"fps", v->fps},
-            {"width", v->width},
-            {"height", v->height},
-            {"durationSeconds", v->durationSeconds},
-        };
+    // Video tracks (RB-6).
+    json vtracks = json::array();
+    for (const auto& vt : edit.videoTracks()) {
+        json jvt;
+        jvt["id"] = vt.id;
+        jvt["name"] = vt.name;
+        jvt["visible"] = vt.visible;
+        json vclips = json::array();
+        for (const auto& c : vt.clips) {
+            vclips.push_back({
+                {"id", c.id},
+                {"path", c.path},
+                {"name", c.name},
+                {"codec", c.codec},
+                {"timelineStart", c.timelineStart},
+                {"sourceOffset", c.sourceOffset},
+                {"length", c.length},
+                {"fps", c.fps},
+                {"width", c.width},
+                {"height", c.height},
+                {"durationSeconds", c.durationSeconds},
+            });
+        }
+        jvt["clips"] = vclips;
+        vtracks.push_back(jvt);
     }
+    j["videoTracks"] = vtracks;
 
     return j.dump(2);
 }
@@ -250,20 +264,33 @@ ProjectResult deserializeEdit(const std::string& text, Edit& edit) {
         }
     }
 
-    // Video clip (optional).
-    edit.clearVideoClip_();
-    if (j.contains("videoClip")) {
-        const auto& jv = j["videoClip"];
-        VideoClip v;
-        v.path = jv.value("path", "");
-        v.name = jv.value("name", "");
-        v.codec = jv.value("codec", "");
-        v.timelineStart = jv.value("timelineStart", int64_t(0));
-        v.fps = jv.value("fps", 0.0);
-        v.width = jv.value("width", 0);
-        v.height = jv.value("height", 0);
-        v.durationSeconds = jv.value("durationSeconds", 0.0);
-        edit.setVideoClip(std::move(v));
+    // Video tracks (RB-6).
+    edit.clearVideoTracks_();
+    if (j.contains("videoTracks")) {
+        for (const auto& jvt : j["videoTracks"]) {
+            VideoTrack vt;
+            vt.id = jvt.value("id", "");
+            vt.name = jvt.value("name", "");
+            vt.visible = jvt.value("visible", true);
+            if (jvt.contains("clips")) {
+                for (const auto& jc : jvt["clips"]) {
+                    VideoClip c;
+                    c.id = jc.value("id", "");
+                    c.path = jc.value("path", "");
+                    c.name = jc.value("name", "");
+                    c.codec = jc.value("codec", "");
+                    c.timelineStart = jc.value("timelineStart", int64_t(0));
+                    c.sourceOffset = jc.value("sourceOffset", int64_t(0));
+                    c.length = jc.value("length", int64_t(0));
+                    c.fps = jc.value("fps", 0.0);
+                    c.width = jc.value("width", 0);
+                    c.height = jc.value("height", 0);
+                    c.durationSeconds = jc.value("durationSeconds", 0.0);
+                    vt.clips.push_back(std::move(c));
+                }
+            }
+            edit.loadVideoTrack_(std::move(vt));
+        }
     }
 
     return {true, ""};
@@ -312,17 +339,22 @@ ProjectResult saveBundle(const std::string& bundlePath, const Edit& edit,
                     }
                 }
             }
-            // Copy + rewrite video.
-            if (j.contains("videoClip")) {
-                std::string orig = j["videoClip"].value("path", "");
-                if (!orig.empty() && fs::exists(orig)) {
-                    fs::path src(orig);
-                    fs::path dst = videoDir / src.filename();
-                    if (!fs::exists(dst)) {
-                        fs::copy_file(orig, dst,
-                                      fs::copy_options::overwrite_existing);
+            // Copy + rewrite video clips (RB-6: multiple clips across tracks).
+            if (j.contains("videoTracks")) {
+                for (auto& jvt : j["videoTracks"]) {
+                    if (!jvt.contains("clips")) continue;
+                    for (auto& jc : jvt["clips"]) {
+                        std::string orig = jc.value("path", "");
+                        if (!orig.empty() && fs::exists(orig)) {
+                            fs::path src(orig);
+                            fs::path dst = videoDir / src.filename();
+                            if (!fs::exists(dst)) {
+                                fs::copy_file(orig, dst,
+                                              fs::copy_options::overwrite_existing);
+                            }
+                            jc["path"] = "video/" + src.filename().string();
+                        }
                     }
-                    j["videoClip"]["path"] = "video/" + src.filename().string();
                 }
             }
         }
@@ -365,11 +397,12 @@ ProjectResult loadBundle(const std::string& bundlePath, Edit& edit) {
                 a.path = (base / a.path).string();
             }
         }
-        if (const auto* v = edit.videoClip()) {
-            if (!v->path.empty() && v->path.find("video/") == 0) {
-                VideoClip copy = *v;
-                copy.path = (base / v->path).string();
-                edit.setVideoClip(std::move(copy));
+        // Rewrite relative video paths to absolute (bundle-rooted).
+        for (auto& vt : edit.videoTracksMut()) {
+            for (auto& c : vt.clips) {
+                if (!c.path.empty() && c.path.find("video/") == 0) {
+                    c.path = (base / c.path).string();
+                }
             }
         }
         return {true, ""};

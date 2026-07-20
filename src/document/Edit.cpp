@@ -209,4 +209,62 @@ const Marker* Edit::activeLoopMarker() const {
     return nullptr;
 }
 
+// ─── Video tracks ───────────────────────────────────────────────────────────
+
+std::string Edit::addVideoTrack(const std::string& name) {
+    VideoTrack vt;
+    vt.id = newId("vtrack_");
+    ++idCounter_;
+    vt.name = name.empty() ? ("Video " + std::to_string(idCounter_)) : name;
+    videoTracks_.push_back(std::move(vt));
+    notifyChanged();
+    return videoTracks_.back().id;
+}
+
+std::string Edit::addVideoClip(const std::string& trackId, VideoClip clip) {
+    for (auto& vt : videoTracks_) {
+        if (vt.id == trackId) {
+            clip.id = newId("vclip_");
+            ++idCounter_;
+            // Default length = full source duration if not set.
+            if (clip.length <= 0 && clip.fps > 0.0) {
+                clip.length = static_cast<int64_t>(clip.durationSeconds * 48000.0);
+            }
+            vt.clips.push_back(std::move(clip));
+            notifyChanged();
+            return vt.clips.back().id;
+        }
+    }
+    return "";
+}
+
+bool Edit::removeVideoClip(const std::string& trackId, const std::string& clipId) {
+    for (auto& vt : videoTracks_) {
+        if (vt.id != trackId) continue;
+        for (auto it = vt.clips.begin(); it != vt.clips.end(); ++it) {
+            if (it->id == clipId) {
+                vt.clips.erase(it);
+                notifyChanged();
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+const VideoClip* Edit::videoClipAt(int64_t timelineSample) const {
+    for (const auto& vt : videoTracks_) {
+        if (!vt.visible) continue;
+        for (const auto& c : vt.clips) {
+            int64_t len = (c.length > 0) ? c.length
+                : static_cast<int64_t>(c.durationSeconds * 48000.0);
+            if (timelineSample >= c.timelineStart &&
+                timelineSample < c.timelineStart + len) {
+                return &c;
+            }
+        }
+    }
+    return nullptr;
+}
+
 } // namespace dave::document

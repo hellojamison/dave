@@ -2,8 +2,6 @@
 
 #include "document/Types.h"
 
-#include <memory>
-
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -79,21 +77,25 @@ public:
     // (Sample-mode only for RB-4; other modes resolve later.)
     const Marker* activeLoopMarker() const;
 
-    // --- Video (RB-5) ------------------------------------------------------
-    // A project holds at most one video clip for RB-5 (the "reference movie"
-    // model — audio-for-picture). It's separate from audio tracks; the preview
-    // panel renders it locked to the transport. Multi-clip editing is RB-6.
-    const VideoClip* videoClip() const { return videoClip_.get(); }
-    void setVideoClip(VideoClip clip) { videoClip_ = std::make_unique<VideoClip>(std::move(clip)); notifyChanged(); }
-    void clearVideoClip() { videoClip_.reset(); notifyChanged(); }
+    // --- Video (RB-6) ------------------------------------------------------
+    // Video tracks hold video clips (like audio tracks hold audio clips).
+    // RB-6 ships one default video track; the model supports multiple.
+    const std::vector<VideoTrack>& videoTracks() const { return videoTracks_; }
+    std::vector<VideoTrack>& videoTracksMut() { return videoTracks_; }
+    std::string addVideoTrack(const std::string& name);
+    // Add a video clip to a track; returns the clip id (empty if track missing).
+    std::string addVideoClip(const std::string& trackId, VideoClip clip);
+    bool removeVideoClip(const std::string& trackId, const std::string& clipId);
+    // Find which video clip is active at a given timeline position (samples).
+    // Returns nullptr if none. Searches the first visible video track.
+    const VideoClip* videoClipAt(int64_t timelineSample) const;
 
     // --- Persistence helpers (load-time only; don't fire change notifications)
-    // Used by ProjectFile::deserializeEdit to rebuild an Edit from JSON without
-    // triggering re-derives mid-load.
     void loadAsset_(AudioAsset a) { assets_.emplace(a.id, std::move(a)); }
     void loadMarkerTrack_(MarkerTrack mt) { markerTracks_.push_back(std::move(mt)); }
     void clearMarkerTracks_() { markerTracks_.clear(); }
-    void clearVideoClip_() { videoClip_.reset(); }
+    void clearVideoTracks_() { videoTracks_.clear(); }
+    void loadVideoTrack_(VideoTrack vt) { videoTracks_.push_back(std::move(vt)); }
     std::unordered_map<AssetId, AudioAsset>& assets() { return assets_; }
 
     // --- Change notification ----------------------------------------------
@@ -108,7 +110,7 @@ private:
 
     std::vector<Track> tracks_;
     std::vector<MarkerTrack> markerTracks_;
-    std::unique_ptr<VideoClip> videoClip_;
+    std::vector<VideoTrack> videoTracks_;
     std::unordered_map<AssetId, AudioAsset> assets_;
     ChangeCallback onChange_;
     uint64_t idCounter_ = 0;

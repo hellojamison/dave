@@ -104,21 +104,33 @@ struct MarkerTrack {
     std::vector<Marker> markers;
 };
 
-// ─── Video (RB-5) ───────────────────────────────────────────────────────────
+// ─── Video (RB-5/RB-6) ──────────────────────────────────────────────────────
 // A video clip references a movie file (decoded via the LGPL FFmpeg subprocess
-// — see VideoDecoder). It sits on the timeline like an audio clip; its frames
-// show in the VideoPreview panel locked to the audio transport (audio master).
-// RB-5 is playback-only (no editing/transitions — that's RB-6).
+// — see VideoDecoder). RB-6 adds timeline placement + trimming (like audio
+// clips): timelineStart, sourceOffset, length — so multiple clips can be
+// arranged on a video track. The preview shows whichever clip is at the
+// playhead.
 struct VideoClip {
     std::string id;
     std::string path;           // movie file
     std::string name;           // display (filename)
     std::string codec;          // e.g. "h264", "dnxhd" (probed at import)
     int64_t timelineStart = 0;  // where on the timeline (samples, @ audio sr)
+    int64_t sourceOffset = 0;   // where in the source to start (samples @ audio sr)
+    int64_t length = 0;         // how long to play (samples @ audio sr; 0 = full)
     double fps = 0.0;           // native frame rate
     int width = 0;              // native resolution (probe at import)
     int height = 0;
     double durationSeconds = 0.0;
+};
+
+// A video track holds an ordered list of video clips. RB-6 ships one default
+// video track; the model supports multiple (e.g. "Main picture" + "Alt angle").
+struct VideoTrack {
+    std::string id;
+    std::string name;
+    bool visible = true;
+    std::vector<VideoClip> clips;
 };
 
 } // namespace dave::document

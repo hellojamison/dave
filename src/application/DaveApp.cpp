@@ -406,7 +406,6 @@ void DaveApp::openVideoDialog() {
     if (NFD_OpenDialog(&outPath, &filter, 1, nullptr) == NFD_OKAY && outPath) {
         std::string path = outPath;
         NFD_FreePath(outPath);
-        // Probe the video for format/duration/fps/resolution.
         engine::VideoInfo info;
         if (!engine::VideoProbe::probe(path, info)) {
             std::fprintf(stderr, "Dave: failed to probe video: %s\n", path.c_str());
@@ -416,34 +415,33 @@ void DaveApp::openVideoDialog() {
         clip.path = path;
         auto slash = path.find_last_of("/\\");
         clip.name = (slash != std::string::npos) ? path.substr(slash + 1) : path;
-        clip.timelineStart = 0;
+        clip.timelineStart = audio_.transport().position();
+        clip.sourceOffset = 0;
+        clip.length = 0; // auto = full duration
         clip.codec = info.codec;
         clip.fps = info.fps;
         clip.width = info.width;
         clip.height = info.height;
         clip.durationSeconds = info.durationSeconds;
-        edit_.setVideoClip(std::move(clip));
-        // Reset preview state so the decoder/texture get recreated for the new clip.
+        if (edit_.videoTracks().empty()) {
+            edit_.addVideoTrack("Video 1");
+        }
+        edit_.addVideoClip(edit_.videoTracks().front().id, std::move(clip));
         videoDecoder_.close();
         lastDecodedFrameIndex_ = -1;
-        std::fprintf(stderr, "Dave: loaded video %s (%dx%d @ %.3ffps, %.1fs, %s)\n",
-                     clip.name.c_str(), clip.width, clip.height, clip.fps,
-                     clip.durationSeconds, clip.codec.c_str());
     }
 }
 
 void DaveApp::newProject() {
-    // Clear the Edit and reset everything to a fresh state.
     edit_.tracksMut().clear();
     edit_.clearMarkerTracks_();
-    edit_.clearVideoClip();
-    builder_ = {};  // drop cached plugin instances / asset buffers
+    edit_.clearVideoTracks_();
+    builder_ = {};
     videoDecoder_.close();
     lastDecodedFrameIndex_ = -1;
     projectPath_.clear();
     dirty_ = false;
     undo_.clear();
-    // Re-seed a default track + marker track (matches init()).
     undo_.execute(std::make_unique<editing::AddTrackCommand>("Track 1"));
     edit_.addMarkerTrack("Markers");
     audio_.transport().stop();
@@ -499,47 +497,50 @@ void DaveApp::saveProject(bool saveAs) {
 void DaveApp::drawVideoPreview() {
     ImGui::Begin("Video");
 
-    const auto* clip = edit_.videoClip();
+    // Find the video clip active at the current playhead (RB-6: multi-clip).
+    int64_t playhead = audio_.transport().position();
+    const auto* clip = edit_.videoClipAt(playhead);
+
     if (!clip) {
-        ImGui::TextDisabled("(no video loaded)");
+        ImGui::TextDisabled("(no video at playhead)");
         if (ImGui::Button("Load Video...")) openVideoDialog();
         ImGui::End();
         return;
     }
 
-    // Header: name + reload button.
     ImGui::Text("%s", clip->name.c_str());
     ImGui::SameLine();
-    if (ImGui::SmallButton("Replace...")) openVideoDialog();
+    if (ImGui::SmallButton("Add Video...")) openVideoDialog();
     ImGui::TextDisabled("%dx%d @ %.3ffps  %.1fs", clip->width, clip->height,
                         clip->fps, clip->durationSeconds);
 
-    // Compute the target video frame from the transport position (audio master).
-    // timelineStart is in audio samples; sampleRate is 48000.
+    // Compute the target video frame. relSamples includes sourceOffset so
+    // trimmed clips play from the right point in the source.
     const double audioSr = 48000.0;
-    int64_t playhead = audio_.transport().position();
-    int64_t relSamples = playhead - clip->timelineStart;
+    int64_t relSamples = (playhead - clip->timelineStart) +
+                         (clip->sourceOffset / 1); // both in audio samples
     double videoTimeSec = (relSamples > 0) ? (relSamples / audioSr) : 0.0;
-    bool inRange = (videoTimeSec >= 0.0 && videoTimeSec <= clip->durationSeconds);
+    double clipDurationSec = (clip->length > 0)
+        ? (clip->length / audioSr) : clip->durationSeconds;
+    bool inRange = (videoTimeSec >= 0.0 && videoTimeSec <= clipDurationSec);
     int64_t frameIndex = (clip->fps > 0.0)
         ? static_cast<int64_t>(videoTimeSec * clip->fps) : 0;
 
-    // If the frame index changed, decode + upload a new RGBA frame.
-    // Debounce random-access seeks: spawning ffmpeg per scrub-tick floods the
-    // pipe + tanks responsiveness. Allow at most one seek per ~150ms; during
-    // fast scrub we just hold the last decoded frame. Sequential playback
-    // (frameIndex advancing by 1) is NOT throttled — it reuses the process.
+    // If the active clip changed, force a re-decode (close the old process).
+    if (lastVideoClipId_ != clip->id) {
+        videoDecoder_.close();
+        lastDecodedFrameIndex_ = -1;
+        lastVideoClipId_ = clip->id;
+    }
+
     bool sequential = videoDecoder_.isOpen() && frameIndex == lastDecodedFrameIndex_ + 1;
     double nowSec = ImGui::GetTime();
     bool seekAllowed = sequential || (nowSec - lastSeekTime_ >= 0.15);
     if (inRange && frameIndex != lastDecodedFrameIndex_ && seekAllowed) {
         lastSeekTime_ = nowSec;
-        // Preview resolution — cap to 480 wide. 1920x1080 RGBA is 8MB/frame and
-        // swamps the pipe + GL upload; 480 wide is ~1MB and plenty for a preview.
         const int previewMaxW = 480;
         int pw = clip->width, ph = clip->height;
         if (pw > previewMaxW) { ph = ph * previewMaxW / pw; pw = previewMaxW; }
-        // Create or resize the GL texture if needed.
         if (videoTexture_ == 0 || videoTexW_ != pw || videoTexH_ != ph) {
             if (videoTexture_ == 0) glGenTextures(1, &videoTexture_);
             glBindTexture(GL_TEXTURE_2D, videoTexture_);
@@ -550,22 +551,16 @@ void DaveApp::drawVideoPreview() {
             videoTexW_ = pw;
             videoTexH_ = ph;
         }
-        // Decode the frame. Sequential playback keeps the process open; a jump
-        // of >1 frame closes + respawns (seekAndRead).
         bool got = false;
         if (sequential) {
             got = videoDecoder_.readFrame(videoFrameBuf_);
         }
         if (!got) {
-            // Random access: close + reopen at the requested time.
             double seekTo = static_cast<double>(frameIndex) / clip->fps;
             got = videoDecoder_.seekAndRead(clip->path, seekTo, pw, ph, videoFrameBuf_);
         }
         if (got && videoFrameBuf_.size() == static_cast<size_t>(pw * ph * 4)) {
             glBindTexture(GL_TEXTURE_2D, videoTexture_);
-            // Be explicit about pixel unpack alignment — default (4) is fine for
-            // RGBA but setting it removes a whole class of striping bugs when
-            // row widths change.
             glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
             glPixelStorei(GL_UNPACK_ROW_LENGTH, pw);
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, pw, ph, 0,
@@ -575,7 +570,6 @@ void DaveApp::drawVideoPreview() {
         }
     }
 
-    // Draw the latest frame. Preserve aspect ratio; fit to panel width.
     if (videoTexture_ != 0 && videoTexW_ > 0 && videoTexH_ > 0) {
         ImVec2 avail = ImGui::GetContentRegionAvail();
         float drawW = avail.x;
@@ -587,7 +581,6 @@ void DaveApp::drawVideoPreview() {
         ImGui::TextDisabled("(seek to a position to decode a frame)");
     }
 
-    // Timecode readout.
     int mm = static_cast<int>(videoTimeSec) / 60;
     int ss = static_cast<int>(videoTimeSec) % 60;
     int ff = (clip->fps > 0.0) ? static_cast<int>((videoTimeSec - static_cast<int>(videoTimeSec)) * clip->fps) : 0;

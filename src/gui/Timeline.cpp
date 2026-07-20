@@ -153,25 +153,41 @@ void drawTimeline(const document::Edit& edit,
                               ImVec2(origin.x + 4, y + trackHeight),
                               C(pal.accent));
         }
-        // Track header (in the gutter).
-        dl->AddText(ImVec2(origin.x + 10, y + 9),
+        // Track header (in the gutter): name + gain slider + pan slider.
+        dl->AddText(ImVec2(origin.x + 10, y + 6),
                     C(pal.text), track.name.c_str());
 
-        // Click the gutter (track header) to select this track. This matters
-        // for empty tracks — they have no clip to click, so without this the
-        // Plugins panel ("select a track...") could never target them.
+        // Click the gutter to select this track.
         if (areaHovered &&
             mouse.x >= origin.x && mouse.x <= origin.x + gutterWidth &&
             mouse.y >= y && mouse.y <= y + trackHeight &&
             ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
             view.selectedTrackIndex = static_cast<int>(ti);
         }
-        // Mini gain meter placeholder in the header.
-        char gainLabel[16];
-        std::snprintf(gainLabel, sizeof(gainLabel), "%.1f dB",
-                      20.0f * std::log10(std::max(0.0001f, float(track.gain))));
-        dl->AddText(ImVec2(origin.x + 10, y + trackHeight - 16),
-                    C(pal.textMuted), gainLabel);
+
+        // Interactive gain + pan controls in the gutter. Use ImGui widgets
+        // positioned via SetCursorScreenPos so they render inside the gutter
+        // area (not the clip lane).
+        ImGui::PushID(static_cast<int>(ti));
+        // Gain slider (horizontal, compact).
+        ImGui::SetCursorScreenPos(ImVec2(origin.x + 10, y + trackHeight - 38));
+        float gainVal = static_cast<float>(track.gain);
+        ImGui::PushItemWidth(gutterWidth - 50);
+        if (ImGui::SliderFloat("##gain", &gainVal, 0.0f, 2.0f, "%.1f")) {
+            const_cast<document::Track&>(track).gain = gainVal;
+            const_cast<document::Edit&>(edit).notifyChanged();
+        }
+        ImGui::PopItemWidth();
+        // Pan slider (horizontal, -1=L to +1=R).
+        ImGui::SetCursorScreenPos(ImVec2(origin.x + 10, y + trackHeight - 18));
+        float panVal = static_cast<float>(track.pan);
+        ImGui::PushItemWidth(gutterWidth - 50);
+        if (ImGui::SliderFloat("##pan", &panVal, -1.0f, 1.0f, "Pan %.1f")) {
+            const_cast<document::Track&>(track).pan = panVal;
+            const_cast<document::Edit&>(edit).notifyChanged();
+        }
+        ImGui::PopItemWidth();
+        ImGui::PopID();
 
         for (const auto& clip : track.clips) {
             double clipX = origin.x + gutterWidth +

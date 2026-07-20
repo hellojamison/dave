@@ -31,6 +31,7 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit, double sa
         // shows them and the master sum has the right pin count.
         auto gain = std::make_shared<GainNode>();
         gain->setGain(track.gain);
+        gain->setPan(track.pan);
         auto gainId = graph->addNode(gain);
         trackGains_[track.id] = gain;
 

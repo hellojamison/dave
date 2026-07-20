@@ -454,6 +454,106 @@ void DaveApp::run() {
     window_.run();
 }
 
+void DaveApp::updateThumbnails(const document::Edit& edit) {
+    // For each video clip, ensure we have thumbnail textures. We request them
+    // one at a time via the background decoder (not all at once — avoids
+    // spawning many ffmpeg processes). Each clip gets ~1 thumb per 2 seconds.
+    for (const auto& vt : edit.videoTracks()) {
+        for (const auto& clip : vt.clips) {
+            // Find or create the thumbnail entry.
+            ClipThumbnails* ct = nullptr;
+            for (auto& t : thumbCache_) {
+                if (t.clipId == clip.id) { ct = &t; break; }
+            }
+            if (!ct) {
+                thumbCache_.push_back({clip.id, clip.path, {}, clip.fps, false});
+                ct = &thumbCache_.back();
+            }
+            // Count how many thumbs we need.
+            int64_t len = (clip.length > 0) ? clip.length
+                : static_cast<int64_t>(clip.durationSeconds * 48000.0);
+            double durSec = len / 48000.0;
+            int needed = std::max(1, static_cast<int>(durSec / 2.0));
+            // Request thumbs one at a time.
+            if (static_cast<int>(ct->textures.size()) < needed &&
+                !ct->requested && !thumbDecoder_.isBusy()) {
+                double t = ct->textures.size() * 2.0;  // every 2 seconds
+                if (t > durSec) t = durSec - 0.1;
+                int tw = 80, th = static_cast<int>(80.0 * clip.height / clip.width);
+                thumbDecoder_.requestFrame(clip.path, t, tw, th, clip.fps);
+                ct->requested = true;
+                thumbRequestClipId_ = clip.id;
+            }
+        }
+    }
+    // Check for a completed thumbnail.
+    if (!thumbRequestClipId_.empty() && !thumbDecoder_.isBusy()) {
+        engine::VideoFrame frame;
+        if (thumbDecoder_.getLatestFrame(frame)) {
+            for (auto& ct : thumbCache_) {
+                if (ct.clipId == thumbRequestClipId_) {
+                    unsigned int tex = 0;
+                    glGenTextures(1, &tex);
+                    glBindTexture(GL_TEXTURE_2D, tex);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+                    glPixelStorei(GL_UNPACK_ROW_LENGTH, frame.width);
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, frame.width, frame.height,
+                                 0, GL_RGBA, GL_UNSIGNED_BYTE, frame.rgba.data());
+                    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+                    ct.textures.push_back({tex, frame.width, frame.height, frame.timeSeconds});
+                    ct.requested = false;
+                    break;
+                }
+            }
+        }
+        thumbRequestClipId_.clear();
+    }
+}
+
+void DaveApp::drawVideoThumbnails(ImDrawList* dl, ImVec2 origin, float laneHeight,
+                                   float totalWidth, float gutterWidth,
+                                   double scroll, double spp,
+                                   const document::Edit& edit) {
+    // Draw thumbnail textures inside video clip blocks in the video lane.
+    for (const auto& vt : edit.videoTracks()) {
+        for (const auto& clip : vt.clips) {
+            // Find the thumbnail cache entry.
+            const ClipThumbnails* ct = nullptr;
+            for (const auto& t : thumbCache_) {
+                if (t.clipId == clip.id) { ct = &t; break; }
+            }
+            if (!ct || ct->textures.empty()) continue;
+
+            // Clip screen rect.
+            double clipX = origin.x + gutterWidth +
+                (clip.timelineStart - scroll) / spp;
+            int64_t len = (clip.length > 0) ? clip.length
+                : static_cast<int64_t>(clip.durationSeconds * 48000.0);
+            double clipW = static_cast<double>(len) / spp;
+            if (clipX + clipW < origin.x + gutterWidth) continue;
+            if (clipX > origin.x + totalWidth) continue;
+
+            // Draw each thumbnail at its position within the clip.
+            for (const auto& thumb : ct->textures) {
+                double thumbX = clipX + (thumb.timeSeconds * 48000.0) / spp;
+                if (thumbX < clipX || thumbX > clipX + clipW) continue;
+                if (thumb.texId == 0) continue;
+                float thumbW = static_cast<float>(thumb.w);
+                float thumbH = static_cast<float>(thumb.h);
+                // Scale to fit the lane height.
+                float scale = (laneHeight - 10) / thumbH;
+                ImGui::SetCursorScreenPos(ImVec2(thumbX, origin.y + 5));
+                ImGui::Image(static_cast<ImTextureID>(thumb.texId),
+                             ImVec2(thumbW * scale, thumbH * scale));
+            }
+        }
+    }
+}
+
 void DaveApp::openVideoDialog() {
     nfdnchar_t* outPath = nullptr;
     nfdnfilteritem_t filter{"Video", "mp4,mov,mkv,m4v,mxf"};

@@ -13,6 +13,8 @@
 #include "platform/AudioEngine.h"
 #include "platform/Window.h"
 
+#include <imgui.h>  // ImDrawList, ImVec2 for drawVideoThumbnails
+
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -96,6 +98,31 @@ private:
     int64_t lastDecodedFrameIndex_ = -1; // last frame index we uploaded
     double lastSeekTime_ = 0.0;          // ImGui::GetTime() of last random-access seek (debounce)
     std::string lastVideoClipId_;       // which clip the decoder is open for (RB-6 multi-clip)
+
+    // Video thumbnails for the timeline lane. One AsyncVideoDecoder per clip,
+    // caching a few representative frames as GL textures.
+    struct ThumbTexture {
+        unsigned int texId = 0;
+        int w = 0, h = 0;
+        double timeSeconds = 0.0;
+    };
+    struct ClipThumbnails {
+        std::string clipId;
+        std::string path;
+        std::vector<ThumbTexture> textures;  // one per interval
+        double fps = 24.0;
+        bool requested = false;  // true while async decode is in progress
+    };
+    std::vector<ClipThumbnails> thumbCache_;
+    engine::AsyncVideoDecoder thumbDecoder_;  // separate decoder for thumbs
+    int thumbRequestIndex_ = 0;  // which thumb to request next
+    std::string thumbRequestClipId_;  // which clip we're filling
+
+    void updateThumbnails(const document::Edit& edit);
+    void drawVideoThumbnails(ImDrawList* dl, ImVec2 origin, float laneHeight,
+                             float totalWidth, float gutterWidth,
+                             double scroll, double spp,
+                             const document::Edit& edit);
 
     // ─── Project persistence ────────────────────────────────────────────────
     std::string projectPath_;            // current .dave bundle path (empty = untitled)

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "engine/plugins/PluginHost.h"
 
 #include <public.sdk/source/vst/hosting/module.h>

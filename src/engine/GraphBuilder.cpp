@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "engine/GraphBuilder.h"
 
 #define DR_WAV_NO_IMPLEMENTATION

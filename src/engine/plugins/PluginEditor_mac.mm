@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "engine/plugins/PluginEditor.h"
 #include "engine/plugins/PluginInstance.h"
 

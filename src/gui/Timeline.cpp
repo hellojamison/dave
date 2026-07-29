@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "gui/Timeline.h"
 #include "editing/Commands.h"
 #include "gui/Theme.h"
@@ -5,9 +6,11 @@
 #include <imgui.h>
 
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 
 namespace dave::gui {
 
@@ -63,33 +66,104 @@ static inline ImU32 C(const ImVec4& v) {
         int(v.x * 255), int(v.y * 255), int(v.z * 255), int(v.w * 255));
 }
 
-const std::vector<PeakBucket>& PeakCache::get(const std::string& assetId,
-                                              const std::vector<std::vector<float>>& buffer,
-                                              int samplesPerPixel) {
-    std::string k = key(assetId, samplesPerPixel);
-    auto it = cache_.find(k);
-    if (it != cache_.end()) return it->second;
+namespace {
+constexpr size_t kPeakCacheBytes = 32u * 1024u * 1024u;
+constexpr size_t kMaxBucketsPerLevel = 1u << 20;
+}
 
-    std::vector<PeakBucket> buckets;
-    if (!buffer.empty()) {
-        const auto& ch = buffer[0];
-        const int64_t total = static_cast<int64_t>(ch.size());
-        const int64_t numBuckets = (total + samplesPerPixel - 1) / samplesPerPixel;
-        buckets.reserve(static_cast<size_t>(numBuckets));
-        for (int64_t b = 0; b < numBuckets; ++b) {
-            int64_t start = b * samplesPerPixel;
-            int64_t end = std::min(start + samplesPerPixel, total);
-            float mn = 1e9f, mx = -1e9f;
-            for (int64_t i = start; i < end; ++i) {
-                mn = std::min(mn, ch[i]);
-                mx = std::max(mx, ch[i]);
+int PeakCache::bucketSizeFor(int samplesPerPixel, size_t sampleCount) {
+    const int target = std::max(4, samplesPerPixel);
+    int upper = 4;
+    while (upper < target && upper < (1 << 29)) {
+        upper <<= 1;
+    }
+    const int lower = std::max(4, upper >> 1);
+    int bucketSize = target - lower <= upper - target ? lower : upper;
+
+    // A very long asset must not let one fine mip level consume the whole
+    // cache; increasing by powers of two keeps the selection predictable.
+    while ((sampleCount + static_cast<size_t>(bucketSize) - 1) /
+               static_cast<size_t>(bucketSize) > kMaxBucketsPerLevel &&
+           bucketSize < (1 << 29)) {
+        bucketSize <<= 1;
+    }
+    return bucketSize;
+}
+
+void PeakCache::trim(size_t incomingBytes) {
+    while (cacheBytes_ + incomingBytes > kPeakCacheBytes && !cache_.empty()) {
+        auto oldestAsset = cache_.end();
+        size_t oldestLevel = 0;
+        uint64_t oldestUse = std::numeric_limits<uint64_t>::max();
+        for (auto asset = cache_.begin(); asset != cache_.end(); ++asset) {
+            for (size_t level = 0; level < asset->second.size(); ++level) {
+                if (asset->second[level].lastUsed < oldestUse) {
+                    oldestAsset = asset;
+                    oldestLevel = level;
+                    oldestUse = asset->second[level].lastUsed;
+                }
             }
-            if (mn > mx) { mn = 0; mx = 0; }
-            buckets.push_back({mn, mx});
+        }
+        if (oldestAsset == cache_.end()) {
+            break;
+        }
+        cacheBytes_ -= oldestAsset->second[oldestLevel].peaks.buckets.size() *
+                       sizeof(PeakBucket);
+        oldestAsset->second.erase(oldestAsset->second.begin() +
+                                  static_cast<ptrdiff_t>(oldestLevel));
+        if (oldestAsset->second.empty()) {
+            cache_.erase(oldestAsset);
         }
     }
-    auto [insIt, _] = cache_.emplace(k, std::move(buckets));
-    return insIt->second;
+}
+
+const PeakLevel& PeakCache::get(const std::string& assetId,
+                                const std::vector<std::vector<float>>& buffer,
+                                int samplesPerPixel) {
+    const size_t sampleCount = buffer.empty() ? 0 : buffer.front().size();
+    const int bucketSize = bucketSizeFor(samplesPerPixel, sampleCount);
+    if (auto asset = cache_.find(assetId); asset != cache_.end()) {
+        for (auto& level : asset->second) {
+            if (level.peaks.bucketSize == bucketSize) {
+                level.lastUsed = ++useClock_;
+                return level.peaks;
+            }
+        }
+    }
+
+    PeakLevel level;
+    level.bucketSize = bucketSize;
+    float peakMagnitude = 0.0f;
+    if (!buffer.empty()) {
+        const auto& ch = buffer.front();
+        const int64_t total = static_cast<int64_t>(ch.size());
+        const int64_t numBuckets = (total + bucketSize - 1) / bucketSize;
+        level.buckets.reserve(static_cast<size_t>(numBuckets));
+        for (int64_t bucket = 0; bucket < numBuckets; ++bucket) {
+            const int64_t start = bucket * bucketSize;
+            const int64_t end = std::min(start + bucketSize, total);
+            float mn = 1e9f;
+            float mx = -1e9f;
+            for (int64_t sample = start; sample < end; ++sample) {
+                mn = std::min(mn, ch[sample]);
+                mx = std::max(mx, ch[sample]);
+            }
+            if (mn > mx) { mn = 0; mx = 0; }
+            peakMagnitude = std::max(peakMagnitude, std::max(std::abs(mn), std::abs(mx)));
+            level.buckets.push_back({mn, mx});
+        }
+    }
+    // This is display-only gain: cap it so near-silent files do not turn
+    // background noise into a dominant visual while normal recordings fill
+    // the available waveform body.
+    level.displayScale = std::min(8.0f, 1.0f / std::max(peakMagnitude, 0.001f));
+
+    const size_t incomingBytes = level.buckets.size() * sizeof(PeakBucket);
+    trim(incomingBytes);
+    auto& levels = cache_[assetId];
+    levels.push_back(CachedLevel{std::move(level), ++useClock_});
+    cacheBytes_ += incomingBytes;
+    return levels.back().peaks;
 }
 
 void drawTimeline(const document::Edit& edit,
@@ -103,15 +177,31 @@ void drawTimeline(const document::Edit& edit,
                   float timelineHeight) {
     // Draw directly into the host window's draw list (no child windows — they
     // introduce scrolling/sizing bugs that hid the clips in RB-2's first cut).
-    // We reserve a fixed gutter on the left for track names and draw everything
-    // (ruler, tracks, clips, waveforms, playhead) with absolute coordinates.
+    // The gutter width follows the controls it contains; the remaining canvas
+    // stays dedicated to clips, waveforms, and timeline interaction.
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 origin = ImGui::GetCursorScreenPos();
     ImVec2 avail = ImGui::GetContentRegionAvail();
-    const float gutterWidth = 132.0f;       // a touch wider for track names + meter
+    const float gutterWidth = 196.0f;
     const float totalWidth = avail.x;
     const float totalHeight = avail.y;
     const auto& pal = theme::palette();
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float rowPadding = 6.0f;
+    const float rowGap = 3.0f;
+    const float compactControlHeight = ImGui::GetFontSize() + 2.0f;
+    const float labelHeight = static_cast<float>(theme::typeScale().label);
+    const float headerHeight = std::max(labelHeight, compactControlHeight);
+    const float minTrackHeight =
+        rowPadding * 2.0f + headerHeight +
+        compactControlHeight * 2.0f + rowGap * 2.0f;
+    trackHeight = std::max(trackHeight, minTrackHeight);
+
+    // Rows deliberately stop at their content boundary. The shell below them
+    // is a canvas for future tracks, not a blank continuation of the gutter.
+    theme::drawShellBackground(
+        dl, theme::Rect{origin, ImVec2(origin.x + totalWidth,
+                                      origin.y + totalHeight)});
 
     // Reserve the marker lane FIRST so its "Add marker track" button gets
     // interaction space before the timeline's big InvisibleButton claims the
@@ -123,15 +213,23 @@ void drawTimeline(const document::Edit& edit,
     // Reserve the TRACK ROWS area as an invisible interaction widget. This
     // must NOT cover the ruler or marker lane, or it eats their clicks.
     // We account for the cursor advance the marker lane already did.
-    const float tracksRegionHeight = totalHeight - timelineHeight - markerLaneHeight;
+    const auto& tracks = edit.tracks();
+    const float tracksRegionHeight =
+        static_cast<float>(tracks.size()) * trackHeight;
     char areaBtn[32];
     std::snprintf(areaBtn, sizeof(areaBtn), "##timeline_area_%p", &view);
     // The InvisibleButton covers the clip lane (right of the gutter) so it
     // doesn't eat clicks meant for the gutter's gain/pan sliders.
-    ImGui::SetCursorScreenPos(ImVec2(origin.x + gutterWidth, origin.y + timelineHeight + markerLaneHeight));
-    ImGui::InvisibleButton(areaBtn, ImVec2(totalWidth - gutterWidth, tracksRegionHeight));
+    bool areaHovered = false;
+    if (tracksRegionHeight > 0.0f) {
+        ImGui::SetCursorScreenPos(
+            ImVec2(origin.x + gutterWidth,
+                   origin.y + timelineHeight + markerLaneHeight));
+        ImGui::InvisibleButton(
+            areaBtn, ImVec2(totalWidth - gutterWidth, tracksRegionHeight));
+        areaHovered = ImGui::IsItemHovered();
+    }
     const ImVec2 mouse = ImGui::GetIO().MousePos;
-    const bool areaHovered = ImGui::IsItemHovered();
 
     // Is the mouse over the ruler region? Check independently of areaHovered
     // (the InvisibleButton only covers the track-rows area, but the ruler is
@@ -141,11 +239,10 @@ void drawTimeline(const document::Edit& edit,
         mouse.y >= origin.y && mouse.y <= origin.y + timelineHeight &&
         mouse.x >= origin.x + gutterWidth;
 
-    // Gutter column background (runs full height, slightly distinct).
-    dl->AddRectFilled(origin, ImVec2(origin.x + gutterWidth, origin.y + totalHeight),
-                      C(pal.bgElevated));
-
     // Ruler background + ticks. Brighten slightly when hovered/clickable.
+    dl->AddRectFilled(
+        origin, ImVec2(origin.x + gutterWidth, origin.y + timelineHeight),
+        C(pal.surfaceStrong));
     ImVec4 rulerBg = rulerHovered ? pal.bgElevated : pal.bgAlt;
     dl->AddRectFilled(ImVec2(origin.x + gutterWidth, origin.y),
                       ImVec2(origin.x + totalWidth, origin.y + timelineHeight),
@@ -154,54 +251,97 @@ void drawTimeline(const document::Edit& edit,
                 ImVec2(origin.x + totalWidth, origin.y + timelineHeight),
                 C(pal.border));
     const double sr = 48000.0;
-    const int64_t secStep = static_cast<int64_t>(sr);
-    int64_t firstSec = static_cast<int64_t>(view.scrollSamples / secStep);
-    for (int64_t s = firstSec; ; ++s) {
+    // Keep labelled ticks roughly a label-width apart. This is chosen from
+    // zoom rather than a fixed second grid, so both sample-level edits and
+    // long-form timelines retain an intelligible ruler.
+    constexpr double majorSeconds[] = {
+        0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0,
+        10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0
+    };
+    constexpr double targetMajorPixels = 120.0;
+    double majorSecondsStep = majorSeconds[std::size(majorSeconds) - 1];
+    for (double candidate : majorSeconds) {
+        if (candidate * sr / view.samplesPerPixel >= targetMajorPixels) {
+            majorSecondsStep = candidate;
+            break;
+        }
+    }
+    const int64_t majorStep = std::max<int64_t>(1,
+        static_cast<int64_t>(std::llround(majorSecondsStep * sr)));
+    const int64_t minorStep = std::max<int64_t>(1, majorStep / 5);
+    const int64_t firstMinor = std::max<int64_t>(0,
+        static_cast<int64_t>(std::floor(view.scrollSamples / minorStep)));
+    ImFont* rulerFont = theme::fonts().monoSmall != nullptr
+        ? theme::fonts().monoSmall : ImGui::GetFont();
+    const float rulerFontSize = static_cast<float>(theme::typeScale().caption);
+    dl->PushClipRect(ImVec2(origin.x + gutterWidth, origin.y),
+                     ImVec2(origin.x + totalWidth, origin.y + timelineHeight), true);
+    for (int64_t tick = firstMinor; ; ++tick) {
+        const int64_t sample = tick * minorStep;
         double x = origin.x + gutterWidth +
-            (s * secStep - view.scrollSamples) / view.samplesPerPixel;
+            (sample - view.scrollSamples) / view.samplesPerPixel;
         if (x > origin.x + totalWidth) break;
         if (x < origin.x + gutterWidth) continue;
-        dl->AddLine(ImVec2(x, origin.y), ImVec2(x, origin.y + timelineHeight),
-                    C(pal.border));
-        std::string label = formatTimecode(s * secStep, view.tcMode);
-        dl->AddText(ImVec2(x + 4, origin.y + 6), C(pal.textMuted), label.c_str());
+        const bool major = sample % majorStep == 0;
+        const float tickTop = major ? origin.y + 15.0f : origin.y + 22.0f;
+        dl->AddLine(ImVec2(x, tickTop), ImVec2(x, origin.y + timelineHeight),
+                    C(major ? pal.borderStrong : pal.border));
+        if (major) {
+            const std::string label = formatTimecode(sample, view.tcMode);
+            dl->AddText(rulerFont, rulerFontSize, ImVec2(x + 4.0f, origin.y + 2.0f),
+                        C(pal.textMuted), label.c_str());
+        }
     }
+    dl->PopClipRect();
 
-    const auto& tracks = edit.tracks();
     // Marker lane was already drawn above (before the InvisibleButton). Reuse
     // its height to compute the track-row region.
     const float tracksTop = origin.y + timelineHeight + markerLaneHeight;
-    const float tracksAreaHeight = totalHeight - timelineHeight - markerLaneHeight;
+    const bool gutterHovered =
+        windowHovered &&
+        mouse.x >= origin.x && mouse.x <= origin.x + gutterWidth &&
+        mouse.y >= tracksTop &&
+        mouse.y <= tracksTop + tracksRegionHeight;
 
     // Tracks + clips.
+    ImGui::PushStyleVar(
+        ImGuiStyleVar_FramePadding, ImVec2(style.FramePadding.x, 1.0f));
     for (size_t ti = 0; ti < tracks.size(); ++ti) {
         const auto& track = tracks[ti];
         float y = tracksTop + static_cast<float>(ti) * trackHeight;
         if (y > origin.y + totalHeight) break;
 
         bool selected = view.selectedTrackIndex == static_cast<int>(ti);
-        // Alternating row backgrounds for readability.
-        ImVec4 rowBg = (ti % 2 == 0) ? pal.bg : pal.bgAlt;
-        dl->AddRectFilled(ImVec2(origin.x + gutterWidth, y),
-                          ImVec2(origin.x + totalWidth, y + trackHeight), C(rowBg));
-        // Selected highlight on the track lane.
-        if (selected) {
-            dl->AddRectFilled(ImVec2(origin.x + gutterWidth, y),
-                              ImVec2(origin.x + totalWidth, y + trackHeight),
-                              C(ImVec4(pal.accent.x, pal.accent.y, pal.accent.z, 0.08f)));
-        }
+        // The surface step spans the full row so header and clip lane read as
+        // one track, not two unrelated tables.
+        ImVec4 rowBg = selected
+            ? pal.trackSelected
+            : (ti % 2 == 0 ? pal.surfaceBase : pal.surfaceSoft);
+        dl->AddRectFilled(
+            ImVec2(origin.x, y),
+            ImVec2(origin.x + totalWidth, y + trackHeight), C(rowBg));
         // Track separator.
         dl->AddLine(ImVec2(origin.x, y + trackHeight),
                     ImVec2(origin.x + totalWidth, y + trackHeight),
                     C(pal.border));
-        // If selected, highlight the gutter with an accent stripe so it's
-        // obvious which track the Plugins panel is targeting.
+        // Selection gets a dedicated accent edge. The smaller chip remains a
+        // stable per-track identity when selection moves elsewhere.
         if (selected) {
             dl->AddRectFilled(ImVec2(origin.x, y),
                               ImVec2(origin.x + 4, y + trackHeight),
                               C(pal.accent));
         }
-        // Track header (in the gutter): name + gain slider + pan slider.
+        const ImVec4 trackColors[] = {
+            pal.markerCue, pal.markerSection, pal.markerLoop,
+            pal.markerPunch, pal.markerCd, pal.markerCustom
+        };
+        const ImVec4& trackColor =
+            trackColors[ti % (sizeof(trackColors) / sizeof(trackColors[0]))];
+        dl->AddRectFilled(
+            ImVec2(origin.x + 10.0f, y + rowPadding),
+            ImVec2(origin.x + 14.0f, y + rowPadding + headerHeight),
+            C(trackColor), 2.0f);
+
         // Double-click the name to rename (inline text input).
         {
             // Unique ID for the rename input so each track has its own state.
@@ -214,8 +354,9 @@ void drawTimeline(const document::Edit& edit,
 
             if (thisRenaming) {
                 // Show an InputText in place of the name.
-                ImGui::SetCursorScreenPos(ImVec2(origin.x + 8, y + 4));
-                ImGui::PushItemWidth(gutterWidth - 16);
+                ImGui::SetCursorScreenPos(
+                    ImVec2(origin.x + 20.0f, y + rowPadding));
+                ImGui::PushItemWidth(gutterWidth - 88.0f);
                 ImGui::SetKeyboardFocusHere();
                 char nameBuf[128];
                 std::strncpy(nameBuf, track.name.c_str(), sizeof(nameBuf) - 1);
@@ -237,14 +378,24 @@ void drawTimeline(const document::Edit& edit,
                 ImGui::PopID();
                 ImGui::PopItemWidth();
             } else {
-                // Normal: draw the name as text.
-                dl->AddText(ImVec2(origin.x + 10, y + 6),
-                            C(pal.text), track.name.c_str());
+                ImFont* nameFont = theme::fonts().label != nullptr
+                    ? theme::fonts().label : ImGui::GetFont();
+                dl->PushClipRect(
+                    ImVec2(origin.x + 20.0f, y),
+                    ImVec2(origin.x + gutterWidth - 62.0f,
+                           y + headerHeight + rowPadding * 2.0f),
+                    true);
+                dl->AddText(
+                    nameFont, labelHeight,
+                    ImVec2(origin.x + 20.0f, y + rowPadding),
+                    C(pal.text), track.name.c_str());
+                dl->PopClipRect();
             }
             // Double-click on the name area starts rename mode.
-            if (areaHovered &&
-                mouse.x >= origin.x && mouse.x <= origin.x + gutterWidth &&
-                mouse.y >= y && mouse.y <= y + 24 &&
+            if (gutterHovered &&
+                mouse.x >= origin.x + 16.0f &&
+                mouse.x <= origin.x + gutterWidth - 62.0f &&
+                mouse.y >= y && mouse.y <= y + headerHeight + rowPadding * 2.0f &&
                 ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
                 renaming = true;
                 renameIdx = static_cast<int>(ti);
@@ -252,9 +403,18 @@ void drawTimeline(const document::Edit& edit,
             }
         }
 
+        ImGui::PushID(static_cast<int>(ti) + 5000);
+        ImGui::SetCursorScreenPos(
+            ImVec2(origin.x + gutterWidth - 56.0f, y + rowPadding));
+        ImGui::BeginDisabled();
+        ImGui::Button("M", ImVec2(24.0f, compactControlHeight));
+        ImGui::SameLine(0.0f, 3.0f);
+        ImGui::Button("S", ImVec2(24.0f, compactControlHeight));
+        ImGui::EndDisabled();
+        ImGui::PopID();
+
         // Click the gutter to select this track.
-        if (areaHovered &&
-            mouse.x >= origin.x && mouse.x <= origin.x + gutterWidth &&
+        if (gutterHovered &&
             mouse.y >= y && mouse.y <= y + trackHeight &&
             ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
             view.selectedTrackIndex = static_cast<int>(ti);
@@ -263,13 +423,26 @@ void drawTimeline(const document::Edit& edit,
         // Interactive gain + pan controls in the gutter.
         // Option-click (Alt-click) resets to default: gain=0 dB, pan=center.
         ImGui::PushID(static_cast<int>(ti));
+        float controlY = y + rowPadding + headerHeight + rowGap;
+        constexpr float controlX = 12.0f;
+        constexpr float controlLabelW = 64.0f;
+        const float sliderW =
+            gutterWidth - controlX - 10.0f - controlLabelW - 6.0f;
         {
             // Gain: dB slider from -60 to +6 dB. Convert to/from linear.
-            ImGui::SetCursorScreenPos(ImVec2(origin.x + 10, y + trackHeight - 38));
             float gainDb = 20.0f * std::log10(std::max(0.0001f, static_cast<float>(track.gain)));
-            ImGui::PushItemWidth(gutterWidth - 50);
-            // Option-click resets gain to 0 dB (unity).
-            if (ImGui::SliderFloat("##gain", &gainDb, -60.0f, 6.0f, "%.1f dB")) {
+            char gainText[16];
+            std::snprintf(gainText, sizeof(gainText), "%.1f", gainDb);
+            dl->AddText(ImVec2(origin.x + controlX, controlY + 1.0f),
+                        C(pal.textMuted), "Gain");
+            const float gainTextWidth = ImGui::CalcTextSize(gainText).x;
+            dl->AddText(ImVec2(origin.x + controlX + controlLabelW - gainTextWidth - 4.0f,
+                               controlY + 1.0f), C(pal.textSubtle), gainText);
+            ImGui::SetCursorScreenPos(
+                ImVec2(origin.x + controlX + controlLabelW, controlY));
+            ImGui::PushItemWidth(sliderW);
+            // The readout lives beside, not on, the grab so centre remains usable.
+            if (ImGui::SliderFloat("##gain", &gainDb, -60.0f, 6.0f, "")) {
                 float linear = std::pow(10.0f, gainDb / 20.0f);
                 const_cast<document::Track&>(track).gain = linear;
                 const_cast<document::Edit&>(edit).notifyChanged();
@@ -281,11 +454,20 @@ void drawTimeline(const document::Edit& edit,
             }
             ImGui::PopItemWidth();
         }
+        controlY += compactControlHeight + rowGap;
         // Pan: -1=L to +1=R. Option-click resets to center (0.0).
-        ImGui::SetCursorScreenPos(ImVec2(origin.x + 10, y + trackHeight - 18));
         float panVal = static_cast<float>(track.pan);
-        ImGui::PushItemWidth(gutterWidth - 50);
-        if (ImGui::SliderFloat("##pan", &panVal, -1.0f, 1.0f, "Pan %.1f")) {
+        char panText[16];
+        std::snprintf(panText, sizeof(panText), "%.1f", panVal);
+        dl->AddText(ImVec2(origin.x + controlX, controlY + 1.0f),
+                    C(pal.textMuted), "Pan");
+        const float panTextWidth = ImGui::CalcTextSize(panText).x;
+        dl->AddText(ImVec2(origin.x + controlX + controlLabelW - panTextWidth - 4.0f,
+                           controlY + 1.0f), C(pal.textSubtle), panText);
+        ImGui::SetCursorScreenPos(
+            ImVec2(origin.x + controlX + controlLabelW, controlY));
+        ImGui::PushItemWidth(sliderW);
+        if (ImGui::SliderFloat("##pan", &panVal, -1.0f, 1.0f, "")) {
             const_cast<document::Track&>(track).pan = panVal;
             const_cast<document::Edit&>(edit).notifyChanged();
         }
@@ -310,30 +492,76 @@ void drawTimeline(const document::Edit& edit,
             Rect clipRect{ImVec2(clipX, y + 6),
                           ImVec2(clipX + clipW, y + trackHeight - 6)};
             bool isSel = view.selectedClipId == clip.id;
-            // Clip body: blue, brighter if selected.
+            // A distinct header gives a clip its identity without competing
+            // with the waveform, which carries the edit-critical detail.
             ImVec4 body = pal.clipAudio;
             if (isSel) body = ImVec4(body.x + 0.1f, body.y + 0.08f, body.z + 0.05f, 1.0f);
             dl->AddRectFilled(clipRect.min, clipRect.max, C(body), 2.0f);
             dl->AddRect(clipRect.min, clipRect.max,
                         isSel ? C(pal.accent) : C(pal.clipAudioBorder), 2.0f);
+            constexpr float clipHeaderHeight = 20.0f;
+            const float headerBottom = std::min(clipRect.max.y - 4.0f,
+                                                clipRect.min.y + clipHeaderHeight);
+            const ImVec4 headerColor(
+                pal.clipAudioBorder.x, pal.clipAudioBorder.y,
+                pal.clipAudioBorder.z, isSel ? 0.40f : 0.30f);
+            dl->AddRectFilled(clipRect.min,
+                              ImVec2(clipRect.max.x, headerBottom),
+                              C(headerColor), 2.0f,
+                              ImDrawFlags_RoundCornersTop);
+            if (clipW > 28.0) {
+                ImFont* clipFont = theme::fonts().small != nullptr
+                    ? theme::fonts().small : ImGui::GetFont();
+                const document::AudioAsset* asset = edit.asset(clip.asset);
+                const char* clipLabel = "Audio clip";
+                if (asset != nullptr && !asset->path.empty()) {
+                    const size_t lastSeparator = asset->path.find_last_of("/\\\\");
+                    clipLabel = asset->path.c_str() +
+                        (lastSeparator == std::string::npos ? 0 : lastSeparator + 1);
+                }
+                dl->PushClipRect(ImVec2(clipRect.min.x + 6.0f, clipRect.min.y),
+                                 ImVec2(clipRect.max.x - 4.0f, headerBottom), true);
+                dl->AddText(clipFont, static_cast<float>(theme::typeScale().caption),
+                            ImVec2(clipRect.min.x + 6.0f, clipRect.min.y + 3.0f),
+                            C(pal.primaryText), clipLabel);
+                dl->PopClipRect();
+            }
 
             // Waveform (lighter than the body so it reads).
             auto bufIt = assetBuffers.find(clip.asset.sha256);
             if (bufIt != assetBuffers.end()) {
-                int spp = std::max(1, static_cast<int>(view.samplesPerPixel));
-                const auto& pk = peaks.get(clip.asset.sha256, bufIt->second, spp);
-                double midY = y + trackHeight * 0.5f;
-                float halfH = (trackHeight - 12) * 0.45f;
-                int64_t startBucket = clip.sourceOffset / spp;
+                const int spp = std::max(1, static_cast<int>(view.samplesPerPixel));
+                const auto& level = peaks.get(clip.asset.sha256, bufIt->second, spp);
+                const float waveformTop = headerBottom + 4.0f;
+                const float waveformBottom = clipRect.max.y - 4.0f;
+                const float waveformMidY = (waveformTop + waveformBottom) * 0.5f;
+                const float waveformHalfH = std::max(2.0f,
+                    (waveformBottom - waveformTop) * 0.5f);
+                const float waveformScale = level.displayScale;
                 int64_t numDraw = static_cast<int64_t>(clipW);
-                ImU32 waveCol = IM_COL32(220, 235, 255, 230);
+                ImU32 waveCol = C(pal.clipAudioBorder);
                 for (int64_t px = 0; px < numDraw; ++px) {
-                    int64_t bucket = startBucket + px;
-                    if (bucket < 0 || bucket >= static_cast<int64_t>(pk.size())) continue;
-                    const auto& b = pk[bucket];
+                    const int64_t sourceStart = clip.sourceOffset +
+                        static_cast<int64_t>(std::floor(px * view.samplesPerPixel));
+                    const int64_t sourceEnd = clip.sourceOffset +
+                        static_cast<int64_t>(std::ceil((px + 1) * view.samplesPerPixel));
+                    const int64_t firstBucket = sourceStart / level.bucketSize;
+                    const int64_t lastBucket = std::max(firstBucket,
+                        (sourceEnd - 1) / level.bucketSize);
+                    float peakMin = 1.0f;
+                    float peakMax = -1.0f;
+                    for (int64_t bucket = firstBucket; bucket <= lastBucket; ++bucket) {
+                        if (bucket < 0 ||
+                            bucket >= static_cast<int64_t>(level.buckets.size())) continue;
+                        peakMin = std::min(peakMin, level.buckets[bucket].min);
+                        peakMax = std::max(peakMax, level.buckets[bucket].max);
+                    }
+                    if (peakMin > peakMax) continue;
+                    peakMin = std::clamp(peakMin * waveformScale, -1.0f, 1.0f);
+                    peakMax = std::clamp(peakMax * waveformScale, -1.0f, 1.0f);
                     float pxX = static_cast<float>(clipX + px);
-                    dl->AddLine(ImVec2(pxX, midY - b.max * halfH),
-                                ImVec2(pxX, midY - b.min * halfH), waveCol);
+                    dl->AddLine(ImVec2(pxX, waveformMidY - peakMax * waveformHalfH),
+                                ImVec2(pxX, waveformMidY - peakMin * waveformHalfH), waveCol);
                 }
             }
 
@@ -354,6 +582,75 @@ void drawTimeline(const document::Edit& edit,
             }
         }
     }
+    ImGui::PopStyleVar();
+
+    const float addTrackY =
+        tracksTop + static_cast<float>(tracks.size()) * trackHeight;
+    constexpr float addTrackHeight = 42.0f;
+    ImGui::SetCursorScreenPos(ImVec2(origin.x, addTrackY));
+    ImGui::InvisibleButton(
+        "##addTrackTimeline", ImVec2(totalWidth, addTrackHeight));
+    const bool addTrackHovered =
+        ImGui::IsItemHovered() || ImGui::IsItemActive();
+    const bool addTrackRequested =
+        ImGui::IsItemClicked(ImGuiMouseButton_Left);
+    if (addTrackHovered) {
+        dl->AddRectFilled(
+            ImVec2(origin.x, addTrackY),
+            ImVec2(origin.x + totalWidth, addTrackY + addTrackHeight),
+            C(ImVec4(pal.accent.x, pal.accent.y, pal.accent.z, 0.08f)));
+    }
+    const ImU32 ghostBorder = C(
+        addTrackHovered ? pal.accent : pal.borderStrong);
+    constexpr float dash = 7.0f;
+    constexpr float dashGap = 5.0f;
+    for (float x = origin.x + 8.0f;
+         x < origin.x + totalWidth - 8.0f; x += dash + dashGap) {
+        dl->AddLine(
+            ImVec2(x, addTrackY + 5.0f),
+            ImVec2(std::min(x + dash, origin.x + totalWidth - 8.0f),
+                   addTrackY + 5.0f),
+            ghostBorder);
+        dl->AddLine(
+            ImVec2(x, addTrackY + addTrackHeight - 5.0f),
+            ImVec2(std::min(x + dash, origin.x + totalWidth - 8.0f),
+                   addTrackY + addTrackHeight - 5.0f),
+            ghostBorder);
+    }
+    const char* addTrackLabel = "+ Add track";
+    ImFont* addTrackFont = theme::fonts().label != nullptr
+        ? theme::fonts().label : ImGui::GetFont();
+    const ImVec2 addTrackLabelSize = addTrackFont->CalcTextSizeA(
+        labelHeight, FLT_MAX, 0.0f, addTrackLabel);
+    dl->AddText(
+        addTrackFont, labelHeight,
+        ImVec2(origin.x + (totalWidth - addTrackLabelSize.x) * 0.5f,
+               addTrackY + (addTrackHeight - addTrackLabelSize.y) * 0.5f),
+        C(addTrackHovered ? pal.accentStrong : pal.textMuted),
+        addTrackLabel);
+    const float videoLaneY = addTrackY + addTrackHeight;
+    // The spare canvas is deliberately the fastest way to create another
+    // track: the GLFW drop callback imports each WAV into a fresh lane.
+    constexpr float videoLaneHeight = 40.0f;
+    const float canvasTop = videoLaneY + videoLaneHeight;
+    const float canvasHeight = origin.y + totalHeight - canvasTop;
+    if (canvasHeight >= 72.0f) {
+        const char* canvasLabel = "Drop WAV files here to create tracks";
+        const ImVec2 labelSize = ImGui::CalcTextSize(canvasLabel);
+        dl->AddText(ImVec2(origin.x + (totalWidth - labelSize.x) * 0.5f,
+                           canvasTop + (canvasHeight - labelSize.y) * 0.5f),
+                    C(pal.textSubtle), canvasLabel);
+    }
+    const bool canvasHovered =
+        windowHovered &&
+        mouse.x >= origin.x + gutterWidth &&
+        mouse.x <= origin.x + totalWidth &&
+        mouse.y >= tracksTop &&
+        mouse.y <= origin.y + totalHeight &&
+        !(mouse.y >= addTrackY &&
+          mouse.y <= addTrackY + addTrackHeight) &&
+        !(mouse.y >= videoLaneY &&
+          mouse.y <= videoLaneY + 40.0f);
 
     // Clip context menu (right-click on a clip).
     if (ImGui::BeginPopup("##clip_ctx")) {
@@ -476,7 +773,7 @@ void drawTimeline(const document::Edit& edit,
     }
 
     // Track area: click empty space seeks (but not on clips — those drag).
-    if (areaHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !view.dragging) {
+    if (canvasHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !view.dragging) {
         bool hitClip = false;
         for (const auto& track : tracks) {
             for (const auto& clip : track.clips) {
@@ -500,7 +797,7 @@ void drawTimeline(const document::Edit& edit,
     }
 
     // Update selection end while dragging.
-    if (view.isSelecting && areaHovered && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+    if (view.isSelecting && canvasHovered && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
         double localX = mouse.x - (origin.x + gutterWidth);
         view.selectionEnd = static_cast<int64_t>(
             view.scrollSamples + std::max(0.0, localX) * view.samplesPerPixel);
@@ -544,39 +841,58 @@ void drawTimeline(const document::Edit& edit,
         }
     }
 
-    // Playhead — amber, full height, with a small cap triangle at the top.
+    // A shaded rail survives both the clip body and the shell, while the thin
+    // bright core preserves the precise position needed for edit decisions.
     int64_t pos = transport.position();
     double playheadX = origin.x + gutterWidth +
         (pos - view.scrollSamples) / view.samplesPerPixel;
     if (playheadX >= origin.x + gutterWidth && playheadX <= origin.x + totalWidth) {
-        dl->AddLine(ImVec2(playheadX, origin.y),
+        dl->AddLine(ImVec2(playheadX, origin.y + timelineHeight),
                     ImVec2(playheadX, origin.y + totalHeight),
-                    C(pal.accent), 2.0f);
-        // Cap.
+                    C(pal.accentDeep), 5.0f);
+        dl->AddLine(ImVec2(playheadX, origin.y + timelineHeight),
+                    ImVec2(playheadX, origin.y + totalHeight),
+                    C(pal.accentStrong), 2.0f);
+        dl->AddRectFilled(
+            ImVec2(playheadX - 5.0f, origin.y + timelineHeight - 8.0f),
+            ImVec2(playheadX + 5.0f, origin.y + timelineHeight - 3.0f),
+            C(pal.accentStrong), 2.0f);
         dl->AddTriangleFilled(
-            ImVec2(playheadX - 5, origin.y),
-            ImVec2(playheadX + 5, origin.y),
-            ImVec2(playheadX, origin.y + 7), C(pal.accent));
+            ImVec2(playheadX - 8, origin.y + timelineHeight - 3),
+            ImVec2(playheadX + 8, origin.y + timelineHeight - 3),
+            ImVec2(playheadX, origin.y + timelineHeight + 4), C(pal.accentStrong));
     }
 
     // Video lane — a strip at the bottom of the timeline showing video clips.
     // Placed below the track rows, above the scroll/zoom handler.
     {
-        float videoLaneY = tracksTop + static_cast<float>(tracks.size()) * trackHeight;
-        drawVideoLane(edit, transport, view,
-                      ImVec2(origin.x, videoLaneY),
-                      totalWidth, gutterWidth,
-                      view.scrollSamples, view.samplesPerPixel);
+        const float videoLaneHeight = drawVideoLane(
+            edit, transport, view, ImVec2(origin.x, videoLaneY),
+            totalWidth, gutterWidth, view.scrollSamples,
+            view.samplesPerPixel);
+        // Register the absolute-drawn lane with ImGui's content extent so a
+        // long track list remains vertically scrollable down to its add row.
+        ImGui::SetCursorScreenPos(
+            ImVec2(origin.x, videoLaneY + videoLaneHeight));
+        ImGui::Dummy(ImVec2(1.0f, 1.0f));
     }
 
     // Scroll / zoom.
     double wheel = ImGui::GetIO().MouseWheel;
-    if (areaHovered && wheel != 0.0) {
+    if (canvasHovered && wheel != 0.0) {
         if (ImGui::GetIO().KeyCtrl) {
             view.samplesPerPixel = std::clamp(view.samplesPerPixel - wheel * 10.0, 4.0, 50000.0);
         } else {
             view.scrollSamples = std::max(0.0, view.scrollSamples - wheel * view.samplesPerPixel * 20.0);
         }
+    }
+
+    // Adding reallocates the track vector, so it happens only after every
+    // reference used for drawing and interaction has gone out of scope.
+    if (addTrackRequested) {
+        undo.execute(std::make_unique<editing::AddTrackCommand>("Track"));
+        view.selectedTrackIndex =
+            static_cast<int>(edit.tracks().size()) - 1;
     }
 }
 
@@ -586,13 +902,14 @@ namespace {
 
 // Default color per marker kind (used when Marker::color is empty).
 ImU32 markerColor(document::MarkerKind k) {
+    const auto& pal = theme::palette();
     switch (k) {
-        case document::MarkerKind::Cue:     return IM_COL32(245, 166,  35, 255); // amber
-        case document::MarkerKind::Section: return IM_COL32(180,  90, 220, 255); // purple
-        case document::MarkerKind::Loop:    return IM_COL32( 80, 200, 120, 255); // green
-        case document::MarkerKind::Punch:   return IM_COL32(220,  80,  80, 255); // red
-        case document::MarkerKind::CD:      return IM_COL32( 90, 160, 220, 255); // blue
-        default:                            return IM_COL32(160, 160, 170, 255); // grey (Custom)
+        case document::MarkerKind::Cue:     return C(pal.markerCue);
+        case document::MarkerKind::Section: return C(pal.markerSection);
+        case document::MarkerKind::Loop:    return C(pal.markerLoop);
+        case document::MarkerKind::Punch:   return C(pal.markerPunch);
+        case document::MarkerKind::CD:      return C(pal.markerCd);
+        default:                            return C(pal.markerCustom);
     }
 }
 
@@ -854,10 +1171,9 @@ float drawVideoLane(const document::Edit& edit,
     // Gutter label.
     dl->AddText(ImVec2(origin.x + 10, origin.y + 6), C(pal.textMuted), "Video");
 
-    // No video tracks → hint.
+    // The picture panel owns onboarding. Repeating it here splits the empty
+    // state into two unrelated fragments and makes this lane read as an error.
     if (edit.videoTracks().empty()) {
-        dl->AddText(ImVec2(origin.x + gutterWidth + 8, origin.y + 6),
-                    C(pal.textMuted), "(no video — File > Load Video)");
         return laneHeight;
     }
 
@@ -882,9 +1198,10 @@ float drawVideoLane(const document::Edit& edit,
             if (clipX + clipW < origin.x + gutterWidth) { ++clipCount; continue; }
             if (clipX > origin.x + totalWidth) { ++clipCount; continue; }
 
-            // Clip block — dark teal body (distinct from blue audio clips).
-            ImU32 bodyCol = IM_COL32(45, 90, 85, 255);
-            ImU32 borderCol = IM_COL32(80, 140, 130, 255);
+            // The video role remains distinct from audio without bypassing
+            // the shared palette that keeps all timeline media in register.
+            ImU32 bodyCol = C(pal.clipVideo);
+            ImU32 borderCol = C(pal.clipVideoBorder);
             bool isSel = view.selectedClipId == clip.id;
             if (isSel) {
                 borderCol = C(pal.accent);

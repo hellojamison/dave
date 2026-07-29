@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "engine/plugins/PluginInstance.h"
 
 #include <public.sdk/source/common/memorystream.h>

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
 #include "document/Edit.h"
@@ -6,6 +7,7 @@
 
 #include <imgui.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -14,23 +16,35 @@
 namespace dave::gui {
 
 // Peak cache: min/max per "bucket" of samples, used to draw waveforms cheaply
-// at a given zoom level. Computed once per asset, cached by asset id + bucket
-// size. For RB-2 this is a single resolution; a mipmap (multiple bucket sizes)
-// comes later for smooth zoom.
+// at a given zoom level. Power-of-two levels form a bounded mip chain so zoom
+// changes reuse nearby work instead of filling memory with arbitrary resolutions.
 struct PeakBucket { float min; float max; };
+
+struct PeakLevel {
+    int bucketSize = 1;
+    std::vector<PeakBucket> buckets;
+    float displayScale = 1.0f;
+};
 
 class PeakCache {
 public:
-    // Get peaks for an asset at `samplesPerPixel` resolution. Computes and
-    // caches on first request; returns cached thereafter.
-    const std::vector<PeakBucket>& get(const std::string& assetId,
-                                       const std::vector<std::vector<float>>& buffer,
-                                       int samplesPerPixel);
+    // Get the nearest power-of-two level for `samplesPerPixel`, building it on
+    // the UI thread only when that level has not already been retained.
+    const PeakLevel& get(const std::string& assetId,
+                         const std::vector<std::vector<float>>& buffer,
+                         int samplesPerPixel);
 
 private:
-    // key: assetId + samplesPerPixel
-    std::unordered_map<std::string, std::vector<PeakBucket>> cache_;
-    std::string key(const std::string& id, int spp) const { return id + ":" + std::to_string(spp); }
+    struct CachedLevel {
+        PeakLevel peaks;
+        uint64_t lastUsed = 0;
+    };
+    std::unordered_map<std::string, std::vector<CachedLevel>> cache_;
+    size_t cacheBytes_ = 0;
+    uint64_t useClock_ = 0;
+
+    static int bucketSizeFor(int samplesPerPixel, size_t sampleCount);
+    void trim(size_t incomingBytes);
 };
 
 // Timecode display modes for the ruler + transport readout.

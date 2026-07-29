@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "application/DaveApp.h"
 #include "document/MarkerCsv.h"
 #include "document/ProjectFile.h"
@@ -12,6 +13,7 @@
 #include <nfd.h>
 
 #include <algorithm>
+#include <cfloat>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
@@ -19,6 +21,47 @@
 #include <string>
 
 namespace dave::application {
+
+namespace {
+
+bool drawCenteredEmptyState(const char* message, const char* detail,
+                            const char* actionLabel) {
+    const auto& pal = gui::theme::palette();
+    const ImVec2 start = ImGui::GetCursorScreenPos();
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    const float buttonH = 30.0f;
+    const float blockH = ImGui::GetTextLineHeight() * 2.0f + 16.0f + buttonH;
+    const float top = std::max(12.0f, (avail.y - blockH) * 0.5f);
+
+    ImGui::SetCursorScreenPos(ImVec2(start.x, start.y + top));
+    if (gui::theme::fonts().label != nullptr) {
+        ImGui::PushFont(gui::theme::fonts().label,
+                        static_cast<float>(gui::theme::typeScale().label));
+    }
+    const float messageW = ImGui::CalcTextSize(message).x;
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                         std::max(0.0f, (avail.x - messageW) * 0.5f));
+    ImGui::TextColored(pal.text, "%s", message);
+    if (gui::theme::fonts().label != nullptr) {
+        ImGui::PopFont();
+    }
+
+    const float detailW = ImGui::CalcTextSize(detail).x;
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                         std::max(0.0f, (avail.x - detailW) * 0.5f));
+    ImGui::TextColored(pal.textMuted, "%s", detail);
+    ImGui::Dummy(ImVec2(0.0f, 8.0f));
+
+    const float buttonW = std::max(118.0f, ImGui::CalcTextSize(
+        actionLabel, nullptr, true).x + ImGui::GetStyle().FramePadding.x * 2.0f);
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                         std::max(0.0f, (avail.x - buttonW) * 0.5f));
+    return gui::theme::gradientButton(
+        actionLabel, ImVec2(buttonW, buttonH),
+        gui::theme::ButtonVariant::Primary);
+}
+
+} // namespace
 
 DaveApp::~DaveApp() {
     audio_.stop();
@@ -29,6 +72,19 @@ bool DaveApp::init() {
     if (!window_.valid() || !imgui_.init(window_)) {
         return false;
     }
+    window_.setFileDropCallback([this](const std::vector<std::string>& paths) {
+        for (const auto& path : paths) {
+            const auto extension = path.find_last_of('.');
+            std::string suffix = extension == std::string::npos ? "" : path.substr(extension);
+            std::transform(suffix.begin(), suffix.end(), suffix.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (suffix != ".wav") {
+                std::fprintf(stderr, "Dave: ignored dropped non-WAV file: %s\n", path.c_str());
+                continue;
+            }
+            loadWavIntoNewTrack(path);
+        }
+    });
 
     // ─── macOS native menu bar ───────────────────────────────────────────
     // On macOS the menu bar belongs at the top of the screen, not inside the
@@ -58,6 +114,7 @@ bool DaveApp::init() {
 
     // Seed an initial track so the timeline isn't empty.
     undo_.execute(std::make_unique<editing::AddTrackCommand>("Track 1"));
+    view_.selectedTrackIndex = 0;
 
     // Seed a default marker track so the marker lane is immediately usable —
     // no "Add marker track" hurdle. The user can still add more tracks later
@@ -123,6 +180,12 @@ void DaveApp::handleShortcuts() {
     }
 }
 
+void DaveApp::setTimelineSamplesPerPixel(double samplesPerPixel) {
+    // Screenshot fixtures need deterministic zoom without manufacturing input
+    // events, while the same bounds remain in force as interactive zooming.
+    view_.samplesPerPixel = std::clamp(samplesPerPixel, 4.0, 50000.0);
+}
+
 void DaveApp::onEditChanged() {
     // UI thread. Re-derive the engine graph from the Edit, compile, publish.
     dirty_ = true; // any edit marks the project dirty
@@ -145,16 +208,16 @@ void DaveApp::onEditChanged() {
     }
 }
 
-void DaveApp::loadWavIntoEdit(const std::string& path) {
+bool DaveApp::loadWavIntoEdit(const std::string& path) {
     auto assetId = edit_.importAsset(path);
     if (!assetId.valid()) {
         std::fprintf(stderr, "Dave: import failed: %s\n", path.c_str());
-        return;
+        return false;
     }
     const auto* asset = edit_.asset(assetId);
     if (asset == nullptr) {
         std::fprintf(stderr, "Dave: asset lookup failed after import\n");
-        return;
+        return false;
     }
 
     // Ensure at least one track exists.
@@ -192,6 +255,38 @@ void DaveApp::loadWavIntoEdit(const std::string& path) {
                  asset->lengthSamples / static_cast<double>(asset->sampleRate),
                  asset->channels,
                  static_cast<long long>(placeAt));
+    return true;
+}
+
+bool DaveApp::loadWavIntoNewTrack(const std::string& path) {
+    auto assetId = edit_.importAsset(path);
+    if (!assetId.valid()) {
+        std::fprintf(stderr, "Dave: dropped WAV import failed: %s\n", path.c_str());
+        return false;
+    }
+    const auto* asset = edit_.asset(assetId);
+    if (asset == nullptr) {
+        std::fprintf(stderr, "Dave: dropped WAV lookup failed after import\n");
+        return false;
+    }
+
+    // A drop is an insertion gesture, not an append request: its own track
+    // keeps the imported clip visible and immediately editable.
+    undo_.execute(std::make_unique<editing::AddTrackCommand>("Audio"));
+    const auto& trackId = edit_.tracks().back().id;
+    document::AudioClip clip;
+    clip.asset = assetId;
+    clip.timelineStart = 0;
+    clip.sourceOffset = 0;
+    clip.length = asset->lengthSamples;
+    clip.fadeIn = 64;
+    clip.fadeOut = 64;
+    undo_.execute(std::make_unique<editing::AddClipCommand>(trackId, clip));
+    view_.selectedTrackIndex = static_cast<int>(edit_.tracks().size()) - 1;
+    view_.scrollSamples = 0;
+    audio_.transport().seek(0);
+    std::fprintf(stderr, "Dave: dropped %s into a new track\n", path.c_str());
+    return true;
 }
 
 void DaveApp::drawUI() {
@@ -212,30 +307,40 @@ void DaveApp::drawUI() {
     }
 
     // ─── Layout constants ────────────────────────────────────────────────
-    // The entire window is divided into non-overlapping fixed regions:
-    //   [menu bar]                          — auto height (~24px)
-    //   [transport bar]                     — 52px, full width
-    //   [timeline]     [right sidebar]      — timeline fills, sidebar 300px
-    // The sidebar is split: Plugins (top) + Video preview (bottom).
-    // NO floating windows, NO dockspace — everything is computed from the
-    // viewport and locked with NoMove+NoResize+NoTitleBar.
+    // Fixed panel windows remain predictable, while the two gaps between
+    // them are live splitters. The ratio-based picture panel keeps its visual
+    // priority on taller displays without starving the plugin chain.
     const ImGuiViewport* vp = ImGui::GetMainViewport();
-    // menuH = space consumed by the menu bar. On macOS the menu is at the top
-    // of the SCREEN (not in-window), so menuH = 0 and the transport bar starts
-    // at the very top of the window. On Windows/Linux the in-window ImGui menu
-    // bar consumes ~24px.
-#ifdef __APPLE__
+    // WorkPos already excludes an in-window menu bar on platforms that use
+    // one; adding that offset again would push the entire panel stack down.
     const float menuH = 0.0f;
-#else
-    const float menuH = vp->WorkPos.y;
-#endif
+    const float baseX = vp->WorkPos.x;
+    const float baseY = vp->WorkPos.y;
     const float toolbarH = 48.0f;
-    const float sidebarW = 300.0f;
-    const float videoPanelH = 240.0f;
-    const float contentY = menuH + toolbarH;
+    const float splitterSize = 6.0f;
+    const float contentY = baseY + menuH + toolbarH;
     const float contentH = vp->WorkSize.y - toolbarH;
-    const float timelineW = vp->WorkSize.x - sidebarW;
-    const float pluginsH = contentH - videoPanelH;
+    const float availablePanelW =
+        std::max(2.0f, vp->WorkSize.x - splitterSize);
+    const float minSidebarW =
+        std::min(320.0f, availablePanelW * 0.5f);
+    const float minTimelineW =
+        std::min(560.0f, availablePanelW - minSidebarW);
+    const float maxSidebarW =
+        std::max(minSidebarW, availablePanelW - minTimelineW);
+    const float sidebarW = std::clamp(sidebarWidth_, minSidebarW, maxSidebarW);
+    sidebarWidth_ = sidebarW;
+    const float timelineW = availablePanelW - sidebarW;
+    const float sidebarX = baseX + timelineW + splitterSize;
+
+    const float splitContentH = std::max(1.0f, contentH - splitterSize);
+    const float minVideoH = std::min(260.0f, splitContentH * 0.55f);
+    const float minPluginsH = std::min(180.0f, splitContentH * 0.38f);
+    const float maxVideoH = std::max(minVideoH, splitContentH - minPluginsH);
+    const float videoPanelH =
+        std::clamp(splitContentH * videoShare_, minVideoH, maxVideoH);
+    const float pluginsH = splitContentH - videoPanelH;
+    videoShare_ = videoPanelH / splitContentH;
 
     // Common flags for all docked panels — nothing can move or overlap.
     const ImGuiWindowFlags panelFlags =
@@ -288,36 +393,69 @@ void DaveApp::drawUI() {
 #endif // __APPLE__
 
     // ─── Transport bar (full width, below menu) ──────────────────────────
-    ImGui::SetNextWindowPos(ImVec2(0, menuH), ImGuiCond_Always);
+    ImGui::SetNextWindowPos(ImVec2(baseX, baseY + menuH), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x, toolbarH), ImGuiCond_Always);
     ImGui::Begin("Transport", nullptr, panelFlags);
     {
-        const ImVec2 btnSize(60, 30);
-        // Play/Stop with accent when active. Capture the state BEFORE the
-        // button click — if toggle() fires during the click, the push/pop
-        // must still balance (push if was playing, pop regardless).
-        bool wasPlaying = transport.isPlaying();
-        if (wasPlaying) {
-            ImGui::PushStyleColor(ImGuiCol_Button, pal.accent);
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, pal.accentHover);
-        }
-        if (ImGui::Button(wasPlaying ? "Stop" : "Play", btnSize))
+        const float controlH = 30.0f;
+        auto groupSeparator = [&] {
+            ImGui::SameLine(0.0f, 10.0f);
+            const ImVec2 lineTop = ImGui::GetCursorScreenPos();
+            ImGui::Dummy(ImVec2(1.0f, controlH));
+            ImGui::GetWindowDrawList()->AddLine(
+                lineTop, ImVec2(lineTop.x, lineTop.y + controlH),
+                ImGui::GetColorU32(pal.borderStrong));
+            ImGui::SameLine(0.0f, 10.0f);
+        };
+
+        const bool wasPlaying = transport.isPlaying();
+        if (gui::theme::iconButton(
+                "##transportPlay",
+                wasPlaying ? gui::theme::TransportIcon::Stop
+                           : gui::theme::TransportIcon::Play,
+                wasPlaying ? "Stop (Space)" : "Play (Space)",
+                ImVec2(controlH, controlH),
+                wasPlaying ? gui::theme::ButtonVariant::Primary
+                           : gui::theme::ButtonVariant::Normal)) {
             transport.toggle();
-        if (wasPlaying) ImGui::PopStyleColor(2);
+        }
 
         ImGui::SameLine();
-        if (ImGui::Button("Rewind", btnSize)) { transport.stop(); transport.seek(0); }
-        ImGui::SameLine(0, 20);
+        if (gui::theme::iconButton(
+                "##transportRewind", gui::theme::TransportIcon::ReturnToStart,
+                "Stop and return to start (Return)", ImVec2(controlH, controlH))) {
+            transport.stop();
+            transport.seek(0);
+        }
+        groupSeparator();
 
         // Position readout — double-click to edit (type a timecode to seek).
         int64_t pos = transport.position();
         const char* tcModes[] = {"min:sec", "timecode", "bars|beats", "feet+frames", "samples"};
         int tcIdx = static_cast<int>(view_.tcMode);
-        // Display the current position; double-click converts to an editable
-        // InputText where the user types a timecode string to seek.
+        constexpr float counterW = 150.0f;
         if (!view_.editingPosition) {
             std::string tcStr = gui::formatTimecode(pos, view_.tcMode);
-            ImGui::TextColored(pal.accent, "%s", tcStr.c_str());
+            const ImVec2 counterMin = ImGui::GetCursorScreenPos();
+            ImGui::InvisibleButton("##positionCounter",
+                                   ImVec2(counterW, controlH));
+            ImFont* counterFont = gui::theme::fonts().monoLarge != nullptr
+                ? gui::theme::fonts().monoLarge : ImGui::GetFont();
+            constexpr float counterFontSize = 20.0f;
+            const ImVec2 textSize =
+                counterFont->CalcTextSizeA(counterFontSize, FLT_MAX, 0.0f,
+                                           tcStr.c_str());
+            ImGui::GetWindowDrawList()->PushClipRect(
+                counterMin,
+                ImVec2(counterMin.x + counterW,
+                       counterMin.y + controlH),
+                true);
+            ImGui::GetWindowDrawList()->AddText(
+                counterFont, counterFontSize,
+                ImVec2(counterMin.x + (counterW - textSize.x) * 0.5f,
+                       counterMin.y + (controlH - textSize.y) * 0.5f),
+                ImGui::GetColorU32(pal.accent), tcStr.c_str());
+            ImGui::GetWindowDrawList()->PopClipRect();
             if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
                 view_.editingPosition = true;
                 // Pre-fill the input with the current timecode.
@@ -326,8 +464,11 @@ void DaveApp::drawUI() {
             }
         } else {
             // Editable input. Enter = seek, Escape = cancel.
-            ImGui::SetNextItemWidth(100);
+            ImGui::SetNextItemWidth(counterW);
             ImGui::SetKeyboardFocusHere();
+            if (gui::theme::fonts().monoSmall != nullptr) {
+                ImGui::PushFont(gui::theme::fonts().monoSmall, 13.0f);
+            }
             if (ImGui::InputText("##posedit", view_.positionInput,
                                  sizeof(view_.positionInput),
                                  ImGuiInputTextFlags_EnterReturnsTrue)) {
@@ -372,25 +513,27 @@ void DaveApp::drawUI() {
                 if (target >= 0) transport.seek(target);
                 view_.editingPosition = false;
             }
+            if (gui::theme::fonts().monoSmall != nullptr) {
+                ImGui::PopFont();
+            }
             if (ImGui::IsKeyPressed(ImGuiKey_Escape))
                 view_.editingPosition = false;
         }
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(95);
+        ImGui::SetNextItemWidth(108.0f);
         if (ImGui::Combo("##tcmode", &tcIdx, tcModes, 5)) {
             view_.tcMode = static_cast<gui::TimecodeMode>(tcIdx);
         }
+        groupSeparator();
 
-        // +Track button (right-aligned). Undo/Redo are Cmd+Z / Cmd+Shift+Z only.
-        ImGui::SameLine(timelineW - btnSize.x - 20);
-        if (ImGui::Button("+Track", btnSize))
+        if (ImGui::Button("+Track", ImVec2(76.0f, controlH)))
             undo_.execute(std::make_unique<editing::AddTrackCommand>("Track"));
 
-        // Snap-to-marker toggle.
         ImGui::SameLine();
         ImGui::Checkbox("Snap", &view_.snapToMarkers);
+        groupSeparator();
 
-        // Output device picker (far right, in the sidebar area).
+        ImGui::TextColored(pal.textMuted, "Output");
         ImGui::SameLine();
         static int selectedDevice = -1;
         static std::vector<std::string> devices;
@@ -403,10 +546,11 @@ void DaveApp::drawUI() {
         static std::vector<std::string> labelStore;
         labelStore = devices;
         std::vector<const char*> labels;
+        labels.reserve(labelStore.size());
         for (const auto& n : labelStore) labels.push_back(n.c_str());
         const char* preview = (selectedDevice >= 0 && selectedDevice < static_cast<int>(labels.size()))
                               ? labels[selectedDevice] : "Default";
-        ImGui::SetNextItemWidth(sidebarW - btnSize.x * 3 - 60);
+        ImGui::SetNextItemWidth(-FLT_MIN);
         if (ImGui::BeginCombo("##output", preview)) {
             for (int i = 0; i < static_cast<int>(labels.size()); ++i) {
                 bool sel = (i == selectedDevice);
@@ -422,25 +566,97 @@ void DaveApp::drawUI() {
     ImGui::End();
 
     // ─── Timeline (left, fills remaining width) ──────────────────────────
-    ImGui::SetNextWindowPos(ImVec2(0, contentY), ImGuiCond_Always);
+    ImGui::SetNextWindowPos(ImVec2(baseX, contentY), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(timelineW, contentH), ImGuiCond_Always);
     ImGui::Begin("Timeline", nullptr, panelFlags);
-    gui::drawTimeline(edit_, undo_, transport, peaks_, view_, builder_.assetBuffers());
+    gui::theme::panelHeader("Timeline");
+    // Taller windows can afford more waveform detail; the gutter itself
+    // computes a content minimum so both values remain overlap-safe.
+    const float trackRowHeight = vp->WorkSize.y >= 900.0f ? 108.0f : 80.0f;
+    gui::drawTimeline(
+        edit_, undo_, transport, peaks_, view_, builder_.assetBuffers(),
+        trackRowHeight);
     ImGui::End();
 
-    // ─── Plugins panel (right sidebar, top portion) ──────────────────────
-    ImGui::SetNextWindowPos(ImVec2(timelineW, contentY), ImGuiCond_Always);
+    // Picture stays above the plugin chain because sync-to-picture is the
+    // primary post-production task.
+    ImGui::SetNextWindowPos(ImVec2(sidebarX, contentY), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(sidebarW, videoPanelH), ImGuiCond_Always);
+    ImGui::Begin("Video", nullptr, panelFlags);
+    gui::theme::panelHeader("Video");
+    drawVideoPreviewContent();
+    ImGui::End();
+
+    ImGui::SetNextWindowPos(
+        ImVec2(sidebarX, contentY + videoPanelH + splitterSize),
+        ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(sidebarW, pluginsH), ImGuiCond_Always);
     ImGui::Begin("Plugins", nullptr, panelFlags);
+    gui::theme::panelHeader("Plugins");
     drawPluginsPanelContent();
     ImGui::End();
 
-    // ─── Video preview (right sidebar, bottom portion) ───────────────────
-    ImGui::SetNextWindowPos(ImVec2(timelineW, contentY + pluginsH), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(sidebarW, videoPanelH), ImGuiCond_Always);
-    ImGui::Begin("Video", nullptr, panelFlags);
-    drawVideoPreviewContent();
+    const ImGuiWindowFlags splitterFlags =
+        panelFlags | ImGuiWindowFlags_NoBackground |
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+        ImGuiWindowFlags_NoSavedSettings;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+
+    ImGui::SetNextWindowPos(
+        ImVec2(baseX + timelineW, contentY), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(
+        ImVec2(splitterSize, contentH), ImGuiCond_Always);
+    ImGui::Begin("##timelineSidebarSplitter", nullptr, splitterFlags);
+    const ImVec2 sidebarSplitterOrigin = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton(
+        "##dragTimelineSidebar", ImVec2(splitterSize, contentH));
+    const bool sidebarSplitterHovered =
+        ImGui::IsItemHovered() || ImGui::IsItemActive();
+    if (sidebarSplitterHovered) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+    }
+    if (ImGui::IsItemActive()) {
+        sidebarWidth_ = std::clamp(
+            sidebarWidth_ - ImGui::GetIO().MouseDelta.x,
+            minSidebarW, maxSidebarW);
+    }
+    ImGui::GetWindowDrawList()->AddLine(
+        ImVec2(sidebarSplitterOrigin.x + splitterSize * 0.5f,
+               sidebarSplitterOrigin.y),
+        ImVec2(sidebarSplitterOrigin.x + splitterSize * 0.5f,
+               sidebarSplitterOrigin.y + contentH),
+        ImGui::GetColorU32(sidebarSplitterHovered
+            ? pal.accent : pal.borderStrong), 1.0f);
     ImGui::End();
+
+    ImGui::SetNextWindowPos(
+        ImVec2(sidebarX, contentY + videoPanelH), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(
+        ImVec2(sidebarW, splitterSize), ImGuiCond_Always);
+    ImGui::Begin("##videoPluginsSplitter", nullptr, splitterFlags);
+    const ImVec2 panelSplitterOrigin = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton(
+        "##dragVideoPlugins", ImVec2(sidebarW, splitterSize));
+    const bool panelSplitterHovered =
+        ImGui::IsItemHovered() || ImGui::IsItemActive();
+    if (panelSplitterHovered) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+    }
+    if (ImGui::IsItemActive()) {
+        videoShare_ = std::clamp(
+            (videoPanelH + ImGui::GetIO().MouseDelta.y) / splitContentH,
+            minVideoH / splitContentH, maxVideoH / splitContentH);
+    }
+    ImGui::GetWindowDrawList()->AddLine(
+        ImVec2(panelSplitterOrigin.x,
+               panelSplitterOrigin.y + splitterSize * 0.5f),
+        ImVec2(panelSplitterOrigin.x + sidebarW,
+               panelSplitterOrigin.y + splitterSize * 0.5f),
+        ImGui::GetColorU32(panelSplitterHovered
+            ? pal.accent : pal.borderStrong), 1.0f);
+    ImGui::End();
+    ImGui::PopStyleVar(2);
 
     // Modals (browser) still float — they're temporary popups, not panels.
     drawPluginBrowser();
@@ -658,6 +874,7 @@ void DaveApp::newProject() {
     dirty_ = false;
     undo_.clear();
     undo_.execute(std::make_unique<editing::AddTrackCommand>("Track 1"));
+    view_.selectedTrackIndex = 0;
     edit_.addMarkerTrack("Markers");
     audio_.transport().stop();
     audio_.transport().seek(0);
@@ -684,6 +901,7 @@ void DaveApp::openProjectDialog() {
         dirty_ = false;
         undo_.clear();
         onEditChanged();  // rebuild graph for the loaded Edit
+        view_.selectedTrackIndex = edit_.tracks().empty() ? -1 : 0;
         std::fprintf(stderr, "Dave: opened %s\n", path.c_str());
     }
 }
@@ -727,8 +945,12 @@ void DaveApp::drawVideoPreviewContent() {
     const auto* clip = edit_.videoClipAt(playhead);
 
     if (!clip) {
-        ImGui::TextDisabled("(no video at playhead)");
-        if (ImGui::Button("Load Video...")) openVideoDialog();
+        if (drawCenteredEmptyState(
+                "No video at the playhead",
+                "Load picture to start working in sync.",
+                "Load Video...###emptyVideo")) {
+            openVideoDialog();
+        }
         return;
     }
 
@@ -791,10 +1013,18 @@ void DaveApp::drawVideoPreviewContent() {
         float drawW = avail.x;
         float drawH = drawW * static_cast<float>(videoTexH_) / static_cast<float>(videoTexW_);
         if (drawH > avail.y) { drawH = avail.y; drawW = drawH * static_cast<float>(videoTexW_) / static_cast<float>(videoTexH_); }
+        ImGui::SetCursorPosX(
+            ImGui::GetCursorPosX() + std::max(0.0f, (avail.x - drawW) * 0.5f));
         ImGui::Image(static_cast<ImTextureID>(videoTexture_),
                      ImVec2(drawW, drawH));
     } else {
-        ImGui::TextDisabled("(loading...)");
+        if (drawCenteredEmptyState(
+                "Preparing the video frame",
+                "Picture will appear as soon as decoding finishes.",
+                "Choose Video...###loadingVideo")) {
+            openVideoDialog();
+        }
+        return;
     }
 
     ImGui::TextDisabled("%s  frame %lld  %s",
@@ -806,11 +1036,24 @@ void DaveApp::drawVideoPreviewContent() {
 void DaveApp::drawPluginsPanel() { drawPluginsPanelContent(); }
 
 void DaveApp::drawPluginsPanelContent() {
-    // NoTitleBar + NoMove: it's a fixed dock column, not a floating window.
     // Operate on the currently-selected track (selectedTrackIndex in the view).
     int sel = view_.selectedTrackIndex;
     if (sel < 0 || sel >= static_cast<int>(edit_.tracks().size())) {
-        ImGui::TextDisabled("Select a track to manage its plugins.");
+        if (edit_.tracks().empty()) {
+            if (drawCenteredEmptyState(
+                    "No track selected",
+                    "Create a track before building an effect chain.",
+                    "+ Add Track###pluginsEmptyTrack")) {
+                undo_.execute(std::make_unique<editing::AddTrackCommand>("Track"));
+                view_.selectedTrackIndex =
+                    static_cast<int>(edit_.tracks().size()) - 1;
+            }
+        } else if (drawCenteredEmptyState(
+                       "Select a track to manage plugins",
+                       "The plugin chain follows the selected timeline row.",
+                       "Select First Track###pluginsSelectTrack")) {
+            view_.selectedTrackIndex = 0;
+        }
         return;
     }
 
@@ -818,10 +1061,22 @@ void DaveApp::drawPluginsPanelContent() {
     ImGui::Text("Track: %s", track.name.c_str());
     ImGui::Separator();
 
-    // The plugin chain.
     if (track.plugins.empty()) {
-        ImGui::TextDisabled("(no plugins)");
+        std::string message = "No plugins on " + track.name;
+        if (drawCenteredEmptyState(
+                message.c_str(),
+                "Add an effect to begin shaping this track.",
+                "Add Plugin###pluginsEmptyChain")) {
+            if (pluginHost_.descriptors().empty()) {
+                pluginHost_.scan();
+            }
+            browserTargetTrackId_ = track.id;
+            showPluginBrowser_ = true;
+        }
+        return;
     }
+
+    std::string removeSlotId;
     int slotIdx = 0;
     for (const auto& slot : track.plugins) {
         ImGui::PushID(slotIdx);
@@ -849,11 +1104,17 @@ void DaveApp::drawPluginsPanelContent() {
         }
         ImGui::SameLine();
         if (ImGui::SmallButton("Remove")) {
-            undo_.execute(std::make_unique<editing::RemovePluginCommand>(track.id, slot.id));
-            editors_.erase(slot.id); // close its editor if open
+            // Defer mutation until the range-for completes; removing in place
+            // invalidates the current slot reference.
+            removeSlotId = slot.id;
         }
         ImGui::PopID();
         ++slotIdx;
+    }
+    if (!removeSlotId.empty()) {
+        undo_.execute(std::make_unique<editing::RemovePluginCommand>(
+            track.id, removeSlotId));
+        editors_.erase(removeSlotId);
     }
 
     ImGui::Separator();

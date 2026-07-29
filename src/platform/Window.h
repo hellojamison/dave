@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
 #define GLFW_INCLUDE_NONE
@@ -5,6 +6,7 @@
 
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace dave::platform {
 
@@ -17,6 +19,19 @@ namespace dave::platform {
 class Window {
 public:
     using FrameCallback = std::function<void()>;
+    using FileDropCallback = std::function<void(const std::vector<std::string>&)>;
+
+    struct ScreenshotOptions {
+        std::string outputPath;
+        int frames = 15;
+        int width = 1280;
+        int height = 800;
+    };
+
+    // Screenshot configuration must be set before DaveApp is constructed:
+    // its Window member creates the native window during construction.
+    static void configureScreenshot(ScreenshotOptions options);
+    static bool screenshotSucceeded();
 
     Window(int width, int height, const std::string& title);
     ~Window();
@@ -29,6 +44,7 @@ public:
     // Set the per-frame callback: input is polled, then this is called to
     // build ImGui UI and render.
     void setFrameCallback(FrameCallback cb) { frameCallback_ = std::move(cb); }
+    void setFileDropCallback(FileDropCallback cb);
 
     // Run the event loop until the window is closed.
     void run();
@@ -39,8 +55,11 @@ public:
     GLFWwindow* handle() { return window_; }
 
 private:
+    static void glfwFileDropCallback(GLFWwindow* window, int count, const char** paths);
+
     GLFWwindow* window_ = nullptr;
     FrameCallback frameCallback_;
+    FileDropCallback fileDropCallback_;
     bool shouldClose_ = false;
 };
 

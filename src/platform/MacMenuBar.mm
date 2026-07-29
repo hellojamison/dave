@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #include "platform/MacMenuBar.h"
 
 #ifdef __APPLE__

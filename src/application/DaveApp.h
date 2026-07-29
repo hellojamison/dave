@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
 #include "document/Edit.h"
@@ -45,9 +46,13 @@ public:
     bool init();
     void run();
 
+    // Developer screenshot fixtures use the same import path as the UI so the
+    // captured state exercises real document and graph behavior.
+    bool loadWavIntoEdit(const std::string& path);
+    void setTimelineSamplesPerPixel(double samplesPerPixel);
+
 private:
     void onEditChanged();           // re-derive + recompile + publish
-    void loadWavIntoEdit(const std::string& path);
     void openWavDialog();
     void importMarkersDialog();
     void exportMarkersDialog();
@@ -56,6 +61,7 @@ private:
     void openProjectDialog();
     void saveProject(bool saveAs);
     void handleShortcuts();
+    bool loadWavIntoNewTrack(const std::string& path);
     void drawUI();
     void drawPluginsPanel();        // legacy wrapper (unused — see drawPluginsPanelContent)
     void drawPluginsPanelContent(); // content only (caller manages Begin/End)
@@ -74,6 +80,11 @@ private:
 
     gui::PeakCache peaks_;
     gui::TimelineViewState view_;
+
+    // Ratios keep the picture-first sidebar useful as the window grows, while
+    // pixel clamps in drawUI protect the timeline and plugin controls.
+    float sidebarWidth_ = 360.0f;
+    float videoShare_ = 0.62f;
 
     // Plugin browser modal state.
     bool showPluginBrowser_ = false;

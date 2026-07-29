@@ -47,3 +47,6 @@ imgui.ini
 
 # OS junk
 Thumbs.db
+
+# Local Obsidian notes vault — kept out of the public repo.
+/Project Notes/

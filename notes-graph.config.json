@@ -3,7 +3,7 @@
   "vaultDir": "Project Notes",
   "scriptName": "project-notes",
   "appRel": "Apps/Dave.md",
-  "kitVersion": "0.2.13",
+  "kitVersion": "0.4.0",
   "routes": [
     {
       "id": "notes-graph-maintenance",
@@ -16,5 +16,13 @@
         "notes graph"
       ]
     }
-  ]
+  ],
+  "vaultMigrationState": {
+    "schemaVersion": 1,
+    "applied": [
+      "vault-0.2.16-schema-indexes",
+      "vault-0.3.0-typed-templates",
+      "vault-0.4.0-managed-sections"
+    ]
+  }
 }

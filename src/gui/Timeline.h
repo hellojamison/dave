@@ -66,6 +66,10 @@ struct TimelineViewState {
     std::string selectedClipId;
     // Transient drag state (held only while a drag is active).
     int64_t dragClipOriginalStart = 0;
+    // Where a dragged clip is currently being previewed. The document keeps
+    // the pre-drag position until mouse-up, so undo has a real "before" and
+    // the audio engine never rebuilds against an uncommitted position.
+    int64_t dragPreviewStart = 0;
     std::string dragOriginalTrackId;  // track the clip came from
     bool dragging = false;
     // Marker drag: the screen-X where the drag started, so we can show the

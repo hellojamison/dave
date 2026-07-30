@@ -177,6 +177,38 @@ void DaveApp::handleShortcuts() {
     } else if (ImGui::IsKeyPressed(ImGuiKey_R, false)) {
         // R = zoom out.
         view_.samplesPerPixel = std::min(50000.0, view_.samplesPerPixel * 2.0);
+    } else if (!ctrl && ImGui::IsKeyPressed(ImGuiKey_M, false)) {
+        // M / S toggle the selected track, the standard DAW binding. Guarded
+        // on !ctrl so they don't shadow Cmd+M (minimise) or Cmd+S (save).
+        toggleSelectedTrackMute();
+    } else if (!ctrl && ImGui::IsKeyPressed(ImGuiKey_S, false)) {
+        toggleSelectedTrackSolo();
+    }
+}
+
+// Both toggles operate on the selected track. With no selection there is no
+// unambiguous target, so they do nothing rather than guessing at the first
+// track — silently muting something the user wasn't looking at is worse than
+// a keypress that appears to do nothing.
+document::Track* DaveApp::selectedTrack() {
+    const int sel = view_.selectedTrackIndex;
+    if (sel < 0 || sel >= static_cast<int>(edit_.tracks().size())) {
+        return nullptr;
+    }
+    return &edit_.tracksMut()[static_cast<size_t>(sel)];
+}
+
+void DaveApp::toggleSelectedTrackMute() {
+    if (document::Track* track = selectedTrack()) {
+        track->mute = !track->mute;
+        edit_.notifyChanged();
+    }
+}
+
+void DaveApp::toggleSelectedTrackSolo() {
+    if (document::Track* track = selectedTrack()) {
+        track->solo = !track->solo;
+        edit_.notifyChanged();
     }
 }
 

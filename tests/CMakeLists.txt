@@ -10,6 +10,7 @@ add_executable(dave_tests
     test_peaks.cpp
     test_markers.cpp
     test_mixer.cpp
+    test_clipmove.cpp
     dr_wav_impl.cpp
     # Sources under test.
     "${CMAKE_SOURCE_DIR}/src/document/Sha256.cpp"

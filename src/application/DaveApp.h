@@ -61,6 +61,10 @@ private:
     void openProjectDialog();
     void saveProject(bool saveAs);
     void handleShortcuts();
+    // Targets of the M / S shortcuts; null when nothing is selected.
+    document::Track* selectedTrack();
+    void toggleSelectedTrackMute();
+    void toggleSelectedTrackSolo();
     bool loadWavIntoNewTrack(const std::string& path);
     void drawUI();
     void drawPluginsPanel();        // legacy wrapper (unused — see drawPluginsPanelContent)

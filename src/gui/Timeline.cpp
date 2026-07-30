@@ -556,8 +556,17 @@ void drawTimeline(const document::Edit& edit,
         ImGui::PopID();
 
         for (const auto& clip : track.clips) {
+            // A drag previews from view state instead of writing to the clip.
+            // Mutating the document during the drag meant MoveClipCommand
+            // snapshotted "the old position" after it had already been
+            // overwritten, so undo restored the dragged-to position and the
+            // move became permanent.
+            const bool clipIsDragging =
+                view.dragging && view.selectedClipId == clip.id;
+            const int64_t drawStart =
+                clipIsDragging ? view.dragPreviewStart : clip.timelineStart;
             double clipX = origin.x + gutterWidth +
-                (clip.timelineStart - view.scrollSamples) / view.samplesPerPixel;
+                (drawStart - view.scrollSamples) / view.samplesPerPixel;
             double clipW = static_cast<double>(clip.length) / view.samplesPerPixel;
             if (clipW < 2) clipW = 2;
             if (clipX + clipW < origin.x + gutterWidth) continue;
@@ -647,6 +656,8 @@ void drawTimeline(const document::Edit& edit,
                 view.selectedClipId = clip.id;
                 view.selectedTrackIndex = static_cast<int>(ti);
                 view.dragClipOriginalStart = clip.timelineStart;
+                // Seed the preview so a click without movement draws in place.
+                view.dragPreviewStart = clip.timelineStart;
                 view.dragOriginalTrackId = track.id;
                 view.dragging = true;
             }
@@ -785,18 +796,14 @@ void drawTimeline(const document::Edit& edit,
             }
         }
 
-        // Live move on the original clip (horizontal only during drag; the
-        // actual track move happens on commit so undo is clean).
+        // Preview only — the document is not touched until mouse-up, so
+        // MoveClipCommand can snapshot a genuine "before" for undo, and the
+        // engine never sees a position the user hasn't committed to.
         int64_t dxPx = static_cast<int64_t>(mouse.x) - dragStartMouseX;
         int64_t dxSamples = static_cast<int64_t>(dxPx * view.samplesPerPixel);
-        for (auto& track : const_cast<std::vector<document::Track>&>(tracks)) {
-            for (auto& clip : track.clips) {
-                if (clip.id == view.selectedClipId) {
-                    int64_t raw = std::max<int64_t>(0, view.dragClipOriginalStart + dxSamples);
-                    clip.timelineStart = snapPosition(raw);
-                    break;
-                }
-            }
+        {
+            int64_t raw = std::max<int64_t>(0, view.dragClipOriginalStart + dxSamples);
+            view.dragPreviewStart = snapPosition(raw);
         }
         // Visual hint: highlight the track being hovered during drag.
         if (targetTrackIndex >= 0) {
@@ -812,16 +819,16 @@ void drawTimeline(const document::Edit& edit,
             if (targetTrackIndex >= 0) {
                 targetTrackId = tracks[targetTrackIndex].id;
             }
-            for (auto& track : const_cast<std::vector<document::Track>&>(tracks)) {
-                for (auto& clip : track.clips) {
-                    if (clip.id == view.selectedClipId) {
-                        std::string newTrackArg =
-                            (targetTrackId != view.dragOriginalTrackId) ? targetTrackId : "";
-                        undo.execute(std::make_unique<editing::MoveClipCommand>(
-                            view.dragOriginalTrackId, clip.id, clip.timelineStart, newTrackArg));
-                        break;
-                    }
-                }
+            const std::string newTrackArg =
+                (targetTrackId != view.dragOriginalTrackId) ? targetTrackId : "";
+            // Skip a no-op drag so a stray click doesn't push an undo entry
+            // that appears to do nothing when replayed.
+            const bool moved = view.dragPreviewStart != view.dragClipOriginalStart ||
+                               !newTrackArg.empty();
+            if (moved) {
+                undo.execute(std::make_unique<editing::MoveClipCommand>(
+                    view.dragOriginalTrackId, view.selectedClipId,
+                    view.dragPreviewStart, newTrackArg));
             }
             view.dragging = false;
             view.selectedClipId.clear();

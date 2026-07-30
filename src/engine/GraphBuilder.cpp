@@ -26,12 +26,24 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit, double sa
     auto masterSumId = graph->addNode(masterSum);
     graph->connect(masterSumId, 0, masterId, 0);
 
+    // Solo is relative: as soon as any track is soloed, every track that isn't
+    // becomes silent. Deciding that needs a view of all tracks, so it happens
+    // here rather than on the individual Track.
+    bool anySoloed = false;
+    for (const auto& track : tracks) {
+        if (track.solo) { anySoloed = true; break; }
+    }
+
     int trackIndex = 0;
     for (const auto& track : tracks) {
         // Track gain (post-sum). Created even for empty tracks so the mixer
         // shows them and the master sum has the right pin count.
         auto gain = std::make_shared<GainNode>();
-        gain->setGain(track.gain);
+        // Silencing via the existing gain node keeps the graph topology
+        // identical whether or not anything is muted, so toggling mute doesn't
+        // change the shape of the RT execution plan.
+        const bool audible = document::trackAudible(track, anySoloed);
+        gain->setGain(audible ? track.gain : 0.0);
         gain->setPan(track.pan);
         auto gainId = graph->addNode(gain);
         trackGains_[track.id] = gain;

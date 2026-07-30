@@ -216,6 +216,12 @@ void drawTimeline(const document::Edit& edit,
     // must NOT cover the ruler or marker lane, or it eats their clicks.
     // We account for the cursor advance the marker lane already did.
     const auto& tracks = edit.tracks();
+    // Mirrors GraphBuilder's solo rule so the header dimming below matches
+    // what is actually audible.
+    bool anySoloed = false;
+    for (const auto& t : tracks) {
+        if (t.solo) { anySoloed = true; break; }
+    }
     const float tracksRegionHeight =
         static_cast<float>(tracks.size()) * trackHeight;
     char areaBtn[32];
@@ -421,37 +427,66 @@ void drawTimeline(const document::Edit& edit,
             }
         }
 
-        // Mute/solo indicators, drawn to PTXExtractor's spec: 21x17, 3px
-        // radius, hairline border, amber for mute and yellow for solo.
-        //
-        // These are inert. The document model has no mute or solo state yet,
-        // so there is nothing to toggle — they are drawn in their inactive
-        // state and deliberately rendered dimmed rather than as live controls,
-        // because a track header with convincing-looking M/S buttons that
-        // silently do nothing is worse than one that shows they aren't wired.
+        // Mute/solo, drawn to PTXExtractor's TrackStateIndicator spec: 21x17,
+        // 3px radius, hairline border, amber for mute and yellow for solo.
+        // Drawn rather than composed from ImGui::Button so the active fill can
+        // be the state colour instead of the theme's control gradient.
         {
             const ImVec2 msSize(21.0f, 17.0f);
             const float msGap = 3.0f;
-            float msX = origin.x + gutterWidth - (msSize.x * 2.0f + msGap) - 12.0f;
             const float msY = y + rowPadding;
-            const ImU32 inactiveFill = C(pal.trackControlInactive);
-            const ImU32 borderCol = C(pal.border);
-            const ImU32 labelCol = IM_COL32(
-                static_cast<int>(pal.textSubtle.x * 255),
-                static_cast<int>(pal.textSubtle.y * 255),
-                static_cast<int>(pal.textSubtle.z * 255), 122);
-            const char* labels[2] = {"M", "S"};
+            float msX = origin.x + gutterWidth - (msSize.x * 2.0f + msGap) - 12.0f;
+            struct Toggle { const char* label; bool on; ImVec4 active; };
+            const Toggle toggles[2] = {
+                {"M", track.mute, pal.trackMuteActive},
+                {"S", track.solo, pal.trackSoloActive},
+            };
+            ImGui::PushID(static_cast<int>(ti) + 5000);
             for (int b = 0; b < 2; ++b) {
+                ImGui::PushID(b);
+                ImGui::SetCursorScreenPos(ImVec2(msX, msY));
+                const bool pressed = ImGui::InvisibleButton("##ms", msSize);
+                const bool hovered = ImGui::IsItemHovered();
+                if (pressed) {
+                    auto& mutableTrack = const_cast<document::Track&>(track);
+                    if (b == 0) mutableTrack.mute = !mutableTrack.mute;
+                    else        mutableTrack.solo = !mutableTrack.solo;
+                    const_cast<document::Edit&>(edit).notifyChanged();
+                }
+                const Toggle& t = toggles[b];
                 const ImVec2 bMin(msX, msY);
                 const ImVec2 bMax(msX + msSize.x, msY + msSize.y);
-                dl->AddRectFilled(bMin, bMax, inactiveFill, 3.0f);
-                dl->AddRect(bMin, bMax, borderCol, 3.0f);
-                const ImVec2 ts = ImGui::CalcTextSize(labels[b]);
+                ImU32 fill = t.on ? C(t.active)
+                                  : (hovered ? C(pal.surfaceStrong)
+                                             : C(pal.trackControlInactive));
+                dl->AddRectFilled(bMin, bMax, fill, 3.0f);
+                dl->AddRect(bMin, bMax,
+                            t.on ? C(t.active) : C(pal.border), 3.0f);
+                // Dark text on the bright active fills; both amber and yellow
+                // are too light for the normal foreground to stay legible.
+                const ImU32 labelCol =
+                    t.on ? IM_COL32(32, 30, 28, 255) : C(pal.textMuted);
+                const ImVec2 ts = ImGui::CalcTextSize(t.label);
                 dl->AddText(ImVec2(msX + (msSize.x - ts.x) * 0.5f,
                                    msY + (msSize.y - ts.y) * 0.5f),
-                            labelCol, labels[b]);
+                            labelCol, t.label);
+                if (hovered) {
+                    ImGui::SetTooltip("%s", b == 0 ? "Mute" : "Solo");
+                }
+                ImGui::PopID();
                 msX += msSize.x + msGap;
             }
+            ImGui::PopID();
+        }
+
+        // A soloed track elsewhere silences this one. Without a cue in the
+        // header it looks like a working track that has simply stopped making
+        // sound, which is a genuinely confusing state to debug by ear.
+        if (!track.mute && !track.solo && anySoloed) {
+            dl->AddRectFilled(
+                ImVec2(origin.x, y),
+                ImVec2(origin.x + gutterWidth, y + trackHeight),
+                IM_COL32(20, 19, 18, 110));
         }
 
         // Click the gutter to select this track.

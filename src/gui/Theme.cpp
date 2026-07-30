@@ -205,21 +205,31 @@ void applyTheme() {
     ImGuiStyle& style = ImGui::GetStyle();
     const auto& p = g_palette;
 
-    style.WindowPadding = ImVec2(12, 12);
-    style.FramePadding = ImVec2(8, 4);
-    style.ItemSpacing = ImVec2(8, 6);
-    style.ItemInnerSpacing = ImVec2(6, 4);
+    // Spacing scale: 3 / 6 / 8 / 14 / 16, matching PTXExtractor's SwiftUI
+    // vocabulary (padding(14) and spacing 8/10/16 dominate there). Vertical
+    // and horizontal item spacing are equal — the earlier 8x6 made rows in the
+    // sidebar sit tighter than the gaps beside them, which reads as accidental
+    // rather than dense.
+    style.WindowPadding = ImVec2(14, 14);
+    style.FramePadding = ImVec2(10, 7);
+    style.ItemSpacing = ImVec2(8, 8);
+    style.ItemInnerSpacing = ImVec2(6, 6);
+    style.CellPadding = ImVec2(8, 6);
     style.IndentSpacing = 16.0f;
     style.ScrollbarSize = 12.0f;
-    style.GrabMinSize = 8.0f;
+    style.GrabMinSize = 10.0f;
 
-    style.WindowRounding = 8.0f;
-    style.ChildRounding = 8.0f;
-    style.FrameRounding = 6.0f;
-    style.GrabRounding = 6.0f;
-    style.PopupRounding = 8.0f;
-    style.ScrollbarRounding = 6.0f;
-    style.TabRounding = 6.0f;
+    // Radii follow the same source: 12 for panels, 10 for cards, 5 for
+    // controls, 3 for the smallest chips. Three steps with clear roles rather
+    // than one value everywhere — size should tell you what kind of thing it
+    // is.
+    style.WindowRounding = 12.0f;
+    style.ChildRounding = 10.0f;
+    style.FrameRounding = 5.0f;
+    style.GrabRounding = 5.0f;
+    style.PopupRounding = 10.0f;
+    style.ScrollbarRounding = 3.0f;
+    style.TabRounding = 5.0f;
     style.WindowBorderSize = 1.0f;
     style.FrameBorderSize = 1.0f;
     style.PopupBorderSize = 1.0f;
@@ -312,7 +322,9 @@ void drawPanelSurface(ImDrawList* drawList, const Rect& rect,
         fill = &g_palette.surfaceStrong;
     }
 
-    constexpr float rounding = 8.0f;
+    // Card radius from the shared scale — panels are 12, the cards inside
+    // them 10, so nesting reads as depth rather than as one flat surface.
+    constexpr float rounding = 10.0f;
     drawList->AddRectFilled(rect.min, rect.max, color(*fill), rounding);
     drawList->AddRect(rect.min, rect.max, color(g_palette.border), rounding);
     drawInsetHighlight(drawList, rect, rounding);
@@ -367,7 +379,7 @@ bool gradientButton(const char* label, ImVec2 size, ButtonVariant variant) {
     }
 
     ImDrawList* drawList = ImGui::GetWindowDrawList();
-    constexpr float rounding = 6.0f;
+    constexpr float rounding = 5.0f;  // control radius, matches FrameRounding
     drawVerticalGradient(drawList, rect, color(top), color(bottom), rounding);
     drawList->AddRect(
         rect.min, rect.max,
@@ -418,7 +430,7 @@ bool iconButton(const char* id, TransportIcon icon, const char* tooltip,
     }
 
     ImDrawList* drawList = ImGui::GetWindowDrawList();
-    constexpr float rounding = 6.0f;
+    constexpr float rounding = 5.0f;  // control radius, matches FrameRounding
     drawVerticalGradient(drawList, rect, color(top), color(bottom), rounding);
     drawList->AddRect(
         rect.min, rect.max,

@@ -64,6 +64,8 @@ std::string serializeEdit(const Edit& edit) {
         jt["name"] = t.name;
         jt["gain"] = t.gain;
         jt["pan"] = t.pan;
+        jt["mute"] = t.mute;
+        jt["solo"] = t.solo;
         json clips = json::array();
         for (const auto& c : t.clips) {
             clips.push_back({
@@ -190,6 +192,10 @@ ProjectResult deserializeEdit(const std::string& text, Edit& edit) {
             t.name = jt.value("name", "");
             t.gain = jt.value("gain", 1.0);
             t.pan = jt.value("pan", 0.0);
+            // Defaults keep projects written before mute/solo existed loading
+            // as fully audible rather than silent.
+            t.mute = jt.value("mute", false);
+            t.solo = jt.value("solo", false);
             if (jt.contains("clips")) {
                 for (const auto& jc : jt["clips"]) {
                     AudioClip c;

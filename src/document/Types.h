@@ -62,9 +62,32 @@ struct Track {
     std::string name;
     double gain = 1.0;
     double pan = 0.0;            // -1 (L) .. +1 (R)
+    // Mute and solo are stored per track, but solo is only meaningful relative
+    // to the other tracks: any track soloed silences every non-soloed track.
+    // That comparison lives in GraphBuilder, which is the only place that sees
+    // all tracks at once. See Edit::anyTrackSoloed().
+    bool mute = false;
+    bool solo = false;
     std::vector<AudioClip> clips;
     std::vector<PluginSlot> plugins;  // effect chain, processed in order
 };
+
+// Whether a track should be heard, given whether anything in the edit is
+// soloed. Mute wins over solo, so a track that is both stays silent — that
+// matches every DAW and stops a soloed track becoming impossible to mute.
+//
+// This is a free function rather than a Track method so it can be unit-tested
+// without constructing a graph, and so the GUI's dimming and the engine's
+// gain-zeroing are provably reading the same rule instead of two hand-written
+// conditions that can drift apart.
+inline bool trackAudible(bool mute, bool solo, bool anySoloed) {
+    if (mute) return false;
+    return !anySoloed || solo;
+}
+
+inline bool trackAudible(const Track& t, bool anySoloed) {
+    return trackAudible(t.mute, t.solo, anySoloed);
+}
 
 // ─── Markers (RB-4) ─────────────────────────────────────────────────────────
 // Marker kinds drive color and behavior (loop region loops; punch triggers

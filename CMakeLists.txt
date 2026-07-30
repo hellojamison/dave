@@ -143,17 +143,42 @@ target_compile_definitions(Dave PRIVATE
 # The LGPL ffmpeg binary lives in third_party/ffmpeg-lgpl/bin. In a packaged
 # .app it goes in Contents/Helpers/ so the VideoDecoder can find it at runtime
 # (resolveVideoTools checks Contents/Helpers/ffmpeg).
+#
+# These binaries are build artifacts (~150 MB), so they're gitignored and
+# produced by scripts/build-ffmpeg-lgpl-macos.sh. A fresh clone therefore does
+# not have them, and requiring them unconditionally makes the project
+# unbuildable until a contributor runs a long ffmpeg build they may not need.
+# Skip the copy when they're absent: everything except video still works, and
+# VideoDecoder already falls back to a PATH lookup at runtime.
 if(APPLE)
     set(FFMPEG_BIN "${THIRD_PARTY}/ffmpeg-lgpl/bin/ffmpeg")
     set(FFPROBE_BIN "${THIRD_PARTY}/ffmpeg-lgpl/bin/ffprobe")
+    if(EXISTS "${FFMPEG_BIN}" AND EXISTS "${FFPROBE_BIN}")
+        add_custom_command(TARGET Dave POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                "$<TARGET_FILE_DIR:Dave>/../Helpers"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${FFMPEG_BIN}" "$<TARGET_FILE_DIR:Dave>/../Helpers/ffmpeg"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${FFPROBE_BIN}" "$<TARGET_FILE_DIR:Dave>/../Helpers/ffprobe"
+            COMMENT "Copying LGPL ffmpeg/ffprobe into .app bundle"
+            VERBATIM)
+    else()
+        message(STATUS
+            "ffmpeg/ffprobe not found in third_party/ffmpeg-lgpl/bin — building "
+            "without bundled video tools. Video playback will be unavailable "
+            "unless ffmpeg is on PATH. Run scripts/build-ffmpeg-lgpl-macos.sh "
+            "to build them.")
+    endif()
+
+    # The bundle puts the real executable at Dave.app/Contents/MacOS/Dave, so
+    # `./build/Dave` — what the README and CI both use — doesn't otherwise
+    # exist in a fresh build tree. Create the convenience symlink so that path
+    # works everywhere instead of only where someone made one by hand.
     add_custom_command(TARGET Dave POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory
-            "$<TARGET_FILE_DIR:Dave>/../Helpers"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${FFMPEG_BIN}" "$<TARGET_FILE_DIR:Dave>/../Helpers/ffmpeg"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${FFPROBE_BIN}" "$<TARGET_FILE_DIR:Dave>/../Helpers/ffprobe"
-        COMMENT "Copying LGPL ffmpeg/ffprobe into .app bundle"
+        COMMAND ${CMAKE_COMMAND} -E create_symlink
+            "Dave.app/Contents/MacOS/Dave" "${CMAKE_BINARY_DIR}/Dave"
+        COMMENT "Linking build/Dave -> the bundle executable"
         VERBATIM)
 endif()
 

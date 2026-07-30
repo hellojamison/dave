@@ -10,8 +10,8 @@ system, free node-graph routing, and VST3 / AU / CLAP plugin hosting.
 
 ## Status
 
-🚧 **Early, but it runs.** macOS only so far. Not ready for real work — there is
-no test suite yet, and nothing here should be trusted with a session you care
+🚧 **Early, but it runs.** macOS only so far. Not ready for real work — test
+coverage is thin, and nothing here should be trusted with a session you care
 about.
 
 **Works today:** audio playback through our own node graph, with device
@@ -105,7 +105,7 @@ stays available under the project's licence.
 | 5 — Video playback | FFmpeg decode; A/V sync; preview; video lane | ✅ |
 | 6 — Video NLE | Video tracks; transitions; compositor; render/export | ⬜ |
 | — | Automation, MIDI, time/pitch | ⬜ |
-| — | **Test suite + RT-safety CI** (TSan/ASan, no allocs or locks on the audio thread) | ⬜ |
+| — | Test suite + CI | 🟡 Unit tests + macOS CI; RT-safety checks (TSan/ASan, no allocs or locks on the audio thread) pending |
 | 7 — Polish / 1.0 | Theming; a11y; crash reporting; packaging; DAWproject | 🟡 Theming done; rest pending |
 
 The original Phase 0 targeted JUCE and Tracktion Engine. Both were dropped —

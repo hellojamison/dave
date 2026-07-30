@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A newer push to the same branch makes the in-flight run redundant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Tests (macOS)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # The VST3 SDK dominates configure time and only changes when the
+      # submodule pointer does.
+      - name: Cache CMake build
+        uses: actions/cache@v4
+        with:
+          path: build-tests
+          key: ${{ runner.os }}-cmake-${{ hashFiles('.gitmodules', 'CMakeLists.txt', 'tests/CMakeLists.txt') }}
+          restore-keys: ${{ runner.os }}-cmake-
+
+      - name: Configure
+        run: cmake -B build-tests -DCMAKE_BUILD_TYPE=Debug -DDAVE_BUILD_TESTS=ON
+
+      - name: Build tests
+        run: cmake --build build-tests --target dave_tests -j3
+
+      # No audio device and no display on a CI runner — dave_tests is built
+      # from selected sources precisely so it needs neither.
+      - name: Run tests
+        run: ctest --test-dir build-tests --output-on-failure
+
+  app:
+    name: App builds (macOS)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        run: cmake --build build -j3
+
+      # Proves the app initialises GL, builds its font atlases and renders a
+      # real frame — not just that it links. Runs headless via the offscreen
+      # screenshot path.
+      - name: Render a frame offscreen
+        run: |
+          ./build/Dave --screenshot /tmp/ci.png --frames 20
+          test -s /tmp/ci.png
+          file /tmp/ci.png | grep -q PNG
+
+      - name: Upload rendered frame
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rendered-frame
+          path: /tmp/ci.png
+          if-no-files-found: warn

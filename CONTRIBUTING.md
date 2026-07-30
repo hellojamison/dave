@@ -99,12 +99,27 @@ New source files should carry an SPDX header:
 // SPDX-License-Identifier: GPL-3.0-or-later
 ```
 
+## Running the tests
+
+```
+cmake -B build-tests -DCMAKE_BUILD_TYPE=Debug -DDAVE_BUILD_TESTS=ON
+cmake --build build-tests --target dave_tests
+ctest --test-dir build-tests --output-on-failure
+```
+
+Tests are off by default so a plain build stays fast for people who only want to
+run the app. CI runs them on every pull request, along with a headless build of
+the app itself.
+
+Coverage is currently thin — the graph compiler, the peak cache, marker CSV
+interchange and content hashing. Contributions that extend it are especially
+welcome, and anything touching those areas should come with a test.
+
 ## Verifying your change
 
-There is no automated test suite yet — that's a known gap, not a standard we're
-relaxing for you. Until it exists, verification means saying concretely what you
-ran and what you observed:
+Say concretely what you ran and what you observed:
 
+- `ctest` passes, and you added a test if you changed behavior it covers.
 - `cmake --build build` completes clean, with no new warnings.
 - The app launches and audio still starts.
 - For UI changes, attach a screenshot (`--screenshot`, above).
@@ -113,3 +128,9 @@ ran and what you observed:
 
 Claims like "should work" or "looks correct" aren't verification. If you couldn't
 test something, say so explicitly; unverified is fine, silently-assumed is not.
+
+**A test that passes is only evidence if it would have failed before.** When you
+add a regression test, break the fix and watch the test go red before you submit.
+The peak-cache tests exist because a waveform bug shipped after being "verified"
+against a constant-amplitude tone — a signal that looks identical whether the
+code is right or wrong. Choose inputs that can actually expose the failure.

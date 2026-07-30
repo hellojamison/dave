@@ -179,3 +179,13 @@ if(APPLE)
     find_library(FOUNDATION_LIB Foundation REQUIRED)
     target_link_libraries(plugin_test PRIVATE ${CF_LIB} ${FOUNDATION_LIB})
 endif()
+
+# ─── Unit tests ─────────────────────────────────────────────────────────────
+# Off by default so a plain `cmake -B build` stays the fast path for people who
+# only want to run the app. CI and contributors turn it on explicitly.
+option(DAVE_BUILD_TESTS "Build the unit test suite" OFF)
+if(DAVE_BUILD_TESTS)
+    enable_testing()
+    list(APPEND CMAKE_MODULE_PATH "${THIRD_PARTY}/Catch2/extras")
+    add_subdirectory(tests)
+endif()

@@ -82,6 +82,22 @@ Palette makePalette() {
     p.clipVideo         = hex(0x466b64ff);
     p.clipVideoBorder   = hex(0x71958cff);
 
+    // Timeline surfaces, taken from PTXExtractor's CueConverterTheme so a user
+    // moving between the two apps sees one product. Note lanes are darker than
+    // both the header column and the window behind them: content sits in a
+    // well, chrome sits above it.
+    p.rulerSurface        = hex(0x252422ff);
+    p.trackHeaderSurface  = hex(0x302e2bff);
+    p.trackLaneSurface    = hex(0x201f1dff);
+    p.trackLaneAlt        = hex(0x242220ff);
+    p.workspaceBackground = hex(0x242321ff);
+    p.toolbarSurface      = hex(0x302e2cff);
+    p.inspectorSurface    = hex(0x2c2a28ff);
+
+    p.trackMuteActive      = hex(0xe78a31ff);
+    p.trackSoloActive      = hex(0xf0cc3aff);
+    p.trackControlInactive = hex(0x242321ff);
+
     return p;
 }
 

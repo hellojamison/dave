@@ -103,8 +103,11 @@ void drawTimeline(const document::Edit& edit,
                   TimelineViewState& view,
                   const std::unordered_map<std::string,
                       std::vector<std::vector<float>>>& assetBuffers,
-                  float trackHeight = 80.0f,
-                  float timelineHeight = 28.0f);
+                  // 58 and 30 match PTXExtractor's playlist lane and ruler.
+                  // drawTimeline clamps trackHeight up if the gutter controls
+                  // need more room, so this is a floor, not a guarantee.
+                  float trackHeight = 58.0f,
+                  float timelineHeight = 30.0f);
 
 // Draw the marker lane (a strip above the track rows showing markers as flags
 // and regions). Returns the height it consumed (caller reserves that much

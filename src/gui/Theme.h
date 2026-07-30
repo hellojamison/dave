@@ -64,6 +64,26 @@ struct Palette {
     ImVec4 markerCustom;
     ImVec4 clipVideo;
     ImVec4 clipVideoBorder;
+
+    // Timeline surfaces, matching PTXExtractor's session workspace so the two
+    // apps read as one family. The ordering matters more than the exact
+    // values: lanes are the DARKEST surface, so clips and waveforms sit on the
+    // deepest background and read as content on a canvas. Headers and the
+    // ruler step lighter, which puts the chrome visually above the material.
+    ImVec4 rulerSurface;
+    ImVec4 trackHeaderSurface;
+    ImVec4 trackLaneSurface;
+    ImVec4 trackLaneAlt;         // subtle banding for adjacent rows
+    ImVec4 workspaceBackground;  // behind the tracks, outside the lanes
+    ImVec4 toolbarSurface;
+    ImVec4 inspectorSurface;
+
+    // Mute and solo are the two per-track states a mix engineer scans for at a
+    // glance, so they get dedicated hues rather than the accent — amber for
+    // mute, yellow for solo, as in PTXExtractor and Pro Tools itself.
+    ImVec4 trackMuteActive;
+    ImVec4 trackSoloActive;
+    ImVec4 trackControlInactive;
 };
 
 const Palette& palette();

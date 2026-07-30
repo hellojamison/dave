@@ -572,7 +572,12 @@ void DaveApp::drawUI() {
     gui::theme::panelHeader("Timeline");
     // Taller windows can afford more waveform detail; the gutter itself
     // computes a content minimum so both values remain overlap-safe.
-    const float trackRowHeight = vp->WorkSize.y >= 900.0f ? 108.0f : 80.0f;
+    // PTXExtractor's playlist lane height. drawTimeline raises this if the
+    // gutter's gain and pan sliders need more room — PTXExtractor gets away
+    // with 58 because its track controls are read-only indicators, where
+    // Dave's are draggable — so the result is PTX's density wherever the
+    // controls allow it, rather than a fixed height picked per window size.
+    const float trackRowHeight = 58.0f;
     gui::drawTimeline(
         edit_, undo_, transport, peaks_, view_, builder_.assetBuffers(),
         trackRowHeight);

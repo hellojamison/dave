@@ -182,7 +182,9 @@ void drawTimeline(const document::Edit& edit,
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 origin = ImGui::GetCursorScreenPos();
     ImVec2 avail = ImGui::GetContentRegionAvail();
-    const float gutterWidth = 196.0f;
+    // 260 matches PTXExtractor's default track-header width, which is sized to
+    // hold a name plus a full row of per-track controls without truncation.
+    const float gutterWidth = 260.0f;
     const float totalWidth = avail.x;
     const float totalHeight = avail.y;
     const auto& pal = theme::palette();
@@ -242,8 +244,8 @@ void drawTimeline(const document::Edit& edit,
     // Ruler background + ticks. Brighten slightly when hovered/clickable.
     dl->AddRectFilled(
         origin, ImVec2(origin.x + gutterWidth, origin.y + timelineHeight),
-        C(pal.surfaceStrong));
-    ImVec4 rulerBg = rulerHovered ? pal.bgElevated : pal.bgAlt;
+        C(pal.trackHeaderSurface));
+    ImVec4 rulerBg = rulerHovered ? pal.surfaceBase : pal.rulerSurface;
     dl->AddRectFilled(ImVec2(origin.x + gutterWidth, origin.y),
                       ImVec2(origin.x + totalWidth, origin.y + timelineHeight),
                       C(rulerBg));
@@ -312,14 +314,30 @@ void drawTimeline(const document::Edit& edit,
         if (y > origin.y + totalHeight) break;
 
         bool selected = view.selectedTrackIndex == static_cast<int>(ti);
-        // The surface step spans the full row so header and clip lane read as
-        // one track, not two unrelated tables.
-        ImVec4 rowBg = selected
-            ? pal.trackSelected
-            : (ti % 2 == 0 ? pal.surfaceBase : pal.surfaceSoft);
+        // Header and lane get different surfaces rather than one fill across
+        // the row. The lane is the darkest surface in the app so clips and
+        // waveforms read as content sitting in a well, with the header column
+        // stepping lighter as chrome above it — the arrangement PTXExtractor
+        // uses. Alternating lane shading keeps adjacent tracks separable when
+        // several are empty.
+        const ImVec4 headerBg = selected ? pal.trackSelected : pal.trackHeaderSurface;
+        const ImVec4 laneBg = ti % 2 == 0 ? pal.trackLaneSurface : pal.trackLaneAlt;
         dl->AddRectFilled(
             ImVec2(origin.x, y),
-            ImVec2(origin.x + totalWidth, y + trackHeight), C(rowBg));
+            ImVec2(origin.x + gutterWidth, y + trackHeight), C(headerBg));
+        dl->AddRectFilled(
+            ImVec2(origin.x + gutterWidth, y),
+            ImVec2(origin.x + totalWidth, y + trackHeight), C(laneBg));
+        // Selection reads on the lane too, or selecting a track would only
+        // highlight the narrow header and be easy to miss at a glance.
+        if (selected) {
+            dl->AddRectFilled(
+                ImVec2(origin.x + gutterWidth, y),
+                ImVec2(origin.x + totalWidth, y + trackHeight),
+                IM_COL32(static_cast<int>(pal.accent.x * 255),
+                         static_cast<int>(pal.accent.y * 255),
+                         static_cast<int>(pal.accent.z * 255), 18));
+        }
         // Track separator.
         dl->AddLine(ImVec2(origin.x, y + trackHeight),
                     ImVec2(origin.x + totalWidth, y + trackHeight),
@@ -403,15 +421,38 @@ void drawTimeline(const document::Edit& edit,
             }
         }
 
-        ImGui::PushID(static_cast<int>(ti) + 5000);
-        ImGui::SetCursorScreenPos(
-            ImVec2(origin.x + gutterWidth - 56.0f, y + rowPadding));
-        ImGui::BeginDisabled();
-        ImGui::Button("M", ImVec2(24.0f, compactControlHeight));
-        ImGui::SameLine(0.0f, 3.0f);
-        ImGui::Button("S", ImVec2(24.0f, compactControlHeight));
-        ImGui::EndDisabled();
-        ImGui::PopID();
+        // Mute/solo indicators, drawn to PTXExtractor's spec: 21x17, 3px
+        // radius, hairline border, amber for mute and yellow for solo.
+        //
+        // These are inert. The document model has no mute or solo state yet,
+        // so there is nothing to toggle — they are drawn in their inactive
+        // state and deliberately rendered dimmed rather than as live controls,
+        // because a track header with convincing-looking M/S buttons that
+        // silently do nothing is worse than one that shows they aren't wired.
+        {
+            const ImVec2 msSize(21.0f, 17.0f);
+            const float msGap = 3.0f;
+            float msX = origin.x + gutterWidth - (msSize.x * 2.0f + msGap) - 12.0f;
+            const float msY = y + rowPadding;
+            const ImU32 inactiveFill = C(pal.trackControlInactive);
+            const ImU32 borderCol = C(pal.border);
+            const ImU32 labelCol = IM_COL32(
+                static_cast<int>(pal.textSubtle.x * 255),
+                static_cast<int>(pal.textSubtle.y * 255),
+                static_cast<int>(pal.textSubtle.z * 255), 122);
+            const char* labels[2] = {"M", "S"};
+            for (int b = 0; b < 2; ++b) {
+                const ImVec2 bMin(msX, msY);
+                const ImVec2 bMax(msX + msSize.x, msY + msSize.y);
+                dl->AddRectFilled(bMin, bMax, inactiveFill, 3.0f);
+                dl->AddRect(bMin, bMax, borderCol, 3.0f);
+                const ImVec2 ts = ImGui::CalcTextSize(labels[b]);
+                dl->AddText(ImVec2(msX + (msSize.x - ts.x) * 0.5f,
+                                   msY + (msSize.y - ts.y) * 0.5f),
+                            labelCol, labels[b]);
+                msX += msSize.x + msGap;
+            }
+        }
 
         // Click the gutter to select this track.
         if (gutterHovered &&

@@ -49,12 +49,41 @@ static MarkerPosMode parseMode(const std::string& s) {
     return MarkerPosMode::Sample;
 }
 
+// ─── Plugin slots ───────────────────────────────────────────────────────────
+// Slots appear in three places now (audio chains, MIDI instruments, MIDI
+// chains), so the field list lives once rather than three times.
+
+static json pluginSlotToJson(const PluginSlot& p) {
+    return json{
+        {"id", p.id},
+        {"name", p.name},
+        {"uidString", p.uidString},
+        {"path", p.path},
+        {"bypass", p.bypass},
+        {"stateBase64", p.stateBase64},
+    };
+}
+
+static PluginSlot pluginSlotFromJson(const json& jp) {
+    PluginSlot p;
+    p.id = jp.value("id", "");
+    p.name = jp.value("name", "");
+    p.uidString = jp.value("uidString", "");
+    p.path = jp.value("path", "");
+    p.bypass = jp.value("bypass", false);
+    p.stateBase64 = jp.value("stateBase64", "");
+    return p;
+}
+
 // ─── Serialize ──────────────────────────────────────────────────────────────
 
 std::string serializeEdit(const Edit& edit) {
     json j;
     j["format"] = "dave.doc/v1";
-    j["sampleRate"] = 48000; // RB single-rate
+    // The session's own format, not a constant: sample positions in this
+    // document are only meaningful against the rate that produced them.
+    j["sampleRate"] = edit.sampleRate();
+    j["bitDepth"] = edit.bitDepth();
 
     // Tracks (audio + clips + plugins).
     json tracks = json::array();
@@ -81,20 +110,56 @@ std::string serializeEdit(const Edit& edit) {
         }
         jt["clips"] = clips;
         json plugins = json::array();
-        for (const auto& p : t.plugins) {
-            plugins.push_back({
-                {"id", p.id},
-                {"name", p.name},
-                {"uidString", p.uidString},
-                {"path", p.path},
-                {"bypass", p.bypass},
-                {"stateBase64", p.stateBase64},
-            });
-        }
+        for (const auto& p : t.plugins) plugins.push_back(pluginSlotToJson(p));
         jt["plugins"] = plugins;
         tracks.push_back(jt);
     }
     j["tracks"] = tracks;
+
+    // MIDI tracks (RB-7). Notes are written as fixed 5-element arrays rather
+    // than objects: a few bars of piano is thousands of notes, and
+    // {"startSample":...,"lengthSamples":...} per note turns a small project
+    // into a megabyte of key names. The order is the MidiNote field order.
+    json midiTracks = json::array();
+    for (const auto& mt : edit.midiTracks()) {
+        json jmt;
+        jmt["id"] = mt.id;
+        jmt["name"] = mt.name;
+        jmt["gain"] = mt.gain;
+        jmt["pan"] = mt.pan;
+        jmt["mute"] = mt.mute;
+        jmt["solo"] = mt.solo;
+        jmt["instrument"] = pluginSlotToJson(mt.instrument);
+        json mclips = json::array();
+        for (const auto& c : mt.clips) {
+            json notes = json::array();
+            for (const auto& n : c.notes) {
+                notes.push_back(json::array({n.startSample, n.lengthSamples,
+                                             n.pitch, n.velocity, n.channel}));
+            }
+            json tempi = json::array();
+            for (const auto& t : c.sourceTempi) {
+                tempi.push_back(json::array({t.tick, t.microsecondsPerQuarter}));
+            }
+            mclips.push_back({
+                {"id", c.id},
+                {"name", c.name},
+                {"timelineStart", c.timelineStart},
+                {"sourceOffset", c.sourceOffset},
+                {"length", c.length},
+                {"notes", notes},
+                {"sourcePath", c.sourcePath},
+                {"sourcePpq", c.sourcePpq},
+                {"sourceTempi", tempi},
+            });
+        }
+        jmt["clips"] = mclips;
+        json mplugins = json::array();
+        for (const auto& p : mt.plugins) mplugins.push_back(pluginSlotToJson(p));
+        jmt["plugins"] = mplugins;
+        midiTracks.push_back(jmt);
+    }
+    j["midiTracks"] = midiTracks;
 
     // Assets.
     json assets = json::array();
@@ -179,6 +244,10 @@ ProjectResult deserializeEdit(const std::string& text, Edit& edit) {
         return {false, "not a dave.doc/v1 project (format missing or wrong)"};
     }
 
+    // Projects written before the session format was configurable carry no
+    // bitDepth and a hardcoded 48000; both defaults match what they meant.
+    edit.loadSessionFormat_(j.value("sampleRate", 48000), j.value("bitDepth", 24));
+
     // We rebuild the Edit by mutating it directly (its public mutators fire
     // notifyChanged, which we don't want during load — so use tracksMut() etc.
     // and DON'T fire the change listener until the end). For simplicity we
@@ -212,17 +281,71 @@ ProjectResult deserializeEdit(const std::string& text, Edit& edit) {
             }
             if (jt.contains("plugins")) {
                 for (const auto& jp : jt["plugins"]) {
-                    PluginSlot p;
-                    p.id = jp.value("id", "");
-                    p.name = jp.value("name", "");
-                    p.uidString = jp.value("uidString", "");
-                    p.path = jp.value("path", "");
-                    p.bypass = jp.value("bypass", false);
-                    p.stateBase64 = jp.value("stateBase64", "");
-                    t.plugins.push_back(std::move(p));
+                    t.plugins.push_back(pluginSlotFromJson(jp));
                 }
             }
             tracks.push_back(std::move(t));
+        }
+    }
+
+    // MIDI tracks (RB-7). Guarded by contains() like every other section, so a
+    // project written before MIDI existed loads unchanged.
+    edit.clearMidiTracks_();
+    if (j.contains("midiTracks")) {
+        for (const auto& jmt : j["midiTracks"]) {
+            MidiTrack mt;
+            mt.id = jmt.value("id", "");
+            mt.name = jmt.value("name", "");
+            mt.gain = jmt.value("gain", 1.0);
+            mt.pan = jmt.value("pan", 0.0);
+            mt.mute = jmt.value("mute", false);
+            mt.solo = jmt.value("solo", false);
+            if (jmt.contains("instrument")) {
+                mt.instrument = pluginSlotFromJson(jmt["instrument"]);
+            }
+            if (jmt.contains("clips")) {
+                for (const auto& jc : jmt["clips"]) {
+                    MidiClip c;
+                    c.id = jc.value("id", "");
+                    c.name = jc.value("name", "");
+                    c.timelineStart = jc.value("timelineStart", int64_t(0));
+                    c.sourceOffset = jc.value("sourceOffset", int64_t(0));
+                    c.length = jc.value("length", int64_t(0));
+                    c.sourcePath = jc.value("sourcePath", "");
+                    c.sourcePpq = jc.value("sourcePpq", 480);
+                    if (jc.contains("notes")) {
+                        for (const auto& jn : jc["notes"]) {
+                            // Skip anything that isn't a well-formed 5-tuple
+                            // rather than throwing: one bad note shouldn't cost
+                            // the user the whole project.
+                            if (!jn.is_array() || jn.size() < 5) continue;
+                            MidiNote n;
+                            n.startSample = jn[0].get<int64_t>();
+                            n.lengthSamples = jn[1].get<int64_t>();
+                            n.pitch = static_cast<uint8_t>(jn[2].get<int>() & 0x7F);
+                            n.velocity = static_cast<uint8_t>(jn[3].get<int>() & 0x7F);
+                            n.channel = static_cast<uint8_t>(jn[4].get<int>() & 0x0F);
+                            c.notes.push_back(n);
+                        }
+                    }
+                    if (jc.contains("sourceTempi")) {
+                        for (const auto& jt2 : jc["sourceTempi"]) {
+                            if (!jt2.is_array() || jt2.size() < 2) continue;
+                            TempoEvent te;
+                            te.tick = jt2[0].get<int64_t>();
+                            te.microsecondsPerQuarter = jt2[1].get<int32_t>();
+                            c.sourceTempi.push_back(te);
+                        }
+                    }
+                    mt.clips.push_back(std::move(c));
+                }
+            }
+            if (jmt.contains("plugins")) {
+                for (const auto& jp : jmt["plugins"]) {
+                    mt.plugins.push_back(pluginSlotFromJson(jp));
+                }
+            }
+            edit.loadMidiTrack_(std::move(mt));
         }
     }
 

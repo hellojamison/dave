@@ -28,6 +28,8 @@
         case 11: if (g_menuPlayStop) g_menuPlayStop(); break;
         case 12: if (g_menuReturnToStart) g_menuReturnToStart(); break;
         case 13: if (g_menuQuit) g_menuQuit(); break;
+        case 14: if (g_menuToggleVideoWindow) g_menuToggleVideoWindow(); break;
+        case 15: if (g_menuImportMidi) g_menuImportMidi(); break;
     }
 }
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)app {
@@ -51,6 +53,8 @@ std::function<void()> g_menuUndo;
 std::function<void()> g_menuRedo;
 std::function<void()> g_menuPlayStop;
 std::function<void()> g_menuReturnToStart;
+std::function<void()> g_menuToggleVideoWindow;
+std::function<void()> g_menuImportMidi;
 std::function<void()> g_menuQuit;
 
 static DaveMenuItemTarget* g_target = nil;
@@ -92,6 +96,7 @@ void setupMacMenuBar() {
     [fileMenu addItem:makeItem(@"Save As…", 4, @"S")];
     [fileMenu addItem:[NSMenuItem separatorItem]];
     [fileMenu addItem:makeItem(@"Load WAV…", 5)];
+    [fileMenu addItem:makeItem(@"Import MIDI…", 15)];
     [fileMenu addItem:makeItem(@"Load Video…", 6)];
     [fileMenu addItem:[NSMenuItem separatorItem]];
     [fileMenu addItem:makeItem(@"Import Markers (CSV)…", 7)];
@@ -120,6 +125,10 @@ void setupMacMenuBar() {
     NSMenu* winMenu = [[NSMenu alloc] initWithTitle:@"Window"];
     [winMenu addItemWithTitle:@"Minimize" action:@selector(performMiniaturize:) keyEquivalent:@"m"];
     [winMenu addItemWithTitle:@"Zoom" action:@selector(performZoom:) keyEquivalent:@""];
+    [winMenu addItem:[NSMenuItem separatorItem]];
+    // Toggles the picture between the sidebar and its own draggable window —
+    // the escape hatch if the detached window ends up behind something.
+    [winMenu addItem:makeItem(@"Video Window", 14, @"V")];
     [winMenuItem setSubmenu:winMenu];
     [[app mainMenu] addItem:winMenuItem];
 }

@@ -1,0 +1,34 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#pragma once
+
+#include "document/Edit.h"
+#include "editing/Command.h"
+// The mixer shares the session's view state (selection, and the requests that
+// have to be serviced by the application) with the timeline. Two view states
+// would mean selecting a track in one place and not the other.
+#include "gui/Timeline.h"
+
+namespace dave::gui {
+
+// Draw the mixer: one vertical strip per track, audio then MIDI, in the same
+// order as the timeline rows.
+//
+// A strip is the track's signal path top to bottom — instrument (MIDI only),
+// then the insert chain, then mute/solo, pan and the fader. That order is the
+// order the audio actually travels, which is the whole reason a mixer is laid
+// out vertically.
+//
+// Inserts are the track's existing plugin chain; GraphBuilder has always
+// routed audio through it as chainSource -> plugin[0] -> ... -> trackGain.
+// What this adds is somewhere to see and edit that chain for every track at
+// once, instead of one selected track at a time in the sidebar.
+//
+// Mutations go through `undo` where a command exists. Opening the plugin
+// picker or a plugin's editor window can't happen from inside a draw call, so
+// those are recorded in `view` for the application to service after the frame.
+void drawMixer(document::Edit& edit,
+               editing::UndoStack& undo,
+               TimelineViewState& view,
+               float stripWidth = 108.0f);
+
+} // namespace dave::gui

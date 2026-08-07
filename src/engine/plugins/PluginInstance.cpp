@@ -2,6 +2,7 @@
 #include "engine/plugins/PluginInstance.h"
 
 #include <public.sdk/source/common/memorystream.h>
+#include <public.sdk/source/vst/hosting/eventlist.h>
 #include <public.sdk/source/vst/hosting/hostclasses.h>
 #include <public.sdk/source/vst/hosting/module.h>
 #include <public.sdk/source/vst/hosting/processdata.h>
@@ -15,6 +16,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 namespace dave::engine {
 
@@ -35,6 +37,31 @@ struct PluginInstance::Impl {
     ProcessContext processContext{};
     int maxBlock = 0;
     double sampleRate = 48000.0;
+
+    // Pre-allocated event lists. 512 is chosen to cover the worst realistic
+    // block — a dense cluster plus a 128-note all-notes-off flush after a seek
+    // — so addEvent never has to grow anything on the RT thread. Events past
+    // capacity are dropped, which costs a note, not a glitch.
+    static constexpr int kEventCapacity = 512;
+    EventList inputEvents{kEventCapacity};
+    EventList outputEvents{kEventCapacity};
+
+    // Silent input for generators. An instrument is driven by events, not
+    // audio, so its caller passes in == nullptr — but a synth may still declare
+    // an audio input bus (a vocoder side-chain, a "audio in" mode), and
+    // HostProcessData::prepare(…, 0, …) leaves those channel pointers null.
+    // Handing the plugin a real block of zeroes is cheaper than auditing every
+    // synth for whether it reads a bus it declared.
+    static constexpr int kMaxChannels = 8;
+    std::vector<float> silenceStorage;
+    float* silenceChannels[kMaxChannels]{};
+
+    void resizeSilence(int blockSize) {
+        silenceStorage.assign(static_cast<size_t>(blockSize) * kMaxChannels, 0.0f);
+        for (int c = 0; c < kMaxChannels; ++c) {
+            silenceChannels[c] = silenceStorage.data() + static_cast<size_t>(c) * blockSize;
+        }
+    }
 };
 
 PluginInstance::PluginInstance() : p_(std::make_unique<Impl>()) {}
@@ -45,6 +72,7 @@ bool PluginInstance::load(const PluginDescriptor& desc, double sampleRate, int m
     name_ = desc.name;
     p_->sampleRate = sampleRate;
     p_->maxBlock = maxBlock;
+    p_->resizeSilence(maxBlock);
 
     // 1) Load the .vst3 bundle as a hosting Module (dlopens the binary).
     std::string err;
@@ -124,6 +152,26 @@ bool PluginInstance::load(const PluginDescriptor& desc, double sampleRate, int m
                                     (i == 0) ? 1 : 0);
     }
 
+    // 6b) Event buses. A VST3 instrument's note input is a bus like any other
+    //     and starts DEACTIVATED — a synth whose event bus was never activated
+    //     loads cleanly, reports no error, and stays silent forever, which is
+    //     the single most confusing failure mode in VST3 hosting. Activate the
+    //     main event bus in each direction for every plugin: effects simply
+    //     report zero event buses and this loop does nothing.
+    const int nEventIn = p_->component->getBusCount(MediaTypes::kEvent,
+                                                    BusDirections::kInput);
+    for (int i = 0; i < nEventIn; ++i) {
+        p_->component->activateBus(MediaTypes::kEvent, BusDirections::kInput, i,
+                                    (i == 0) ? 1 : 0);
+    }
+    acceptsMidi_ = nEventIn > 0;
+    const int nEventOut = p_->component->getBusCount(MediaTypes::kEvent,
+                                                     BusDirections::kOutput);
+    for (int i = 0; i < nEventOut; ++i) {
+        p_->component->activateBus(MediaTypes::kEvent, BusDirections::kOutput, i,
+                                    (i == 0) ? 1 : 0);
+    }
+
     // 7) Prepare the HostProcessData. We pass bufferSamples=0 so the helper
     //    sets up the bus/channel arrays BUT does NOT allocate its own sample
     //    buffers (channelBufferOwner stays false). That lets our setChannelBuffers
@@ -181,6 +229,7 @@ void PluginInstance::prepare(double sampleRate, int maxBlock) {
 
     p_->sampleRate = sampleRate;
     p_->maxBlock = maxBlock;
+    p_->resizeSilence(maxBlock);
     p_->processData->unprepare();
     p_->processData->prepare(*p_->component, 0, kSample32); // 0 = don't own buffers
 
@@ -191,7 +240,9 @@ void PluginInstance::prepare(double sampleRate, int maxBlock) {
 }
 
 void PluginInstance::process(const float* const* in, float* const* out,
-                              int numChannels, int numSamples, const TimeInfo& time) {
+                              int numChannels, int numSamples,
+                              const MidiEvent* events, int numEvents,
+                              const TimeInfo& time) {
     if (!loaded_ || !p_->processor || !p_->processData) return;
 
     // --- RT thread ---
@@ -204,18 +255,65 @@ void PluginInstance::process(const float* const* in, float* const* out,
     ctx.sampleRate = p_->sampleRate;
     ctx.projectTimeSamples = time.samplePos;
     ctx.continousTimeSamples = time.samplePos; // Steinberg's spelling (no 'u')
-    ctx.state = ProcessContext::kPlaying;
+    // The musical position and tempo have to be flagged valid or a synth's
+    // tempo-synced LFOs and delays read zero and free-run. kPlaying is a flag,
+    // not the whole state word: asserting it unconditionally told every plugin
+    // the transport was rolling even while stopped, so anything gated on
+    // transport state (a synced arpeggiator, a gate) ran during silence.
+    ctx.state = ProcessContext::kProjectTimeMusicValid | ProcessContext::kTempoValid;
+    if (time.isPlaying) ctx.state |= ProcessContext::kPlaying;
+    ctx.projectTimeMusic = time.ppqPosition;
     ctx.tempo = time.bpm;
     pd.processContext = &ctx;
+
+    // Translate our block-relative MIDI into the SDK's Event union. The lists
+    // are pre-allocated members; clear() just resets a fill count.
+    p_->inputEvents.clear();
+    p_->outputEvents.clear();
+    for (int i = 0; i < numEvents; ++i) {
+        const MidiEvent& m = events[i];
+        Event e{};
+        e.busIndex = 0;
+        e.sampleOffset = m.sampleOffset;
+        e.ppqPosition = time.ppqPosition;
+        e.flags = Event::kIsLive;
+        if (m.type == MidiEventType::NoteOn) {
+            e.type = Event::kNoteOnEvent;
+            e.noteOn.channel = m.channel;
+            e.noteOn.pitch = m.pitch;
+            e.noteOn.tuning = 0.0f;
+            e.noteOn.velocity = static_cast<float>(m.velocity) / 127.0f;
+            e.noteOn.length = 0;
+            // -1 means "no note id": we address notes by pitch+channel, which
+            // is what a plain SMF gives us. Note ids belong with per-note
+            // expression, which arrives with the piano roll.
+            e.noteOn.noteId = -1;
+        } else {
+            e.type = Event::kNoteOffEvent;
+            e.noteOff.channel = m.channel;
+            e.noteOff.pitch = m.pitch;
+            e.noteOff.velocity = static_cast<float>(m.velocity) / 127.0f;
+            e.noteOff.noteId = -1;
+            e.noteOff.tuning = 0.0f;
+        }
+        // Returns kResultFalse when full; dropping the overflow is the RT-safe
+        // choice and cannot happen below a 512-event block.
+        p_->inputEvents.addEvent(e);
+    }
+    pd.inputEvents = &p_->inputEvents;
+    pd.outputEvents = &p_->outputEvents;
 
     // Wire our deinterleaved buffers into the HostProcessData's buses.
     // setChannelBuffers wants a non-const Sample32* array. For input we must
     // cast away const (the plugin shouldn't write to inputs, but the SDK type
     // is non-const); for output we hand our writable buffer directly.
     if (pd.inputs != nullptr && numChannels > 0) {
-        float* inBufs[8];
-        int n = numChannels < 8 ? numChannels : 8;
-        for (int c = 0; c < n; ++c) inBufs[c] = const_cast<float*>(in[c]);
+        float* inBufs[Impl::kMaxChannels];
+        int n = numChannels < Impl::kMaxChannels ? numChannels : Impl::kMaxChannels;
+        for (int c = 0; c < n; ++c) {
+            inBufs[c] = (in != nullptr) ? const_cast<float*>(in[c])
+                                        : p_->silenceChannels[c];
+        }
         pd.setChannelBuffers(BusDirections::kInput, 0, inBufs, n);
     }
     if (pd.outputs != nullptr && numChannels > 0) {
@@ -231,7 +329,14 @@ void PluginInstance::process(const float* const* in, float* const* out,
 void PluginInstance::unload() {
     if (p_->processor) { p_->processor->setProcessing(false); p_->processor = nullptr; }
     if (p_->component) { p_->component->setActive(false); }
-    if (p_->processData) { p_->processData->unprepare(); p_->processData.reset(); }
+    if (p_->processData) {
+        // Drop our event-list pointers before the ProcessData goes away, so a
+        // stale unload/reload can't hand a plugin a dangling list.
+        p_->processData->inputEvents = nullptr;
+        p_->processData->outputEvents = nullptr;
+        p_->processData->unprepare();
+        p_->processData.reset();
+    }
     if (p_->controller) { p_->controller = nullptr; }
     if (p_->component) {
         p_->component->terminate();
@@ -240,6 +345,7 @@ void PluginInstance::unload() {
     p_->hostContext = nullptr;
     p_->module.reset();
     loaded_ = false;
+    acceptsMidi_ = false;
 }
 
 void* PluginInstance::editControllerAsUnknown() const {

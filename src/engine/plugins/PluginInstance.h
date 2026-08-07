@@ -14,6 +14,23 @@
 
 namespace dave::engine {
 
+// One MIDI event to hand a plugin for the current block. A plain POD so this
+// header stays SDK-free: the translation to Steinberg's Event union happens
+// inside PluginInstance.cpp, where the SDK headers already live.
+//
+// `sampleOffset` is BLOCK-RELATIVE (0 .. numSamples-1), which is what VST3
+// wants. The caller slices absolute timeline positions down to block-relative
+// ones; see InstrumentNode::sliceBlock.
+enum class MidiEventType : uint8_t { NoteOff = 0, NoteOn = 1 };
+
+struct MidiEvent {
+    int32_t sampleOffset = 0;
+    MidiEventType type = MidiEventType::NoteOn;
+    uint8_t channel = 0;    // 0..15
+    uint8_t pitch = 60;     // 0..127
+    uint8_t velocity = 100; // 0..127
+};
+
 // PluginInstance wraps ONE loaded VST3 plugin: the component (audio processor)
 // + controller (params/editor), with buses set up and a ProcessData ready.
 //
@@ -44,10 +61,28 @@ public:
     void prepare(double sampleRate, int maxBlock);
 
     // RT thread. Processes `n` samples: reads from `in` (deinterleaved, stereo),
-    // writes processed audio to `out` (same layout). Passes `time` through to
-    // the plugin's ProcessContext. No allocation.
+    // writes processed audio to `out` (same layout), and delivers `numEvents`
+    // MIDI events on event input bus 0. Passes `time` through to the plugin's
+    // ProcessContext. No allocation: events are copied into a pre-allocated
+    // list, and anything beyond its capacity is dropped rather than grown.
+    //
+    // `in` may be null for an instrument (a generator with no audio input);
+    // pass numChannels for the OUTPUT in that case.
     void process(const float* const* in, float* const* out, int numChannels,
-                 int numSamples, const TimeInfo& time);
+                 int numSamples, const MidiEvent* events, int numEvents,
+                 const TimeInfo& time);
+
+    // Audio-only overload — what every effect in the chain uses. Kept so
+    // PluginNode and the existing FX path are unaffected by MIDI.
+    void process(const float* const* in, float* const* out, int numChannels,
+                 int numSamples, const TimeInfo& time) {
+        process(in, out, numChannels, numSamples, nullptr, 0, time);
+    }
+
+    // Does the plugin have an event input bus? True for instruments and for
+    // effects that take MIDI (an arpeggiator, a MIDI-triggered gate). Only
+    // meaningful once loaded.
+    bool acceptsMidi() const { return acceptsMidi_; }
 
     // Unload: deactivate, terminate processor, release controller/component.
     // Main thread. Idempotent.
@@ -72,6 +107,7 @@ private:
     struct Impl; // hides SDK-owned types from the header
     std::unique_ptr<Impl> p_;
     bool loaded_ = false;
+    bool acceptsMidi_ = false;
     std::string name_;
     std::string lastError_;
 };

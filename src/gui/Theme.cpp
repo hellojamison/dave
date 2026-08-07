@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <initializer_list>
 #include <string>
@@ -81,6 +82,12 @@ Palette makePalette() {
     p.markerCustom      = hex(0x9b9690ff);
     p.clipVideo         = hex(0x466b64ff);
     p.clipVideoBorder   = hex(0x71958cff);
+    // MIDI clips lean to the mauve side of the shell. Audio and video already
+    // hold the two sage greens, and a third green would make the three clip
+    // types indistinguishable in a glance down a busy session.
+    p.clipMidi          = hex(0x6a5a72ff);
+    p.clipMidiBorder    = hex(0x9c88a4ff);
+    p.midiNote          = hex(0xe6dce9ff);
 
     // Timeline surfaces, taken from PTXExtractor's CueConverterTheme so a user
     // moving between the two apps sees one product. Note lanes are darker than
@@ -152,6 +159,17 @@ const Fonts& fonts() {
     return g_fonts;
 }
 
+std::string formatPan(double pan) {
+    const int magnitude =
+        static_cast<int>(std::lround(std::fabs(pan) * 100.0));
+    if (magnitude == 0) {
+        return "C";
+    }
+    char buf[8];
+    std::snprintf(buf, sizeof(buf), "%c%d", pan < 0.0 ? 'L' : 'R', magnitude);
+    return buf;
+}
+
 ImVec4 hex(uint32_t rgba) {
     constexpr float scale = 1.0f / 255.0f;
     return ImVec4(
@@ -219,15 +237,16 @@ void applyTheme() {
     style.ScrollbarSize = 12.0f;
     style.GrabMinSize = 10.0f;
 
-    // Radii follow the same source: 12 for panels, 10 for cards, 5 for
-    // controls, 3 for the smallest chips. Three steps with clear roles rather
-    // than one value everywhere — size should tell you what kind of thing it
-    // is.
-    style.WindowRounding = 12.0f;
-    style.ChildRounding = 10.0f;
+    // Sections — panels, cards, popups — are square. They tile edge to edge
+    // across the window, and a radius on a docked panel leaves the shell
+    // showing through at every corner, reading as a gap rather than a seam.
+    // Controls keep their radius: a button is an object on a surface, not a
+    // division of it.
+    style.WindowRounding = 0.0f;
+    style.ChildRounding = 0.0f;
     style.FrameRounding = 5.0f;
     style.GrabRounding = 5.0f;
-    style.PopupRounding = 10.0f;
+    style.PopupRounding = 0.0f;
     style.ScrollbarRounding = 3.0f;
     style.TabRounding = 5.0f;
     style.WindowBorderSize = 1.0f;
@@ -322,9 +341,9 @@ void drawPanelSurface(ImDrawList* drawList, const Rect& rect,
         fill = &g_palette.surfaceStrong;
     }
 
-    // Card radius from the shared scale — panels are 12, the cards inside
-    // them 10, so nesting reads as depth rather than as one flat surface.
-    constexpr float rounding = 10.0f;
+    // Square, like every other section. Depth comes from the fill stepping
+    // lighter as it nests, not from a radius.
+    constexpr float rounding = 0.0f;
     drawList->AddRectFilled(rect.min, rect.max, color(*fill), rounding);
     drawList->AddRect(rect.min, rect.max, color(g_palette.border), rounding);
     drawInsetHighlight(drawList, rect, rounding);
@@ -470,6 +489,24 @@ bool iconButton(const char* id, TransportIcon icon, const char* tooltip,
         case TransportIcon::Record:
             drawList->AddCircleFilled(center, 6.0f, glyph, 16);
             break;
+        case TransportIcon::Loop: {
+            // A rounded rectangle broken at the right edge, with an arrowhead
+            // at the break — a cycle that reads at 16 px, where a full circle
+            // of arrows turns to mush.
+            drawList->PathArcTo(ImVec2(center.x - 3.0f, center.y), 5.0f,
+                                IM_PI * 0.5f, IM_PI * 1.5f, 12);
+            drawList->PathLineTo(ImVec2(center.x + 3.0f, center.y - 5.0f));
+            drawList->PathStroke(glyph, 0, 1.8f);
+            drawList->PathArcTo(ImVec2(center.x + 3.0f, center.y), 5.0f,
+                                IM_PI * 1.5f, IM_PI * 2.5f, 12);
+            drawList->PathLineTo(ImVec2(center.x - 3.0f, center.y + 5.0f));
+            drawList->PathStroke(glyph, 0, 1.8f);
+            drawList->AddTriangleFilled(
+                ImVec2(center.x - 3.0f, center.y + 1.5f),
+                ImVec2(center.x - 3.0f, center.y + 8.5f),
+                ImVec2(center.x - 8.0f, center.y + 5.0f), glyph);
+            break;
+        }
     }
 
     if (tooltip != nullptr && tooltip[0] != '\0') {

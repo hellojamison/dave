@@ -9,12 +9,38 @@
 
 namespace dave::engine {
 
+std::shared_ptr<PluginInstance> GraphBuilder::instanceForSlot(
+    const document::PluginSlot& slot, double sampleRate) {
+    if (slot.id.empty() || slot.uidString.empty()) return nullptr;
+
+    auto& inst = pluginInstances_[slot.id];
+    if (!inst) {
+        inst = std::make_shared<PluginInstance>();
+        PluginDescriptor desc;
+        desc.name = slot.name;
+        desc.path = slot.path;
+        desc.uidString = slot.uidString;
+        if (!inst->load(desc, sampleRate, 256)) {
+            std::fprintf(stderr, "Dave: failed to load plugin '%s': %s\n",
+                         slot.name.c_str(), inst->lastError().c_str());
+            inst.reset();
+            return nullptr;
+        }
+        // Restore saved parameter state if present (RB-7 persistence).
+        if (!slot.stateBase64.empty()) {
+            inst->setStateBase64(slot.stateBase64);
+        }
+    }
+    return inst;
+}
+
 std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit, double sampleRate) {
     auto graph = std::make_unique<Graph>();
 
     master_.reset();
     trackGains_.clear();
     clipNodes_.clear();
+    instrumentNodes_.clear();
 
     // Master: the root of the derived graph.
     master_ = std::make_shared<GainNode>();
@@ -22,17 +48,19 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit, double sa
     auto masterId = graph->addNode(master_);
 
     const auto& tracks = edit.tracks();
-    auto masterSum = std::make_shared<SummingNode>(static_cast<int>(tracks.size()));
+    const auto& midiTracks = edit.midiTracks();
+    // Every track gets a master pin, audio and MIDI alike — they differ only in
+    // what feeds their gain node.
+    auto masterSum = std::make_shared<SummingNode>(
+        static_cast<int>(tracks.size() + midiTracks.size()));
     auto masterSumId = graph->addNode(masterSum);
     graph->connect(masterSumId, 0, masterId, 0);
 
     // Solo is relative: as soon as any track is soloed, every track that isn't
-    // becomes silent. Deciding that needs a view of all tracks, so it happens
-    // here rather than on the individual Track.
-    bool anySoloed = false;
-    for (const auto& track : tracks) {
-        if (track.solo) { anySoloed = true; break; }
-    }
+    // becomes silent. Deciding that needs a view of every track — audio AND
+    // MIDI — so the Edit answers it and the GUI's dimming asks the same
+    // question rather than reimplementing the scan.
+    const bool anySoloed = edit.anySoloed();
 
     int trackIndex = 0;
     for (const auto& track : tracks) {
@@ -115,26 +143,53 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit, double sa
         // chainSource was set above (clip sum, or silent sum for empty tracks).
         for (const auto& slot : track.plugins) {
             if (slot.bypass) continue; // skip bypassed plugins
+            auto inst = instanceForSlot(slot, sampleRate);
+            if (!inst) continue;
 
-            // Get-or-create the cached PluginInstance for this slot.
-            auto& inst = pluginInstances_[slot.id];
-            if (!inst) {
-                inst = std::make_shared<PluginInstance>();
-                PluginDescriptor desc;
-                desc.name = slot.name;
-                desc.path = slot.path;
-                desc.uidString = slot.uidString;
-                if (!inst->load(desc, sampleRate, 256)) {
-                    std::fprintf(stderr, "Dave: failed to load plugin '%s': %s\n",
-                                 slot.name.c_str(), inst->lastError().c_str());
-                    inst.reset();
-                    continue;
-                }
-                // Restore saved parameter state if present (RB-7 persistence).
-                if (!slot.stateBase64.empty()) {
-                    inst->setStateBase64(slot.stateBase64);
-                }
-            }
+            auto node = std::make_shared<PluginNode>(inst);
+            auto nodeId = graph->addNode(node);
+            graph->connect(chainSource, 0, nodeId, 0);
+            chainSource = nodeId;
+        }
+
+        graph->connect(chainSource, 0, gainId, 0);
+        graph->connect(gainId, 0, masterSumId, trackIndex);
+        ++trackIndex;
+    }
+
+    // ─── MIDI tracks ────────────────────────────────────────────────────────
+    // Same shape as an audio track, with an InstrumentNode where the clip sum
+    // would be. `trackIndex` keeps counting: MIDI tracks take the master-sum
+    // pins after the audio ones.
+    for (const auto& track : midiTracks) {
+        auto gain = std::make_shared<GainNode>();
+        const bool audible = document::trackAudible(track, anySoloed);
+        gain->setGain(audible ? track.gain : 0.0);
+        gain->setPan(track.pan);
+        auto gainId = graph->addNode(gain);
+        trackGains_[track.id] = gain;
+
+        NodeId chainSource;
+        auto instrumentInstance = instanceForSlot(track.instrument, sampleRate);
+        if (instrumentInstance) {
+            auto instrumentNode = std::make_shared<InstrumentNode>();
+            instrumentNode->setInstrument(instrumentInstance);
+            instrumentNode->setSequence(bakeClips(track.clips));
+            chainSource = graph->addNode(instrumentNode);
+            instrumentNodes_[track.id] = instrumentNode;
+        } else {
+            // No instrument yet, or it failed to load. The track still needs a
+            // silent anchor so its gain node, effect chain and mixer strip
+            // exist — same reasoning as an audio track with no clips. Importing
+            // a .mid and only then picking a synth is the normal order of
+            // operations, not an error state.
+            chainSource = graph->addNode(std::make_shared<SummingNode>(1));
+        }
+
+        for (const auto& slot : track.plugins) {
+            if (slot.bypass) continue;
+            auto inst = instanceForSlot(slot, sampleRate);
+            if (!inst) continue;
 
             auto node = std::make_shared<PluginNode>(inst);
             auto nodeId = graph->addNode(node);
@@ -151,6 +206,12 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit, double sa
     // was removed from the Edit). Collect live slot ids first.
     std::unordered_set<std::string> liveSlots;
     for (const auto& track : edit.tracks()) {
+        for (const auto& slot : track.plugins) {
+            liveSlots.insert(slot.id);
+        }
+    }
+    for (const auto& track : midiTracks) {
+        if (!track.instrument.id.empty()) liveSlots.insert(track.instrument.id);
         for (const auto& slot : track.plugins) {
             liveSlots.insert(slot.id);
         }

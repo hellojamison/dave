@@ -30,11 +30,16 @@ bool ImGuiLayer::init(platform::Window& window) {
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;       // docking branch feature
-    // NOTE: multi-viewport (detached OS windows) is DISABLED. For a DAW we want
-    // everything inside the single GLFW window so the layout is predictable and
-    // panels don't float around the OS as separate windows. The docking branch
-    // still gives us dockable panels within the main window.
-    // io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+    // Multi-viewport (detached OS windows) is enabled for one reason: the video
+    // preview can be popped out of the sidebar and dragged onto a second
+    // display, which is how picture is monitored in post. The layout stays
+    // predictable anyway — every docked panel is repositioned with
+    // ImGuiCond_Always and carries NoMove | NoDocking, so the popped-out
+    // picture window is the only thing that can leave the main window.
+    io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+    // Keep ImGui's own title bar on detached windows rather than the OS one:
+    // this build of ImGui draws both when the platform window is decorated.
+    io.ConfigViewportsNoDecoration = true;
 
     // Dave's visual identity — replaces the ImGui default (which reads as a
     // debug tool) with a cohesive pro-audio dark theme.

@@ -5,6 +5,7 @@
 #include "engine/graph/Graph.h"
 #include "engine/nodes/AudioClipNode.h"
 #include "engine/nodes/GainNode.h"
+#include "engine/nodes/InstrumentNode.h"
 #include "engine/nodes/SummingNode.h"
 #include "engine/plugins/PluginInstance.h"
 #include "engine/plugins/PluginNode.h"
@@ -18,9 +19,15 @@ namespace dave::engine {
 // GraphBuilder derives an engine::Graph from a document::Edit. This is the
 // single bridge between the user's track/clip/plugin model and the RT graph.
 //
-// Derivation rule (per track):
+// Derivation rule (per audio track):
 //   clips → trackSum → plugin[0] → plugin[1] → ... → trackGain → masterSum → master
 // Tracks with no plugins skip the plugin chain (trackSum → trackGain directly).
+//
+// Per MIDI track:
+//   instrumentNode → plugin[0] → ... → trackGain → masterSum → master
+// The InstrumentNode is a generator that owns both the baked note sequence and
+// the instrument plugin, so a MIDI track differs from an audio track only in
+// what sits at the head of the chain.
 // A free-routing editor (Reaper-style grid) replaces this fixed rule later;
 // GraphBuilder is the seam where that plugs in.
 //
@@ -43,6 +50,12 @@ public:
     const std::unordered_map<std::string, std::shared_ptr<AudioClipNode>>& clipNodes() const {
         return clipNodes_;
     }
+    // Instrument nodes keyed by MIDI track id (present even for tracks whose
+    // instrument failed to load, so the mixer can still find the track).
+    const std::unordered_map<std::string, std::shared_ptr<InstrumentNode>>&
+    instrumentNodes() const {
+        return instrumentNodes_;
+    }
     const std::unordered_map<std::string, std::vector<std::vector<float>>>& assetBuffers() const {
         return assetCache_.buffers;
     }
@@ -55,6 +68,13 @@ public:
     }
 
 private:
+    // Get-or-create the cached PluginInstance for a slot, restoring its saved
+    // state on first load. Returns nullptr if the slot names no plugin or the
+    // load failed. Shared by audio chains, MIDI chains, and instruments — one
+    // cache means one place that decides when a plugin gets reloaded.
+    std::shared_ptr<PluginInstance> instanceForSlot(const document::PluginSlot& slot,
+                                                    double sampleRate);
+
     struct AssetCache {
         std::unordered_map<std::string, std::vector<std::vector<float>>> buffers;
         std::unordered_map<std::string, double> sampleRates;
@@ -69,6 +89,7 @@ private:
     std::shared_ptr<GainNode> master_;
     std::unordered_map<std::string, std::shared_ptr<GainNode>> trackGains_;
     std::unordered_map<std::string, std::shared_ptr<AudioClipNode>> clipNodes_;
+    std::unordered_map<std::string, std::shared_ptr<InstrumentNode>> instrumentNodes_;
 };
 
 } // namespace dave::engine

@@ -61,6 +61,31 @@ bool drawCenteredEmptyState(const char* message, const char* detail,
         gui::theme::ButtonVariant::Primary);
 }
 
+// A panel header with a right-aligned text action. The button is placed back
+// on top of the header bar the theme just drew, so the affordance sits with
+// the title instead of spending a row of the panel's content.
+bool panelHeaderAction(const char* label, const char* actionLabel,
+                       const char* tooltip) {
+    constexpr float headerH = 26.0f;  // matches theme::panelHeader
+    const ImVec2 headerCursor = ImGui::GetCursorPos();
+    const float headerW = ImGui::GetContentRegionAvail().x;
+    gui::theme::panelHeader(label);
+    const ImVec2 afterHeader = ImGui::GetCursorPos();
+
+    const float buttonW = ImGui::CalcTextSize(actionLabel).x +
+                          ImGui::GetStyle().FramePadding.x * 2.0f;
+    const float buttonH = ImGui::GetTextLineHeight();
+    ImGui::SetCursorPos(
+        ImVec2(headerCursor.x + std::max(0.0f, headerW - buttonW - 8.0f),
+               headerCursor.y + (headerH - buttonH) * 0.5f));
+    const bool clicked = ImGui::SmallButton(actionLabel);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("%s", tooltip);
+    }
+    ImGui::SetCursorPos(afterHeader);
+    return clicked;
+}
+
 } // namespace
 
 DaveApp::~DaveApp() {
@@ -78,8 +103,14 @@ bool DaveApp::init() {
             std::string suffix = extension == std::string::npos ? "" : path.substr(extension);
             std::transform(suffix.begin(), suffix.end(), suffix.begin(),
                            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (suffix == ".mid" || suffix == ".midi") {
+                importMidiFile(path);
+                continue;
+            }
             if (suffix != ".wav") {
-                std::fprintf(stderr, "Dave: ignored dropped non-WAV file: %s\n", path.c_str());
+                std::fprintf(stderr,
+                             "Dave: ignored dropped file (not .wav/.mid): %s\n",
+                             path.c_str());
                 continue;
             }
             loadWavIntoNewTrack(path);
@@ -95,6 +126,7 @@ bool DaveApp::init() {
     platform::g_menuSave         = [this](){ saveProject(false); };
     platform::g_menuSaveAs       = [this](){ saveProject(true); };
     platform::g_menuLoadWav      = [this](){ openWavDialog(); };
+    platform::g_menuImportMidi   = [this](){ openMidiDialog(); };
     platform::g_menuLoadVideo    = [this](){ openVideoDialog(); };
     platform::g_menuImportMarkers= [this](){ importMarkersDialog(); };
     platform::g_menuExportMarkers= [this](){ exportMarkersDialog(); };
@@ -102,10 +134,16 @@ bool DaveApp::init() {
     platform::g_menuRedo         = [this](){ undo_.redo(); };
     platform::g_menuPlayStop     = [this](){ audio_.transport().toggle(); };
     platform::g_menuReturnToStart= [this](){ audio_.transport().seek(0); };
+    // The native item is always present; with no picture loaded there is
+    // nothing for it to move, so it does nothing rather than opening an
+    // empty window.
+    platform::g_menuToggleVideoWindow = [this](){
+        if (!edit_.videoTracks().empty()) setVideoPoppedOut(!videoPoppedOut_);
+    };
     platform::g_menuQuit         = [this](){ window_.close(); };
     platform::setupMacMenuBar();
 #endif
-    if (!audio_.start(48000.0, 2)) {
+    if (!audio_.start(static_cast<double>(edit_.sampleRate()), 2)) {
         std::fprintf(stderr, "Dave: audio engine failed to start\n");
     }
 
@@ -173,16 +211,31 @@ void DaveApp::handleShortcuts() {
         window_.close();
     } else if (ImGui::IsKeyPressed(ImGuiKey_T, false)) {
         // T = zoom in (Pro Tools convention).
-        view_.samplesPerPixel = std::max(4.0, view_.samplesPerPixel * 0.5);
+        gui::zoomAroundSample(view_, view_.samplesPerPixel * 0.5,
+                              audio_.transport().position());
     } else if (ImGui::IsKeyPressed(ImGuiKey_R, false)) {
         // R = zoom out.
-        view_.samplesPerPixel = std::min(50000.0, view_.samplesPerPixel * 2.0);
-    } else if (!ctrl && ImGui::IsKeyPressed(ImGuiKey_M, false)) {
-        // M / S toggle the selected track, the standard DAW binding. Guarded
-        // on !ctrl so they don't shadow Cmd+M (minimise) or Cmd+S (save).
+        gui::zoomAroundSample(view_, view_.samplesPerPixel * 2.0,
+                              audio_.transport().position());
+    } else if (!ctrl && ImGui::IsKeyPressed(ImGuiKey_L, false)) {
+        // L = loop on/off, over whatever range is current.
+        loopEnabled_ = !loopEnabled_;
+        syncTransportLoop();
+    } else if (!ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_M, false)) {
+        // Shift+M / Shift+S toggle the selected track. The modifier keeps the
+        // bare letters free and stops a stray keypress from silencing a track
+        // the user was only looking at. Guarded on !ctrl so they don't shadow
+        // Ctrl+Shift+S (Save As).
         toggleSelectedTrackMute();
-    } else if (!ctrl && ImGui::IsKeyPressed(ImGuiKey_S, false)) {
+    } else if (!ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_S, false)) {
         toggleSelectedTrackSolo();
+    } else if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_V, false)) {
+        // Pop the picture in or out of its own window. macOS reaches the same
+        // action through the native Window menu's Cmd+Shift+V. With no video
+        // loaded there is no picture to move, so the binding does nothing.
+        if (!edit_.videoTracks().empty()) {
+            setVideoPoppedOut(!videoPoppedOut_);
+        }
     }
 }
 
@@ -198,9 +251,25 @@ document::Track* DaveApp::selectedTrack() {
     return &edit_.tracksMut()[static_cast<size_t>(sel)];
 }
 
+// MIDI rows sit below the audio rows in one index space, so M and S have to
+// reach them too — a shortcut that works on some rows and silently does nothing
+// on others is worse than one that doesn't exist.
+document::MidiTrack* DaveApp::selectedMidiTrack() {
+    const int sel = view_.selectedTrackIndex;
+    const int audioCount = static_cast<int>(edit_.tracks().size());
+    const int midiIndex = sel - audioCount;
+    if (midiIndex < 0 || midiIndex >= static_cast<int>(edit_.midiTracks().size())) {
+        return nullptr;
+    }
+    return &edit_.midiTracksMut()[static_cast<size_t>(midiIndex)];
+}
+
 void DaveApp::toggleSelectedTrackMute() {
     if (document::Track* track = selectedTrack()) {
         track->mute = !track->mute;
+        edit_.notifyChanged();
+    } else if (document::MidiTrack* midi = selectedMidiTrack()) {
+        midi->mute = !midi->mute;
         edit_.notifyChanged();
     }
 }
@@ -209,13 +278,17 @@ void DaveApp::toggleSelectedTrackSolo() {
     if (document::Track* track = selectedTrack()) {
         track->solo = !track->solo;
         edit_.notifyChanged();
+    } else if (document::MidiTrack* midi = selectedMidiTrack()) {
+        midi->solo = !midi->solo;
+        edit_.notifyChanged();
     }
 }
 
 void DaveApp::setTimelineSamplesPerPixel(double samplesPerPixel) {
     // Screenshot fixtures need deterministic zoom without manufacturing input
     // events, while the same bounds remain in force as interactive zooming.
-    view_.samplesPerPixel = std::clamp(samplesPerPixel, 4.0, 50000.0);
+    gui::zoomAroundSample(view_, samplesPerPixel,
+                          audio_.transport().position());
 }
 
 void DaveApp::onEditChanged() {
@@ -229,12 +302,39 @@ void DaveApp::onEditChanged() {
     }
     audio_.setCompiledGraph(std::move(compiled));
 
-    // Sync the transport's loop region from the first active Loop marker (if
-    // any). Adding/moving/removing a loop region marker updates transport
-    // looping behavior immediately.
-    auto& transport = audio_.transport();
+    syncTransportLoop();
+}
+
+// The loop range, and whether the transport should honour it.
+//
+// A timeline selection wins over a Loop marker. Selecting a range and hitting
+// Loop is how the gesture is reached in every DAW, and requiring the user to
+// first convert that selection into a marker would make the marker an
+// obstacle rather than the persistent alternative it is. The marker remains
+// the way to keep a loop across sessions — it is in the document; a selection
+// is not.
+bool DaveApp::loopRange(int64_t& start, int64_t& end) const {
+    if (view_.hasSelection) {
+        const int64_t lo = std::min(view_.selectionStart, view_.selectionEnd);
+        const int64_t hi = std::max(view_.selectionStart, view_.selectionEnd);
+        if (hi > lo) { start = lo; end = hi; return true; }
+    }
     if (const auto* loop = edit_.activeLoopMarker()) {
-        transport.setLoop(loop->position, loop->position + loop->length);
+        if (loop->length > 0) {
+            start = loop->position;
+            end = loop->position + loop->length;
+            return true;
+        }
+    }
+    return false;
+}
+
+void DaveApp::syncTransportLoop() {
+    auto& transport = audio_.transport();
+    int64_t start = 0;
+    int64_t end = 0;
+    if (loopEnabled_ && loopRange(start, end)) {
+        transport.setLoop(start, end);
     } else {
         transport.clearLoop();
     }
@@ -325,6 +425,13 @@ void DaveApp::drawUI() {
     auto& transport = audio_.transport();
     const auto& pal = gui::theme::palette();
 
+    // Pop-out toggles land here, at the frame boundary, so the sidebar split
+    // and the picture window agree for the whole frame.
+    if (videoPopoutRequest_) {
+        videoPoppedOut_ = videoPopoutRequestValue_;
+        videoPopoutRequest_ = false;
+    }
+
     // ─── Window title ────────────────────────────────────────────────────
     {
         std::string title = "Dave";
@@ -369,10 +476,23 @@ void DaveApp::drawUI() {
     const float minVideoH = std::min(260.0f, splitContentH * 0.55f);
     const float minPluginsH = std::min(180.0f, splitContentH * 0.38f);
     const float maxVideoH = std::max(minVideoH, splitContentH - minPluginsH);
+    // Picture is opt-in. Until a video is imported there is nothing to show,
+    // so the sidebar is the plugin chain alone rather than a large empty
+    // panel advertising a workflow this session isn't using.
+    const bool hasVideo = !edit_.videoTracks().empty();
+    const bool videoDocked = hasVideo && !videoPoppedOut_;
+    // With the picture popped out or absent there is no split to maintain: the
+    // plugin chain takes the whole sidebar and videoShare_ is preserved
+    // untouched so the old proportions come back when the picture returns.
     const float videoPanelH =
-        std::clamp(splitContentH * videoShare_, minVideoH, maxVideoH);
-    const float pluginsH = splitContentH - videoPanelH;
-    videoShare_ = videoPanelH / splitContentH;
+        videoDocked
+            ? std::clamp(splitContentH * videoShare_, minVideoH, maxVideoH)
+            : 0.0f;
+    const float pluginsH =
+        videoDocked ? splitContentH - videoPanelH : contentH;
+    if (videoDocked) {
+        videoShare_ = videoPanelH / splitContentH;
+    }
 
     // Common flags for all docked panels — nothing can move or overlap.
     const ImGuiWindowFlags panelFlags =
@@ -392,6 +512,7 @@ void DaveApp::drawUI() {
             if (ImGui::MenuItem("Save As...", "Ctrl+Shift+S")) saveProject(true);
             ImGui::Separator();
             if (ImGui::MenuItem("Load WAV...", "Ctrl+O")) openWavDialog();
+            if (ImGui::MenuItem("Import MIDI...")) openMidiDialog();
             if (ImGui::MenuItem("Load Video...")) openVideoDialog();
             ImGui::Separator();
             if (ImGui::MenuItem("Import Markers (Reaper CSV)...")) importMarkersDialog();
@@ -415,9 +536,20 @@ void DaveApp::drawUI() {
             if (ImGui::MenuItem("Stop & Rewind")) { transport.stop(); transport.seek(0); }
             ImGui::EndMenu();
         }
+        if (ImGui::BeginMenu("Window")) {
+            if (ImGui::MenuItem("Mixer", "Ctrl+=", showMixer_))
+                showMixer_ = !showMixer_;
+            if (ImGui::MenuItem("Video Window", "Ctrl+Shift+V",
+                                videoPoppedOut_ && hasVideo, hasVideo))
+                setVideoPoppedOut(!videoPoppedOut_);
+            ImGui::EndMenu();
+        }
         if (ImGui::BeginMenu("Help")) {
             ImGui::TextDisabled("Dave — D.A.V.E.");
-            ImGui::TextDisabled("Scroll: pan | Ctrl+scroll: zoom | R-click clip: menu");
+            ImGui::TextDisabled(
+                "Scroll: pan | Cmd/Ctrl+scroll: zoom | R-click clip: menu");
+            ImGui::TextDisabled(
+                "Space: play/stop | L: loop | Shift+M / Shift+S: mute / solo");
             ImGui::EndMenu();
         }
         ImGui::EndMainMenuBar();
@@ -427,17 +559,49 @@ void DaveApp::drawUI() {
     // ─── Transport bar (full width, below menu) ──────────────────────────
     ImGui::SetNextWindowPos(ImVec2(baseX, baseY + menuH), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x, toolbarH), ImGuiCond_Always);
-    ImGui::Begin("Transport", nullptr, panelFlags);
+    // One row of 30 px controls inside a 48 px bar: the 14 px window padding
+    // the panels use would need 58 and ImGui answers that with a scrollbar.
+    // The vertical padding is derived from the two so the row is centred, and
+    // scrollbars are off outright — a fixed-height toolbar has nowhere to
+    // scroll to, so one appearing is always a layout bug rather than a
+    // feature.
+    const float kToolbarControlH = 30.0f;
+    ImGui::PushStyleVar(
+        ImGuiStyleVar_WindowPadding,
+        ImVec2(14.0f, std::max(0.0f, (toolbarH - kToolbarControlH) * 0.5f)));
+    ImGui::Begin("Transport", nullptr,
+                 panelFlags | ImGuiWindowFlags_NoScrollbar |
+                     ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::PopStyleVar();
     {
-        const float controlH = 30.0f;
+        const float controlH = kToolbarControlH;
+        // Every framed control derives its height from FramePadding, so one
+        // value here makes buttons, combos and the checkbox agree instead of
+        // each settling at whatever its own content implies.
+        ImGui::PushStyleVar(
+            ImGuiStyleVar_FramePadding,
+            ImVec2(10.0f,
+                   std::max(0.0f, (controlH - ImGui::GetFontSize()) * 0.5f)));
+        // Two gaps, used consistently: tight between a label and the control
+        // it names, wider between separate controls.
+        constexpr float kGap = 8.0f;
+        constexpr float kLabelGap = 6.0f;
+        constexpr float kComboW = 118.0f;
+        // Labels sit on the text baseline by default, which floats them to
+        // the top of a 30 px row.
+        auto label = [&](const char* text) {
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextColored(pal.textMuted, "%s", text);
+            ImGui::SameLine(0.0f, kLabelGap);
+        };
         auto groupSeparator = [&] {
-            ImGui::SameLine(0.0f, 10.0f);
+            ImGui::SameLine(0.0f, 12.0f);
             const ImVec2 lineTop = ImGui::GetCursorScreenPos();
             ImGui::Dummy(ImVec2(1.0f, controlH));
             ImGui::GetWindowDrawList()->AddLine(
                 lineTop, ImVec2(lineTop.x, lineTop.y + controlH),
                 ImGui::GetColorU32(pal.borderStrong));
-            ImGui::SameLine(0.0f, 10.0f);
+            ImGui::SameLine(0.0f, 12.0f);
         };
 
         const bool wasPlaying = transport.isPlaying();
@@ -452,12 +616,30 @@ void DaveApp::drawUI() {
             transport.toggle();
         }
 
-        ImGui::SameLine();
+        ImGui::SameLine(0.0f, kGap);
         if (gui::theme::iconButton(
                 "##transportRewind", gui::theme::TransportIcon::ReturnToStart,
                 "Stop and return to start (Return)", ImVec2(controlH, controlH))) {
             transport.stop();
             transport.seek(0);
+        }
+
+        ImGui::SameLine(0.0f, kGap);
+        {
+            int64_t loopLo = 0, loopHi = 0;
+            const bool haveRange = loopRange(loopLo, loopHi);
+            const char* loopTip = haveRange
+                ? "Loop playback over the selection (L)"
+                : "Loop playback (L) — select a range, or add a loop marker, "
+                  "to give it something to loop";
+            if (gui::theme::iconButton(
+                    "##transportLoop", gui::theme::TransportIcon::Loop,
+                    loopTip, ImVec2(controlH, controlH),
+                    loopEnabled_ ? gui::theme::ButtonVariant::Primary
+                                 : gui::theme::ButtonVariant::Normal)) {
+                loopEnabled_ = !loopEnabled_;
+                syncTransportLoop();
+            }
         }
         groupSeparator();
 
@@ -506,7 +688,7 @@ void DaveApp::drawUI() {
                                  ImGuiInputTextFlags_EnterReturnsTrue)) {
                 // Parse the timecode back to samples based on the current mode.
                 int64_t target = -1;
-                double sr = 48000.0;
+                double sr = static_cast<double>(edit_.sampleRate());
                 switch (view_.tcMode) {
                     case gui::TimecodeMode::MinSec: {
                         int mm; double ss;
@@ -551,8 +733,8 @@ void DaveApp::drawUI() {
             if (ImGui::IsKeyPressed(ImGuiKey_Escape))
                 view_.editingPosition = false;
         }
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(108.0f);
+        ImGui::SameLine(0.0f, kGap);
+        ImGui::SetNextItemWidth(kComboW);
         if (ImGui::Combo("##tcmode", &tcIdx, tcModes, 5)) {
             view_.tcMode = static_cast<gui::TimecodeMode>(tcIdx);
         }
@@ -561,12 +743,56 @@ void DaveApp::drawUI() {
         if (ImGui::Button("+Track", ImVec2(76.0f, controlH)))
             undo_.execute(std::make_unique<editing::AddTrackCommand>("Track"));
 
-        ImGui::SameLine();
+        ImGui::SameLine(0.0f, kGap);
         ImGui::Checkbox("Snap", &view_.snapToMarkers);
         groupSeparator();
 
-        ImGui::TextColored(pal.textMuted, "Output");
-        ImGui::SameLine();
+        // ─── Session format ──────────────────────────────────────────────
+        label("Session");
+        static constexpr int kRates[] = {44100, 48000, 88200, 96000,
+                                         176400, 192000};
+        static const char* kRateLabels[] = {"44.1 kHz", "48 kHz", "88.2 kHz",
+                                            "96 kHz", "176.4 kHz", "192 kHz"};
+        int rateIdx = 1;
+        for (int i = 0; i < IM_ARRAYSIZE(kRates); ++i) {
+            if (kRates[i] == edit_.sampleRate()) rateIdx = i;
+        }
+        ImGui::SetNextItemWidth(kComboW);
+        if (ImGui::Combo("##sessionRate", &rateIdx, kRateLabels,
+                         IM_ARRAYSIZE(kRateLabels))) {
+            edit_.setSampleRate(kRates[rateIdx]);
+            applySessionSampleRate();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Session sample rate — reopens the output device.\n"
+                "Clip positions are stored as samples and are not converted, "
+                "so material recorded at another rate plays at the wrong "
+                "speed. Set this before recording.");
+        }
+
+        ImGui::SameLine(0.0f, kGap);
+        static constexpr int kDepths[] = {16, 24, 32};
+        static const char* kDepthLabels[] = {"16-bit", "24-bit",
+                                             "32-bit float"};
+        int depthIdx = 1;
+        for (int i = 0; i < IM_ARRAYSIZE(kDepths); ++i) {
+            if (kDepths[i] == edit_.bitDepth()) depthIdx = i;
+        }
+        ImGui::SetNextItemWidth(kComboW);
+        if (ImGui::Combo("##sessionDepth", &depthIdx, kDepthLabels,
+                         IM_ARRAYSIZE(kDepthLabels))) {
+            edit_.setBitDepth(kDepths[depthIdx]);
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Bit depth for files this session writes.\n"
+                "Stored with the project; nothing renders yet, so it has no "
+                "effect on playback.");
+        }
+        groupSeparator();
+
+        label("Output");
         static int selectedDevice = -1;
         static std::vector<std::string> devices;
         static bool listed = false;
@@ -588,18 +814,34 @@ void DaveApp::drawUI() {
                 bool sel = (i == selectedDevice);
                 if (ImGui::Selectable(labels[i], &sel)) {
                     selectedDevice = i;
-                    audio_.selectDevice(i);
+                    // Open the new device at the session's rate, not the
+                    // default — switching outputs must not silently retune
+                    // the session.
+                    audio_.selectDevice(
+                        i, static_cast<double>(edit_.sampleRate()), 2);
                 }
                 if (sel) ImGui::SetItemDefaultFocus();
             }
             ImGui::EndCombo();
         }
+        ImGui::PopStyleVar();   // FramePadding
     }
     ImGui::End();
 
-    // ─── Timeline (left, fills remaining width) ──────────────────────────
+    // ─── Timeline + mixer (left column, split horizontally) ──────────────
+    // The mixer takes the bottom of the timeline column rather than a slot in
+    // the sidebar: strips sit side by side, so the panel needs width, and the
+    // sidebar is a ~360px inspector column.
+    const float minMixerH = 190.0f;
+    const float maxMixerH = std::max(minMixerH, contentH - 200.0f);
+    const float mixerH = showMixer_
+        ? std::clamp(mixerHeight_, minMixerH, maxMixerH) : 0.0f;
+    if (showMixer_) mixerHeight_ = mixerH;
+    const float timelineH =
+        showMixer_ ? std::max(1.0f, contentH - mixerH - splitterSize) : contentH;
+
     ImGui::SetNextWindowPos(ImVec2(baseX, contentY), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(timelineW, contentH), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(timelineW, timelineH), ImGuiCond_Always);
     ImGui::Begin("Timeline", nullptr, panelFlags);
     gui::theme::panelHeader("Timeline");
     // Taller windows can afford more waveform detail; the gutter itself
@@ -615,17 +857,51 @@ void DaveApp::drawUI() {
         trackRowHeight);
     ImGui::End();
 
+    // ─── Mixer (bottom of the timeline column) ───────────────────────────
+    if (showMixer_) {
+        const float mixerY = contentY + timelineH + splitterSize;
+        ImGui::SetNextWindowPos(ImVec2(baseX, mixerY), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(timelineW, mixerH), ImGuiCond_Always);
+        ImGui::Begin("Mixer", nullptr, panelFlags);
+        if (panelHeaderAction("Mixer", "Hide",
+                              "Hide the mixer (View > Mixer to bring it back)")) {
+            showMixer_ = false;
+        }
+        gui::drawMixer(edit_, undo_, view_);
+        ImGui::End();
+    }
+    // Both the timeline and the mixer can ask for a picker or an editor, so
+    // the requests are serviced once, after both have drawn.
+    serviceViewRequests();
+    // The loop follows the live selection, which the timeline has just
+    // finished updating — so this runs every frame rather than only on
+    // document changes. Dragging a new range while looping re-points the loop
+    // at it without a second gesture.
+    syncTransportLoop();
+
     // Picture stays above the plugin chain because sync-to-picture is the
-    // primary post-production task.
-    ImGui::SetNextWindowPos(ImVec2(sidebarX, contentY), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(sidebarW, videoPanelH), ImGuiCond_Always);
-    ImGui::Begin("Video", nullptr, panelFlags);
-    gui::theme::panelHeader("Video");
-    drawVideoPreviewContent();
-    ImGui::End();
+    // primary post-production task — unless it has been popped out or never
+    // imported, in which case the sidebar slot disappears entirely rather
+    // than leaving a hole.
+    if (videoDocked) {
+        videoPanelPos_ = ImVec2(sidebarX, contentY);
+        videoPanelSize_ = ImVec2(sidebarW, videoPanelH);
+        ImGui::SetNextWindowPos(videoPanelPos_, ImGuiCond_Always);
+        ImGui::SetNextWindowSize(videoPanelSize_, ImGuiCond_Always);
+        ImGui::Begin("Video", nullptr, panelFlags);
+        if (panelHeaderAction("Video", "Pop Out",
+                              "Detach the picture into its own window "
+                              "(drag it to another display)")) {
+            setVideoPoppedOut(true);
+        }
+        drawVideoPreviewContent();
+        ImGui::End();
+    }
 
     ImGui::SetNextWindowPos(
-        ImVec2(sidebarX, contentY + videoPanelH + splitterSize),
+        ImVec2(sidebarX,
+               videoDocked ? contentY + videoPanelH + splitterSize
+                           : contentY),
         ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(sidebarW, pluginsH), ImGuiCond_Always);
     ImGui::Begin("Plugins", nullptr, panelFlags);
@@ -667,33 +943,71 @@ void DaveApp::drawUI() {
             ? pal.accent : pal.borderStrong), 1.0f);
     ImGui::End();
 
-    ImGui::SetNextWindowPos(
-        ImVec2(sidebarX, contentY + videoPanelH), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(
-        ImVec2(sidebarW, splitterSize), ImGuiCond_Always);
-    ImGui::Begin("##videoPluginsSplitter", nullptr, splitterFlags);
-    const ImVec2 panelSplitterOrigin = ImGui::GetCursorScreenPos();
-    ImGui::InvisibleButton(
-        "##dragVideoPlugins", ImVec2(sidebarW, splitterSize));
-    const bool panelSplitterHovered =
-        ImGui::IsItemHovered() || ImGui::IsItemActive();
-    if (panelSplitterHovered) {
-        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+    // Drag the timeline/mixer split. Absent when the mixer is hidden — there
+    // is nothing to size.
+    if (showMixer_) {
+        ImGui::SetNextWindowPos(
+            ImVec2(baseX, contentY + timelineH), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(
+            ImVec2(timelineW, splitterSize), ImGuiCond_Always);
+        ImGui::Begin("##timelineMixerSplitter", nullptr, splitterFlags);
+        const ImVec2 mixerSplitterOrigin = ImGui::GetCursorScreenPos();
+        ImGui::InvisibleButton(
+            "##dragTimelineMixer", ImVec2(timelineW, splitterSize));
+        const bool mixerSplitterHovered =
+            ImGui::IsItemHovered() || ImGui::IsItemActive();
+        if (mixerSplitterHovered) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+        }
+        if (ImGui::IsItemActive()) {
+            mixerHeight_ = std::clamp(
+                mixerHeight_ - ImGui::GetIO().MouseDelta.y,
+                minMixerH, maxMixerH);
+        }
+        ImGui::GetWindowDrawList()->AddLine(
+            ImVec2(mixerSplitterOrigin.x,
+                   mixerSplitterOrigin.y + splitterSize * 0.5f),
+            ImVec2(mixerSplitterOrigin.x + timelineW,
+                   mixerSplitterOrigin.y + splitterSize * 0.5f),
+            ImGui::GetColorU32(mixerSplitterHovered
+                ? pal.accent : pal.borderStrong), 1.0f);
+        ImGui::End();
     }
-    if (ImGui::IsItemActive()) {
-        videoShare_ = std::clamp(
-            (videoPanelH + ImGui::GetIO().MouseDelta.y) / splitContentH,
-            minVideoH / splitContentH, maxVideoH / splitContentH);
+
+    // No picture in the sidebar means no split to drag.
+    if (videoDocked) {
+        ImGui::SetNextWindowPos(
+            ImVec2(sidebarX, contentY + videoPanelH), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(
+            ImVec2(sidebarW, splitterSize), ImGuiCond_Always);
+        ImGui::Begin("##videoPluginsSplitter", nullptr, splitterFlags);
+        const ImVec2 panelSplitterOrigin = ImGui::GetCursorScreenPos();
+        ImGui::InvisibleButton(
+            "##dragVideoPlugins", ImVec2(sidebarW, splitterSize));
+        const bool panelSplitterHovered =
+            ImGui::IsItemHovered() || ImGui::IsItemActive();
+        if (panelSplitterHovered) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+        }
+        if (ImGui::IsItemActive()) {
+            videoShare_ = std::clamp(
+                (videoPanelH + ImGui::GetIO().MouseDelta.y) / splitContentH,
+                minVideoH / splitContentH, maxVideoH / splitContentH);
+        }
+        ImGui::GetWindowDrawList()->AddLine(
+            ImVec2(panelSplitterOrigin.x,
+                   panelSplitterOrigin.y + splitterSize * 0.5f),
+            ImVec2(panelSplitterOrigin.x + sidebarW,
+                   panelSplitterOrigin.y + splitterSize * 0.5f),
+            ImGui::GetColorU32(panelSplitterHovered
+                ? pal.accent : pal.borderStrong), 1.0f);
+        ImGui::End();
     }
-    ImGui::GetWindowDrawList()->AddLine(
-        ImVec2(panelSplitterOrigin.x,
-               panelSplitterOrigin.y + splitterSize * 0.5f),
-        ImVec2(panelSplitterOrigin.x + sidebarW,
-               panelSplitterOrigin.y + splitterSize * 0.5f),
-        ImGui::GetColorU32(panelSplitterHovered
-            ? pal.accent : pal.borderStrong), 1.0f);
-    ImGui::End();
     ImGui::PopStyleVar(2);
+
+    // The detached picture, drawn after the panels so it stacks above them
+    // while it is still merged into the main window.
+    drawVideoPopoutWindow();
 
     // Modals (browser) still float — they're temporary popups, not panels.
     drawPluginBrowser();
@@ -723,6 +1037,74 @@ void DaveApp::openWavDialog() {
         NFD_FreePath(outPath);
         loadWavIntoEdit(p);
     }
+}
+
+void DaveApp::openMidiDialog() {
+    nfdnchar_t* outPath = nullptr;
+    nfdnfilteritem_t filter{"MIDI file", "mid,midi"};
+    if (NFD_OpenDialog(&outPath, &filter, 1, nullptr) == NFD_OKAY && outPath) {
+        std::string p = outPath;
+        NFD_FreePath(outPath);
+        importMidiFile(p);
+    }
+}
+
+bool DaveApp::importMidiFile(const std::string& path) {
+    // Notes are baked to samples against the session rate and stay that way;
+    // the file's tick-domain provenance rides along on each clip for a future
+    // tempo map.
+    const auto smf = engine::midi::readSmf(path, edit_.sampleRate());
+    if (!smf.ok) {
+        std::fprintf(stderr, "Dave: MIDI import failed (%s): %s\n",
+                     path.c_str(), smf.error.c_str());
+        return false;
+    }
+
+    const size_t slash = path.find_last_of("/\\");
+    const std::string fileName =
+        slash == std::string::npos ? path : path.substr(slash + 1);
+
+    // One Dave track per non-empty SMF track. Empty ones are almost always the
+    // conductor track (tempo and time signature only) — importing them would
+    // add a row that can never make a sound.
+    std::vector<document::MidiTrack> tracks;
+    int index = 0;
+    for (const auto& st : smf.tracks) {
+        ++index;
+        if (st.notes.empty()) continue;
+
+        document::MidiTrack mt;
+        mt.name = !st.name.empty() ? st.name
+                                   : (fileName + " " + std::to_string(index));
+        document::MidiClip clip;
+        clip.name = mt.name;
+        clip.timelineStart = 0;
+        clip.sourceOffset = 0;
+        clip.length = st.lengthSamples;
+        clip.notes = st.notes;
+        clip.sourcePath = path;
+        clip.sourcePpq = smf.ppq;
+        clip.sourceTempi = smf.tempi;
+        mt.clips.push_back(std::move(clip));
+        tracks.push_back(std::move(mt));
+    }
+
+    if (tracks.empty()) {
+        std::fprintf(stderr, "Dave: %s has no notes to import\n", path.c_str());
+        return false;
+    }
+
+    const size_t firstNew = edit_.midiTracks().size();
+    undo_.execute(std::make_unique<editing::ImportMidiFileCommand>(
+        std::move(tracks), fileName));
+    // Select the first imported row so the instrument picker in the gutter is
+    // the obvious next step rather than something to go hunting for.
+    view_.selectedTrackIndex =
+        static_cast<int>(edit_.tracks().size() + firstNew);
+    std::fprintf(stderr, "Dave: imported %s (%zu track%s)\n", fileName.c_str(),
+                 edit_.midiTracks().size() - firstNew,
+                 (edit_.midiTracks().size() - firstNew) == 1 ? "" : "s");
+    return true;
 }
 
 void DaveApp::importMarkersDialog() {
@@ -896,7 +1278,8 @@ void DaveApp::openVideoDialog() {
         }
         edit_.addVideoClip(edit_.videoTracks().front().id, std::move(clip));
         videoDecoder_.close();
-        lastDecodedFrameIndex_ = -1;
+        lastRequestedFrameIndex_ = -1;
+        lastUploadedFrameIndex_ = -1;
     }
 }
 
@@ -906,7 +1289,8 @@ void DaveApp::newProject() {
     edit_.clearVideoTracks_();
     builder_ = {};
     videoDecoder_.close();
-    lastDecodedFrameIndex_ = -1;
+    lastRequestedFrameIndex_ = -1;
+    lastUploadedFrameIndex_ = -1;
     projectPath_.clear();
     dirty_ = false;
     undo_.clear();
@@ -915,6 +1299,23 @@ void DaveApp::newProject() {
     edit_.addMarkerTrack("Markers");
     audio_.transport().stop();
     audio_.transport().seek(0);
+}
+
+// Reopen the output device at the session rate and re-derive the graph
+// against it. Called when the rate changes and after loading a project that
+// carries a different one — otherwise the engine keeps running at the old
+// rate and everything plays back detuned.
+void DaveApp::applySessionSampleRate() {
+    const double rate = static_cast<double>(edit_.sampleRate());
+    if (audio_.sampleRate() == rate) return;
+    if (!audio_.selectDevice(audio_.currentDeviceIndex(), rate, 2)) {
+        std::fprintf(stderr,
+                     "Dave: could not open the output device at %.0f Hz; "
+                     "the engine is still running at %.0f Hz\n",
+                     rate, audio_.sampleRate());
+        return;
+    }
+    onEditChanged();   // recompile the graph against the new rate
 }
 
 void DaveApp::openProjectDialog() {
@@ -933,10 +1334,12 @@ void DaveApp::openProjectDialog() {
         }
         builder_ = {};  // force re-derive with fresh plugin instances
         videoDecoder_.close();
-        lastDecodedFrameIndex_ = -1;
+        lastRequestedFrameIndex_ = -1;
+        lastUploadedFrameIndex_ = -1;
         projectPath_ = path;
         dirty_ = false;
         undo_.clear();
+        applySessionSampleRate();   // the project may carry a different rate
         onEditChanged();  // rebuild graph for the loaded Edit
         view_.selectedTrackIndex = edit_.tracks().empty() ? -1 : 0;
         std::fprintf(stderr, "Dave: opened %s\n", path.c_str());
@@ -977,6 +1380,91 @@ void DaveApp::saveProject(bool saveAs) {
 
 void DaveApp::drawVideoPreview() { drawVideoPreviewContent(); }
 
+// Public/menu entry point: requests the toggle, which drawUI applies on the
+// next frame boundary. Safe to call from the native menu bar, which fires
+// during event polling rather than inside an ImGui frame.
+void DaveApp::setVideoPoppedOut(bool poppedOut) {
+    videoPopoutRequest_ = true;
+    videoPopoutRequestValue_ = poppedOut;
+}
+
+void DaveApp::drawVideoPopoutWindow() {
+    // No picture means no picture window — including when a project that had
+    // one is closed while it is popped out. videoPoppedOut_ survives so the
+    // window comes back where the user put it on the next import.
+    if (!videoPoppedOut_ || edit_.videoTracks().empty()) {
+        return;
+    }
+
+    // FirstUseEver, not Always: a window the user has already placed (this
+    // session or a previous one, via imgui.ini) reopens where they left it —
+    // the whole point being that the picture monitor stays put. Only a window
+    // that has never been positioned gets seeded over the panel it left, so
+    // the first pop-out reads as the picture lifting out of the layout.
+    const ImGuiViewport* mainVp = ImGui::GetMainViewport();
+    const ImVec2 seedSize(std::max(videoPanelSize_.x, 560.0f),
+                          std::max(videoPanelSize_.y, 360.0f));
+    ImVec2 seedPos = (videoPanelSize_.x > 0.0f)
+        ? videoPanelPos_
+        : ImVec2(mainVp->Pos.x + 120.0f, mainVp->Pos.y + 120.0f);
+    // The picture panel hugs the right edge, so a window seeded at its corner
+    // would hang off the app — and possibly off the display. Keep the whole
+    // thing over the main window; the user drags it out from there.
+    seedPos.x = std::clamp(
+        seedPos.x, mainVp->Pos.x + 16.0f,
+        std::max(mainVp->Pos.x + 16.0f,
+                 mainVp->Pos.x + mainVp->Size.x - seedSize.x - 16.0f));
+    seedPos.y = std::clamp(
+        seedPos.y, mainVp->Pos.y + 16.0f,
+        std::max(mainVp->Pos.y + 16.0f,
+                 mainVp->Pos.y + mainVp->Size.y - seedSize.y - 16.0f));
+    ImGui::SetNextWindowPos(seedPos, ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(seedSize, ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(240.0f, 180.0f),
+                                        ImVec2(FLT_MAX, FLT_MAX));
+
+    // NoAutoMerge is what makes "pop out" mean what it says: the picture gets
+    // a real OS window immediately and keeps it, instead of ImGui folding it
+    // back into the main window whenever it happens to be dragged over it.
+    // That window can then go anywhere the window manager allows, second
+    // display included.
+    ImGuiWindowClass popoutClass;
+    popoutClass.ViewportFlagsOverrideSet = ImGuiViewportFlags_NoAutoMerge;
+    ImGui::SetNextWindowClass(&popoutClass);
+
+    // The platform window is opaque, so rounded corners would leave unpainted
+    // pixels at its edges.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+
+    bool open = true;
+    if (ImGui::Begin("Video###videoPopout", &open,
+                     ImGuiWindowFlags_NoDocking |
+                     ImGuiWindowFlags_NoCollapse)) {
+        // Right-aligned to mirror the docked panel's header action.
+        const float buttonW = ImGui::CalcTextSize("Pop In").x +
+                              ImGui::GetStyle().FramePadding.x * 2.0f;
+        ImGui::SetCursorPosX(
+            ImGui::GetCursorPosX() +
+            std::max(0.0f, ImGui::GetContentRegionAvail().x - buttonW));
+        if (ImGui::SmallButton("Pop In")) {
+            setVideoPoppedOut(false);
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Return the picture to the sidebar");
+        }
+
+        drawVideoPreviewContent();
+    }
+    ImGui::End();
+    ImGui::PopStyleVar();
+
+    // The title-bar close button means "put it back", not "hide the picture" —
+    // there is nowhere else for it to live.
+    if (!open) {
+        setVideoPoppedOut(false);
+    }
+}
+
 void DaveApp::drawVideoPreviewContent() {
     int64_t playhead = audio_.transport().position();
     const auto* clip = edit_.videoClipAt(playhead);
@@ -996,7 +1484,7 @@ void DaveApp::drawVideoPreviewContent() {
     if (ImGui::SmallButton("Add Video...")) openVideoDialog();
     ImGui::TextDisabled("%dx%d @ %.3ffps", clip->width, clip->height, clip->fps);
 
-    const double audioSr = 48000.0;
+    const double audioSr = static_cast<double>(edit_.sampleRate());
     int64_t relSamples = (playhead - clip->timelineStart) + clip->sourceOffset;
     double videoTimeSec = (relSamples > 0) ? (relSamples / audioSr) : 0.0;
     double clipDurationSec = (clip->length > 0)
@@ -1007,23 +1495,31 @@ void DaveApp::drawVideoPreviewContent() {
 
     // If the active clip changed, reset state.
     if (lastVideoClipId_ != clip->id) {
-        lastDecodedFrameIndex_ = -1;
+        lastRequestedFrameIndex_ = -1;
+        lastUploadedFrameIndex_ = -1;
         lastVideoClipId_ = clip->id;
     }
 
-    // Request a frame from the async decoder if the frame index changed
-    // and the decoder isn't already busy with a request.
-    if (inRange && frameIndex != lastDecodedFrameIndex_ && !asyncDecoder_.isBusy()) {
+    // Request a frame from the async decoder if the playhead's frame differs
+    // from what we last asked for and the decoder is free. During playback the
+    // playhead outruns the decoder, so each finished decode immediately
+    // triggers a request for the current frame.
+    if (inRange && frameIndex != lastRequestedFrameIndex_ && !asyncDecoder_.isBusy()) {
         const int previewMaxW = 480;
         int pw = clip->width, ph = clip->height;
         if (pw > previewMaxW) { ph = ph * previewMaxW / pw; pw = previewMaxW; }
         double seekTo = static_cast<double>(frameIndex) / clip->fps;
         asyncDecoder_.requestFrame(clip->path, seekTo, pw, ph, clip->fps);
+        lastRequestedFrameIndex_ = frameIndex;
     }
 
-    // Check if the async decoder has a new frame ready.
+    // Upload whatever the decoder finished most recently, even if the playhead
+    // has since moved on — audio is master and video chases it. Requiring an
+    // exact frame match here made playback freeze: every decode arrived a few
+    // frames late and was discarded, so the picture only updated on stop.
     engine::VideoFrame frame;
-    if (asyncDecoder_.getLatestFrame(frame) && frame.frameIndex == frameIndex) {
+    if (asyncDecoder_.getLatestFrame(frame) &&
+        frame.frameIndex != lastUploadedFrameIndex_) {
         int pw = frame.width;
         int ph = frame.height;
         if (videoTexture_ == 0 || videoTexW_ != pw || videoTexH_ != ph) {
@@ -1042,7 +1538,7 @@ void DaveApp::drawVideoPreviewContent() {
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, pw, ph, 0,
                      GL_RGBA, GL_UNSIGNED_BYTE, frame.rgba.data());
         glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-        lastDecodedFrameIndex_ = frameIndex;
+        lastUploadedFrameIndex_ = frame.frameIndex;
     }
 
     if (videoTexture_ != 0 && videoTexW_ > 0 && videoTexH_ > 0) {
@@ -1072,10 +1568,82 @@ void DaveApp::drawVideoPreviewContent() {
 
 void DaveApp::drawPluginsPanel() { drawPluginsPanelContent(); }
 
+void DaveApp::drawMidiTrackPanel(const document::MidiTrack& track) {
+    ImGui::Text("MIDI Track: %s", track.name.c_str());
+    ImGui::Separator();
+
+    // Instrument first: the effect chain below it is meaningless until
+    // something is generating audio to run through it.
+    ImGui::TextUnformatted("Instrument");
+    if (track.instrument.uidString.empty()) {
+        if (ImGui::Button("Choose Instrument...")) {
+            openPluginBrowser(BrowserMode::MidiInstrument, track.id);
+        }
+    } else {
+        ImGui::Text("%s", track.instrument.name.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Edit##instrument")) {
+            openPluginEditor(track.instrument);
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Replace##instrument")) {
+            openPluginBrowser(BrowserMode::MidiInstrument, track.id);
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Clear##instrument")) {
+            editors_.erase(track.instrument.id);
+            undo_.execute(std::make_unique<editing::SetMidiInstrumentCommand>(
+                track.id, document::PluginSlot{}));
+            return;   // `track` may be reallocated by the command
+        }
+    }
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Effects");
+    std::string removeSlotId;
+    int slotIdx = 0;
+    for (const auto& slot : track.plugins) {
+        ImGui::PushID(slotIdx);
+        bool bypass = slot.bypass;
+        if (ImGui::Checkbox("##bypass", &bypass)) {
+            const_cast<document::PluginSlot&>(slot).bypass = bypass;
+            edit_.notifyChanged();
+        }
+        ImGui::SameLine();
+        if (slot.bypass) ImGui::TextDisabled("%s", slot.name.c_str());
+        else             ImGui::Text("%s", slot.name.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Edit")) openPluginEditor(slot);
+        ImGui::SameLine();
+        // Defer the mutation until the range-for completes; removing in place
+        // invalidates the current slot reference.
+        if (ImGui::SmallButton("Remove")) removeSlotId = slot.id;
+        ImGui::PopID();
+        ++slotIdx;
+    }
+    if (!removeSlotId.empty()) {
+        undo_.execute(std::make_unique<editing::RemoveMidiPluginCommand>(
+            track.id, removeSlotId));
+        editors_.erase(removeSlotId);
+        return;
+    }
+    if (ImGui::Button("Add Plugin")) {
+        openPluginBrowser(BrowserMode::MidiFx, track.id);
+    }
+}
+
 void DaveApp::drawPluginsPanelContent() {
     // Operate on the currently-selected track (selectedTrackIndex in the view).
+    // The index spans both bands: audio rows first, then MIDI rows, which is
+    // the order they're drawn in on the timeline.
     int sel = view_.selectedTrackIndex;
-    if (sel < 0 || sel >= static_cast<int>(edit_.tracks().size())) {
+    const int audioCount = static_cast<int>(edit_.tracks().size());
+    const int midiCount = static_cast<int>(edit_.midiTracks().size());
+    if (sel >= audioCount && sel < audioCount + midiCount) {
+        drawMidiTrackPanel(edit_.midiTracks()[sel - audioCount]);
+        return;
+    }
+    if (sel < 0 || sel >= audioCount) {
         if (edit_.tracks().empty()) {
             if (drawCenteredEmptyState(
                     "No track selected",
@@ -1107,8 +1675,7 @@ void DaveApp::drawPluginsPanelContent() {
             if (pluginHost_.descriptors().empty()) {
                 pluginHost_.scan();
             }
-            browserTargetTrackId_ = track.id;
-            showPluginBrowser_ = true;
+            openPluginBrowser(BrowserMode::AudioFx, track.id);
         }
         return;
     }
@@ -1128,16 +1695,7 @@ void DaveApp::drawPluginsPanelContent() {
         else             ImGui::Text("%s", slot.name.c_str());
         ImGui::SameLine();
         if (ImGui::SmallButton("Edit")) {
-            // Open (or focus) the plugin's editor window. The PluginInstance is
-            // owned by GraphBuilder, keyed by slot id — we look it up there.
-            auto inst = builder_.pluginInstance(slot.id);
-            if (inst) {
-                auto& ed = editors_[slot.id];
-                if (!ed) ed = std::make_unique<engine::PluginEditor>();
-                if (!ed->isOpen()) {
-                    ed->open(*inst, slot.name);
-                }
-            }
+            openPluginEditor(slot);
         }
         ImGui::SameLine();
         if (ImGui::SmallButton("Remove")) {
@@ -1156,30 +1714,103 @@ void DaveApp::drawPluginsPanelContent() {
 
     ImGui::Separator();
     if (ImGui::Button("Add Plugin")) {
-        // Scan if not already done, then open the browser targeting this track.
-        if (pluginHost_.descriptors().empty()) {
-            pluginHost_.scan();
-        }
-        browserTargetTrackId_ = track.id;
-        showPluginBrowser_ = true;
+        openPluginBrowser(BrowserMode::AudioFx, track.id);
     }
 
 
 }
 
+void DaveApp::openPluginBrowser(BrowserMode mode, std::string trackId) {
+    if (pluginHost_.descriptors().empty()) {
+        pluginHost_.scan();
+    }
+    browserMode_ = mode;
+    browserTargetTrackId_ = std::move(trackId);
+    showPluginBrowser_ = true;
+}
+
+const document::PluginSlot* DaveApp::findSlot(const std::string& slotId) const {
+    if (slotId.empty()) return nullptr;
+    for (const auto& t : edit_.tracks()) {
+        for (const auto& s : t.plugins) {
+            if (s.id == slotId) return &s;
+        }
+    }
+    for (const auto& mt : edit_.midiTracks()) {
+        if (mt.instrument.id == slotId) return &mt.instrument;
+        for (const auto& s : mt.plugins) {
+            if (s.id == slotId) return &s;
+        }
+    }
+    return nullptr;
+}
+
+void DaveApp::serviceViewRequests() {
+    if (view_.requestPicker != gui::TimelineViewState::PluginPicker::None) {
+        BrowserMode mode = BrowserMode::AudioFx;
+        switch (view_.requestPicker) {
+            case gui::TimelineViewState::PluginPicker::MidiInstrument:
+                mode = BrowserMode::MidiInstrument; break;
+            case gui::TimelineViewState::PluginPicker::MidiFx:
+                mode = BrowserMode::MidiFx; break;
+            case gui::TimelineViewState::PluginPicker::AudioFx:
+            case gui::TimelineViewState::PluginPicker::None:
+                mode = BrowserMode::AudioFx; break;
+        }
+        openPluginBrowser(mode, view_.requestPickerTrackId);
+        view_.requestPicker = gui::TimelineViewState::PluginPicker::None;
+        view_.requestPickerTrackId.clear();
+    }
+    if (!view_.requestPluginEditorSlotId.empty()) {
+        if (const auto* slot = findSlot(view_.requestPluginEditorSlotId)) {
+            openPluginEditor(*slot);
+        }
+        view_.requestPluginEditorSlotId.clear();
+    }
+}
+
+void DaveApp::openPluginEditor(const document::PluginSlot& slot) {
+    // The PluginInstance is owned by GraphBuilder, keyed by slot id — the
+    // document only stores what to load, not the loaded thing.
+    auto inst = builder_.pluginInstance(slot.id);
+    if (!inst) return;
+    auto& ed = editors_[slot.id];
+    if (!ed) ed = std::make_unique<engine::PluginEditor>();
+    if (!ed->isOpen()) ed->open(*inst, slot.name);
+}
+
 void DaveApp::drawPluginBrowser() {
     if (!showPluginBrowser_) return;
+
+    const bool instrumentsOnly = browserMode_ == BrowserMode::MidiInstrument;
+    const char* title = instrumentsOnly ? "Choose Instrument###pluginBrowser"
+                                        : "Add Plugin###pluginBrowser";
 
     ImGui::SetNextWindowSize(ImVec2(500, 360), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_FirstUseEver,
                             ImVec2(0.5f, 0.5f));
-    if (ImGui::Begin("Add Plugin", &showPluginBrowser_,
+    if (ImGui::Begin(title, &showPluginBrowser_,
                      ImGuiWindowFlags_NoDocking)) {
-        ImGui::Text("Available VST3 plugins");
+        // Count what the mode will actually offer, not what was scanned: "312
+        // found" above a list of four synths is a worse answer than "4".
+        size_t shown = 0;
+        for (const auto& d : pluginHost_.descriptors()) {
+            if (!instrumentsOnly || d.isInstrument) ++shown;
+        }
+        ImGui::Text("%s", instrumentsOnly ? "Available VST3 instruments"
+                                          : "Available VST3 plugins");
         ImGui::SameLine();
-        ImGui::TextDisabled("(%zu found)", pluginHost_.descriptors().size());
+        ImGui::TextDisabled("(%zu found)", shown);
         ImGui::InputText("##filter", browserFilter_, sizeof(browserFilter_));
         ImGui::Separator();
+
+        if (shown == 0 && instrumentsOnly) {
+            ImGui::TextWrapped(
+                "No VST3 instruments found. Dave scanned %zu plugins, all of "
+                "them effects. Install a synth in "
+                "/Library/Audio/Plug-Ins/VST3 and reopen this window.",
+                pluginHost_.descriptors().size());
+        }
 
         // List plugins; clicking one adds it to the target track.
         // Use the loop index for PushID to guarantee unique widget IDs (the
@@ -1187,6 +1818,7 @@ void DaveApp::drawPluginBrowser() {
         // a per-row ID scope).
         int pluginIdx = 0;
         for (const auto& d : pluginHost_.descriptors()) {
+            if (instrumentsOnly && !d.isInstrument) { ++pluginIdx; continue; }
             if (browserFilter_[0] != '\0') {
                 std::string name = d.name;
                 std::string filt = browserFilter_;
@@ -1201,14 +1833,27 @@ void DaveApp::drawPluginBrowser() {
             ImGui::SameLine();
             ImGui::TextDisabled("[%s] %s", d.subCategories.c_str(), d.vendor.c_str());
             ImGui::SameLine();
-            if (ImGui::SmallButton("Add")) {
+            if (ImGui::SmallButton(instrumentsOnly ? "Use" : "Add")) {
                 document::PluginSlot slot;
                 slot.name = d.name;
                 slot.uidString = d.uidString;
                 slot.path = d.path;
                 slot.bypass = false;
-                undo_.execute(std::make_unique<editing::AddPluginCommand>(
-                    browserTargetTrackId_, slot));
+                switch (browserMode_) {
+                    case BrowserMode::AudioFx:
+                        undo_.execute(std::make_unique<editing::AddPluginCommand>(
+                            browserTargetTrackId_, slot));
+                        break;
+                    case BrowserMode::MidiInstrument:
+                        undo_.execute(
+                            std::make_unique<editing::SetMidiInstrumentCommand>(
+                                browserTargetTrackId_, slot));
+                        break;
+                    case BrowserMode::MidiFx:
+                        undo_.execute(std::make_unique<editing::AddMidiPluginCommand>(
+                            browserTargetTrackId_, slot));
+                        break;
+                }
                 showPluginBrowser_ = false;
             }
             ImGui::PopID();

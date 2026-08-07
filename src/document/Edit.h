@@ -58,6 +58,37 @@ public:
     std::string addPlugin(const std::string& trackId, PluginSlot slot);
     bool removePlugin(const std::string& trackId, const std::string& slotId);
 
+    // --- MIDI tracks (RB-7) ------------------------------------------------
+    // MIDI tracks are a parallel list to audio tracks: each drives one
+    // instrument plugin with its clips' notes, then an ordinary effect chain.
+    const std::vector<MidiTrack>& midiTracks() const { return midiTracks_; }
+    std::vector<MidiTrack>& midiTracksMut() { return midiTracks_; }
+    std::string addMidiTrack(const std::string& name);
+    MidiTrack* midiTrack(const std::string& id);
+    const MidiTrack* midiTrack(const std::string& id) const;
+    bool removeMidiTrack(const std::string& id);
+
+    // Add a MIDI clip to a track; returns the clip id (empty if track missing).
+    std::string addMidiClip(const std::string& trackId, MidiClip clip);
+    MidiClip* midiClip(const std::string& trackId, const std::string& clipId);
+    bool removeMidiClip(const std::string& trackId, const std::string& clipId);
+
+    // Set (or clear, by passing a default-constructed slot) the track's
+    // instrument. Returns false if the track doesn't exist.
+    bool setMidiInstrument(const std::string& trackId, PluginSlot slot);
+
+    // Post-instrument effect chain, same semantics as addPlugin on audio tracks.
+    std::string addMidiPlugin(const std::string& trackId, PluginSlot slot);
+    bool removeMidiPlugin(const std::string& trackId, const std::string& slotId);
+
+    // --- Solo ---------------------------------------------------------------
+    // Is anything in the edit soloed? Solo is only meaningful relative to every
+    // other track, so this scan belongs to the Edit rather than to each of the
+    // (now several) places that need the answer — the engine's gain-zeroing and
+    // the GUI's dimming have to agree, and they can only agree by asking the
+    // same question. Pair with document::trackAudible().
+    bool anySoloed() const;
+
     // --- Marker tracks -----------------------------------------------------
     // Marker tracks are category layers (Cues, Scenes, etc.). The Edit owns a
     // list; addMarkerTrack returns the new track's id.
@@ -95,12 +126,40 @@ public:
     // marker regions). Used by the transport to auto-stop. Returns 0 if empty.
     int64_t contentEndSamples() const;
 
+    // --- Session properties ------------------------------------------------
+    // The rate every sample position in this document is expressed in. Changing
+    // it does NOT resample existing audio or move clips: sample positions are
+    // the document's unit, so a session recorded at 48 k and reopened at 96 k
+    // would play at the wrong speed. Set it when the session is empty, or
+    // accept that existing material is being reinterpreted.
+    int sampleRate() const { return sampleRate_; }
+    void setSampleRate(int rate) {
+        if (rate <= 0 || rate == sampleRate_) return;
+        sampleRate_ = rate;
+        notifyChanged();
+    }
+    // Bits per sample for files this session writes. Nothing renders yet, so
+    // today this is a stored preference waiting for an export path.
+    int bitDepth() const { return bitDepth_; }
+    void setBitDepth(int bits) {
+        if (bits <= 0 || bits == bitDepth_) return;
+        bitDepth_ = bits;
+        notifyChanged();
+    }
+    // Load-time setters: no change notification, no equality guard.
+    void loadSessionFormat_(int rate, int bits) {
+        if (rate > 0) sampleRate_ = rate;
+        if (bits > 0) bitDepth_ = bits;
+    }
+
     // --- Persistence helpers (load-time only; don't fire change notifications)
     void loadAsset_(AudioAsset a) { assets_.emplace(a.id, std::move(a)); }
     void loadMarkerTrack_(MarkerTrack mt) { markerTracks_.push_back(std::move(mt)); }
     void clearMarkerTracks_() { markerTracks_.clear(); }
     void clearVideoTracks_() { videoTracks_.clear(); }
     void loadVideoTrack_(VideoTrack vt) { videoTracks_.push_back(std::move(vt)); }
+    void clearMidiTracks_() { midiTracks_.clear(); }
+    void loadMidiTrack_(MidiTrack mt) { midiTracks_.push_back(std::move(mt)); }
     std::unordered_map<AssetId, AudioAsset>& assets() { return assets_; }
 
     // --- Change notification ----------------------------------------------
@@ -114,11 +173,14 @@ private:
     std::string newId(const char* prefix) const;
 
     std::vector<Track> tracks_;
+    std::vector<MidiTrack> midiTracks_;
     std::vector<MarkerTrack> markerTracks_;
     std::vector<VideoTrack> videoTracks_;
     std::unordered_map<AssetId, AudioAsset> assets_;
     ChangeCallback onChange_;
     uint64_t idCounter_ = 0;
+    int sampleRate_ = 48000;
+    int bitDepth_ = 24;
 };
 
 } // namespace dave::document

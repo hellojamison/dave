@@ -88,10 +88,18 @@ target_include_directories(Dave PRIVATE
 # module_win32.cpp) is NOT part of the sdk_hosting library — each host app
 # compiles it directly (see the SDK's audiohost/validator samples). It loads
 # .vst3 bundles via dlopen and needs ARC on macOS.
+# Two SDK sources PluginInstance needs that are not part of any SDK library
+# target: memorystream.cpp (plugin state save/restore) and eventlist.cpp (MIDI
+# delivery — only the InterAppAudio sample compiles it, so every host that
+# sends events to a plugin builds it itself). Both are portable, so they sit
+# outside the platform branches below.
+target_sources(Dave PRIVATE
+    "${THIRD_PARTY}/vst3sdk/public.sdk/source/common/memorystream.cpp"
+    "${THIRD_PARTY}/vst3sdk/public.sdk/source/vst/hosting/eventlist.cpp")
+
 if(APPLE)
     target_sources(Dave PRIVATE
         "${THIRD_PARTY}/vst3sdk/public.sdk/source/vst/hosting/module_mac.mm"
-        "${THIRD_PARTY}/vst3sdk/public.sdk/source/common/memorystream.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/engine/plugins/PluginEditor_mac.mm"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/MacMenuBar.mm")
     set_source_files_properties(
@@ -191,7 +199,8 @@ endif()
 add_executable(plugin_test tools/plugin_test.cpp
     src/engine/plugins/PluginHost.cpp
     src/engine/plugins/PluginInstance.cpp
-    "${THIRD_PARTY}/vst3sdk/public.sdk/source/common/memorystream.cpp")
+    "${THIRD_PARTY}/vst3sdk/public.sdk/source/common/memorystream.cpp"
+    "${THIRD_PARTY}/vst3sdk/public.sdk/source/vst/hosting/eventlist.cpp")
 target_include_directories(plugin_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(plugin_test PRIVATE base pluginterfaces sdk sdk_common sdk_hosting)
 if(APPLE)

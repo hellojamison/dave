@@ -18,8 +18,9 @@ namespace {
 void printUsage(const char* executable) {
     std::fprintf(
         stderr,
-        "Usage: %s [--screenshot <out.png> [--frames N] [--width W] [--height H]"
-        " [--demo-audio <file.wav>] [--samples-per-pixel N]]\n",
+        "Usage: %s [--video-popped-out] [--screenshot <out.png> [--frames N]"
+        " [--width W] [--height H] [--demo-audio <file.wav>]"
+        " [--demo-midi <file.mid>] [--samples-per-pixel N]]\n",
         executable);
 }
 
@@ -56,7 +57,9 @@ int main(int argc, char** argv) {
     bool screenshotRequested = false;
     bool screenshotOnlyOptionProvided = false;
     std::string demoAudioPath;
+    std::string demoMidiPath;
     double screenshotSamplesPerPixel = 0.0;
+    bool startVideoPoppedOut = false;
 
 #ifdef NDEBUG
     if (argc > 1) {
@@ -104,6 +107,18 @@ int main(int argc, char** argv) {
                 return 2;
             }
             demoAudioPath = argv[i];
+        } else if (arg == "--demo-midi") {
+            screenshotOnlyOptionProvided = true;
+            if (++i >= argc) {
+                printUsage(argv[0]);
+                return 2;
+            }
+            demoMidiPath = argv[i];
+        } else if (arg == "--video-popped-out") {
+            // Start with the picture in its own window: a screenshot fixture
+            // for the detached-picture sidebar, and a way to exercise the
+            // popped-out path without clicking through the UI.
+            startVideoPoppedOut = true;
         } else if (arg == "--samples-per-pixel") {
             screenshotOnlyOptionProvided = true;
             if (++i >= argc || !parseSamplesPerPixel(argv[i], screenshotSamplesPerPixel)) {
@@ -138,6 +153,14 @@ int main(int argc, char** argv) {
     }
     if (screenshotSamplesPerPixel > 0.0) {
         app.setTimelineSamplesPerPixel(screenshotSamplesPerPixel);
+    }
+    if (startVideoPoppedOut) {
+        app.setVideoPoppedOut(true);
+    }
+    if (!demoMidiPath.empty()) {
+        if (!app.importMidiIntoEdit(demoMidiPath)) {
+            return 1;
+        }
     }
     if (!demoAudioPath.empty()) {
         if (!app.loadWavIntoEdit(demoAudioPath)) {

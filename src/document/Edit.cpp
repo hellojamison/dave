@@ -140,6 +140,113 @@ bool Edit::removePlugin(const std::string& trackId, const std::string& slotId) {
     return false;
 }
 
+// ─── MIDI tracks ────────────────────────────────────────────────────────────
+
+std::string Edit::addMidiTrack(const std::string& name) {
+    MidiTrack mt;
+    mt.id = newId("miditrack_");
+    ++idCounter_;
+    mt.name = name.empty() ? ("MIDI " + std::to_string(idCounter_)) : name;
+    midiTracks_.push_back(std::move(mt));
+    notifyChanged();
+    return midiTracks_.back().id;
+}
+
+MidiTrack* Edit::midiTrack(const std::string& id) {
+    for (auto& mt : midiTracks_) if (mt.id == id) return &mt;
+    return nullptr;
+}
+
+const MidiTrack* Edit::midiTrack(const std::string& id) const {
+    for (const auto& mt : midiTracks_) if (mt.id == id) return &mt;
+    return nullptr;
+}
+
+bool Edit::removeMidiTrack(const std::string& id) {
+    for (auto it = midiTracks_.begin(); it != midiTracks_.end(); ++it) {
+        if (it->id == id) {
+            midiTracks_.erase(it);
+            notifyChanged();
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string Edit::addMidiClip(const std::string& trackId, MidiClip clip) {
+    MidiTrack* mt = midiTrack(trackId);
+    if (mt == nullptr) return "";
+    clip.id = newId("mclip_");
+    ++idCounter_;
+    mt->clips.push_back(std::move(clip));
+    notifyChanged();
+    return mt->clips.back().id;
+}
+
+MidiClip* Edit::midiClip(const std::string& trackId, const std::string& clipId) {
+    MidiTrack* mt = midiTrack(trackId);
+    if (mt == nullptr) return nullptr;
+    for (auto& c : mt->clips) if (c.id == clipId) return &c;
+    return nullptr;
+}
+
+bool Edit::removeMidiClip(const std::string& trackId, const std::string& clipId) {
+    MidiTrack* mt = midiTrack(trackId);
+    if (mt == nullptr) return false;
+    for (auto it = mt->clips.begin(); it != mt->clips.end(); ++it) {
+        if (it->id == clipId) {
+            mt->clips.erase(it);
+            notifyChanged();
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Edit::setMidiInstrument(const std::string& trackId, PluginSlot slot) {
+    MidiTrack* mt = midiTrack(trackId);
+    if (mt == nullptr) return false;
+    // The instrument keeps a stable id across replacements only if the caller
+    // supplies one; a fresh instrument gets a new id so the GraphBuilder's
+    // instance cache can't hand back the previous plugin.
+    if (slot.id.empty() && !slot.uidString.empty()) {
+        slot.id = newId("instrument_");
+        ++idCounter_;
+    }
+    mt->instrument = std::move(slot);
+    notifyChanged();
+    return true;
+}
+
+std::string Edit::addMidiPlugin(const std::string& trackId, PluginSlot slot) {
+    MidiTrack* mt = midiTrack(trackId);
+    if (mt == nullptr) return "";
+    slot.id = newId("plugin_");
+    ++idCounter_;
+    mt->plugins.push_back(std::move(slot));
+    notifyChanged();
+    return mt->plugins.back().id;
+}
+
+bool Edit::removeMidiPlugin(const std::string& trackId, const std::string& slotId) {
+    MidiTrack* mt = midiTrack(trackId);
+    if (mt == nullptr) return false;
+    for (auto it = mt->plugins.begin(); it != mt->plugins.end(); ++it) {
+        if (it->id == slotId) {
+            mt->plugins.erase(it);
+            notifyChanged();
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Edit::anySoloed() const {
+    for (const auto& t : tracks_) if (t.solo) return true;
+    for (const auto& mt : midiTracks_) if (mt.solo) return true;
+    return false;
+}
+
 // ─── Marker tracks ──────────────────────────────────────────────────────────
 
 std::string Edit::addMarkerTrack(const std::string& name) {
@@ -274,6 +381,11 @@ int64_t Edit::contentEndSamples() const {
     int64_t end = 0;
     for (const auto& t : tracks_) {
         for (const auto& c : t.clips) {
+            end = std::max(end, c.timelineStart + c.length);
+        }
+    }
+    for (const auto& mt : midiTracks_) {
+        for (const auto& c : mt.clips) {
             end = std::max(end, c.timelineStart + c.length);
         }
     }

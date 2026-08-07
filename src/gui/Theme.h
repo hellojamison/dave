@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <imgui.h>
 
+#include <string>
+
 namespace dave::gui::theme {
 
 // Brand and audio-domain colors live together so later layout phases can
@@ -64,6 +66,9 @@ struct Palette {
     ImVec4 markerCustom;
     ImVec4 clipVideo;
     ImVec4 clipVideoBorder;
+    ImVec4 clipMidi;
+    ImVec4 clipMidiBorder;
+    ImVec4 midiNote;             // note blobs inside a MIDI clip
 
     // Timeline surfaces, matching PTXExtractor's session workspace so the two
     // apps read as one family. The ordering matters more than the exact
@@ -143,6 +148,7 @@ enum class TransportIcon {
     Stop,
     ReturnToStart,
     Record,
+    Loop,
 };
 
 void drawVerticalGradient(ImDrawList* drawList, const Rect& rect,
@@ -155,6 +161,12 @@ bool gradientButton(const char* label, ImVec2 size = ImVec2(0, 0),
 bool iconButton(const char* id, TransportIcon icon, const char* tooltip,
                 ImVec2 size, ButtonVariant variant = ButtonVariant::Normal);
 void panelHeader(const char* label);
+
+// Pan as a mixer reads it: "C" dead centre, "L50" / "R100" either side. The
+// underlying value stays -1..+1 — this is display vocabulary, shared so the
+// track gutter and the mixer strip cannot drift into two different dialects
+// for the same control.
+std::string formatPan(double pan);
 
 ImVec4 hex(uint32_t rgba);
 

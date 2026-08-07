@@ -56,7 +56,7 @@ struct PluginSlot {
 };
 
 // A track holds an ordered list of clips, a plugin chain, and a gain/pan.
-// RB-2: one track type (audio). MIDI tracks come later.
+// Audio tracks; MIDI tracks are a parallel type below (MidiTrack).
 struct Track {
     std::string id;              // stable id
     std::string name;
@@ -86,6 +86,70 @@ inline bool trackAudible(bool mute, bool solo, bool anySoloed) {
 }
 
 inline bool trackAudible(const Track& t, bool anySoloed) {
+    return trackAudible(t.mute, t.solo, anySoloed);
+}
+
+// ─── MIDI (RB-7) ────────────────────────────────────────────────────────────
+// One note in a MIDI clip's sequence. Positions are in SOURCE samples — the
+// same time base AudioClip::sourceOffset indexes into — so trimming a MIDI
+// clip is arithmetically identical to trimming an audio clip and the two code
+// paths can't drift apart. The conversion from the .mid file's ticks happens
+// once at import (see engine/midi/SmfReader.h), against that file's own tempo
+// map; Dave has no tempo map of its own yet.
+struct MidiNote {
+    int64_t startSample = 0;    // from the start of the source sequence
+    int64_t lengthSamples = 0;
+    uint8_t pitch = 60;         // 0..127
+    uint8_t velocity = 100;     // 1..127 (a 0-velocity note-on is a note-off)
+    uint8_t channel = 0;        // 0..15
+};
+
+// A tempo change from the source .mid file, kept in the file's own tick base.
+// Dormant metadata for this milestone: nothing reads it, but storing it means a
+// future Dave tempo map can re-conform an already-imported clip instead of
+// forcing a re-import. See MarkerPosMode::Musical.
+struct TempoEvent {
+    int64_t tick = 0;                     // position in source PPQ ticks
+    int32_t microsecondsPerQuarter = 500000;  // 120 bpm default
+};
+
+// A MIDI clip is a placed window onto a baked note sequence, mirroring
+// AudioClip: timelineStart/sourceOffset/length have exactly the same meaning.
+// Notes outside [sourceOffset, sourceOffset + length) simply don't sound.
+struct MidiClip {
+    std::string id;
+    std::string name;            // display (usually the SMF track name)
+    int64_t timelineStart = 0;   // where on the timeline (samples)
+    int64_t sourceOffset = 0;    // where in the sequence (samples)
+    int64_t length = 0;          // how long to play (samples)
+    std::vector<MidiNote> notes; // sorted by startSample (SmfReader guarantees)
+    // Provenance, for re-import and future tempo-map re-conform.
+    std::string sourcePath;
+    int sourcePpq = 480;
+    std::vector<TempoEvent> sourceTempi;
+};
+
+// A MIDI track drives ONE instrument plugin with the notes of its clips, then
+// runs the result through an ordinary effect chain.
+//
+// `instrument` is a dedicated field rather than "plugins[0] is special": a
+// track with no instrument is a real, representable state (it's what you have
+// between importing a .mid and choosing a synth), and a convention that a
+// vector's first element means something different is the kind of thing that
+// survives exactly until the first person inserts an EQ at the top.
+struct MidiTrack {
+    std::string id;
+    std::string name;
+    double gain = 1.0;
+    double pan = 0.0;
+    bool mute = false;
+    bool solo = false;
+    PluginSlot instrument;            // empty uidString = no instrument yet
+    std::vector<MidiClip> clips;
+    std::vector<PluginSlot> plugins;  // post-instrument effect chain, in order
+};
+
+inline bool trackAudible(const MidiTrack& t, bool anySoloed) {
     return trackAudible(t.mute, t.solo, anySoloed);
 }
 

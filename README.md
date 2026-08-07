@@ -10,20 +10,29 @@ system, free node-graph routing, and VST3 / AU / CLAP plugin hosting.
 
 ## Status
 
-🚧 **Early, but it runs.** macOS only so far. Not ready for real work — test
-coverage is thin, and nothing here should be trusted with a session you care
+🚧 **Early, but it runs.** macOS only so far. Not ready for real work — there
+is no recording, and nothing here should be trusted with a session you care
 about.
 
 **Works today:** audio playback through our own node graph, with device
-selection and a transport. A timeline with tracks, clips, drag editing, peak
-waveforms, selection, snapping and undo/redo. VST3 hosting — scanning, loading,
-native plugin editor windows, bypass and state save/restore. A multi-track
-marker lane with Reaper CSV import/export and loop regions. Video playback with
-a preview panel synced to the audio clock, plus a video lane with thumbnails.
-Projects save and load as `.dave` bundles with content-addressed assets.
+selection, a transport that returns to where playback started, and loop
+playback over a selection or a loop marker. A timeline with tracks, clips,
+drag editing, peak waveforms, undo/redo, and lane-scoped range selection that
+snaps to the divisions of the current timing format — min:sec, timecode,
+bars|beats, feet+frames or samples, each with a matching grid. A mixer with
+per-track gain, pan, mute and solo. VST3 hosting — scanning, loading, native
+plugin editor windows, bypass and state save/restore — including instruments
+on MIDI tracks. MIDI file import onto MIDI tracks. A multi-track marker lane
+with Reaper CSV import/export and loop regions. Video playback with a preview
+panel synced to the audio clock, plus a video lane with thumbnails. Projects
+save and load as `.dave` bundles with content-addressed assets, carrying the
+session sample rate and bit depth.
 
-**Not yet:** Windows (untested), automation, video editing, AU and CLAP
-hosting, MIDI, and time/pitch. See the roadmap.
+**Not yet:** recording of any kind — the audio device is opened for playback
+only, so there is no capture, no record arm, and no take handling. Also
+Windows (untested), automation, video editing, rendering and export (the bit
+depth setting is stored but nothing consumes it yet), AU and CLAP hosting,
+live MIDI I/O, and time/pitch. See the roadmap.
 
 ## Goals
 
@@ -100,11 +109,13 @@ stays available under the project's licence.
 | 0 — Skeleton | CMake; window; audio device; sine node through our graph | ✅ |
 | 1 — Audio engine | Our node graph drives playback; mixer; transport | ✅ |
 | 2 — Editing | Track/clip NLE; commands; undo; peak waveforms | ✅ |
-| 3 — Plugins | VST3 hosting; scanner; editor windows; state save | ✅ VST3 only — AU and CLAP pending |
+| 3 — Plugins | VST3 hosting; scanner; editor windows; state save | ✅ VST3 effects and instruments — AU and CLAP pending |
 | 4 — Markers | Multi-track markers; import/export; loop regions | 🟡 Reaper CSV in/out; not all position modes; marker-aware editing pending |
 | 5 — Video playback | FFmpeg decode; A/V sync; preview; video lane | ✅ |
 | 6 — Video NLE | Video tracks; transitions; compositor; render/export | ⬜ |
-| — | Automation, MIDI, time/pitch | ⬜ |
+| — | MIDI | 🟡 File import, MIDI tracks and instrument hosting; live I/O and editing pending |
+| — | Recording | ⬜ Playback-only device; no capture, arm or takes |
+| — | Automation, time/pitch | ⬜ |
 | — | Test suite + CI | 🟡 Unit tests + macOS CI; RT-safety checks (TSan/ASan, no allocs or locks on the audio thread) pending |
 | 7 — Polish / 1.0 | Theming; a11y; crash reporting; packaging; DAWproject | 🟡 Theming done; rest pending |
 

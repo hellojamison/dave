@@ -22,8 +22,9 @@ std::string serializeEdit(const Edit& edit);
 ProjectResult deserializeEdit(const std::string& json, Edit& edit);
 
 // Save the Edit as a .dave bundle at `bundlePath` (a directory). Creates the
-// dir + assets/ + video/ subdirs, copies referenced media in (content-
-// addressed for audio, by-name for video), writes project.json atomically.
+// dir + assets/ + video/ + recordings/ subdirs, copies referenced media in
+// (content-addressed imports, human-named takes, by-name video), and writes
+// project.json atomically.
 // `copyAssets` = true copies media into the bundle (self-contained); false
 // writes the bundle but leaves assets referenced by their original paths.
 ProjectResult saveBundle(const std::string& bundlePath, const Edit& edit,

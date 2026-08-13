@@ -17,11 +17,28 @@ add_executable(dave_tests
     test_midigraph.cpp
     test_timelinedrag.cpp
     test_timelinelayout.cpp
+    test_maineditorlayout.cpp
+    test_trackcolor.cpp
     test_transport.cpp
+    test_spscqueue.cpp
+    test_ringbuffer.cpp
+    test_wavwriter.cpp
+    test_diskwriter.cpp
+    test_audioimport.cpp
+    test_inputmeter.cpp
+    test_audiodeviceconfig.cpp
+    test_audiopreferences.cpp
+    test_iopanel.cpp
     test_mixerstrip.cpp
+    test_recordcontroller.cpp
+    test_transportrecording.cpp
+    test_committake.cpp
+    test_recordingbundle.cpp
+    test_routing.cpp
     dr_wav_impl.cpp
     # Sources under test.
     "${CMAKE_SOURCE_DIR}/src/document/Sha256.cpp"
+    "${CMAKE_SOURCE_DIR}/src/application/AudioPreferences.cpp"
     "${CMAKE_SOURCE_DIR}/src/document/Edit.cpp"
     "${CMAKE_SOURCE_DIR}/src/document/MarkerCsv.cpp"
     "${CMAKE_SOURCE_DIR}/src/document/ProjectFile.cpp"
@@ -41,7 +58,14 @@ add_executable(dave_tests
     # so imgui is linked to satisfy them — no ImGui context is ever created.
     "${CMAKE_SOURCE_DIR}/src/gui/Timeline.cpp"
     "${CMAKE_SOURCE_DIR}/src/gui/Mixer.cpp"
-    "${CMAKE_SOURCE_DIR}/src/gui/Theme.cpp")
+    "${CMAKE_SOURCE_DIR}/src/gui/Theme.cpp"
+    "${CMAKE_SOURCE_DIR}/src/gui/IoPanel.cpp"
+    "${CMAKE_SOURCE_DIR}/src/gui/RoutingViewModel.cpp"
+    "${CMAKE_SOURCE_DIR}/src/gui/TrackColorPicker.cpp"
+    "${CMAKE_SOURCE_DIR}/src/engine/record/WavWriter.cpp"
+    "${CMAKE_SOURCE_DIR}/src/engine/record/DiskWriter.cpp")
+target_sources(dave_tests PRIVATE
+    "${CMAKE_SOURCE_DIR}/src/engine/record/RecordController.cpp")
 
 target_include_directories(dave_tests PRIVATE
     "${CMAKE_SOURCE_DIR}/src"

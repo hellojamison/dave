@@ -73,6 +73,14 @@ public:
         frame(x, y, false, body);
     }
 
+    // macOS Option and Windows/Linux Alt both arrive as ImGui's Alt modifier.
+    void optionClickAt(float x, float y, const std::function<void()>& body) {
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Alt, true);
+        clickAt(x, y, body);
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Alt, false);
+        frame(-100.0f, -100.0f, false, body);
+    }
+
     document::Edit edit;
     editing::UndoStack undo{edit};
     engine::Transport transport;

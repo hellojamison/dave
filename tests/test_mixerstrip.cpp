@@ -50,6 +50,33 @@ bool clickDownColumn(ImGuiRig& rig, int stripIndex, const StopFn& stop,
     return false;
 }
 
+template <typename StopFn>
+bool optionClickDownColumn(ImGuiRig& rig, int stripIndex, const StopFn& stop) {
+    const float x =
+        12.0f + stripIndex * (kStripWidth + kStripGap) + kStripWidth * 0.5f;
+    auto body = [&] { gui::drawMixer(rig.edit, rig.undo, rig.view, kStripWidth); };
+    for (float y = 20.0f; y < ImGuiRig::kDisplayH - 20.0f; y += 3.0f) {
+        rig.optionClickAt(x, y, body);
+        if (stop()) return true;
+    }
+    return false;
+}
+
+template <typename StopFn>
+bool dragUpColumn(ImGuiRig& rig, int stripIndex, const StopFn& stop) {
+    const float x =
+        12.0f + stripIndex * (kStripWidth + kStripGap) + kStripWidth * 0.5f;
+    auto body = [&] { gui::drawMixer(rig.edit, rig.undo, rig.view, kStripWidth); };
+    for (float y = 20.0f; y < ImGuiRig::kDisplayH - 40.0f; y += 3.0f) {
+        rig.frame(x, y, false, body);
+        rig.frame(x, y, true, body);
+        rig.frame(x, y - 18.0f, true, body);
+        rig.frame(x, y - 18.0f, false, body);
+        if (stop()) return true;
+    }
+    return false;
+}
+
 } // namespace
 
 TEST_CASE("the add-insert row asks for the audio effect picker", "[mixerstrip]") {
@@ -145,12 +172,39 @@ TEST_CASE("the mute button on a strip mutes that track", "[mixerstrip]") {
 
     const bool fired = clickDownColumn(rig, 1, [&] {
         return rig.edit.track(b)->mute;
-    }, 0.25f);   // mute occupies the left half of its row
+    }, 0.5f);   // audio rows are R / M / S; mute occupies the middle third
     REQUIRE(fired);
     // Strip 1 is the SECOND track: a strip that edited its neighbour would be
     // invisible in a screenshot and obvious here.
     CHECK(rig.edit.track(b)->mute);
     CHECK_FALSE(rig.edit.track(a)->mute);
+}
+
+TEST_CASE("the record button arms only its audio strip",
+          "[mixerstrip][record-arm]") {
+    ImGuiRig rig;
+    const std::string a = rig.edit.addTrack("A");
+    const std::string b = rig.edit.addTrack("B");
+
+    const bool fired = clickDownColumn(rig, 1, [&] {
+        return rig.edit.track(b)->recordArm;
+    }, 0.16f);   // R is the left third of an audio strip's R/M/S row
+    REQUIRE(fired);
+    CHECK(rig.edit.track(b)->recordArm);
+    CHECK_FALSE(rig.edit.track(a)->recordArm);
+}
+
+TEST_CASE("MIDI strips preserve their two-button mute and solo layout",
+          "[mixerstrip][record-arm]") {
+    ImGuiRig rig;
+    const std::string midi = rig.edit.addMidiTrack("Keys");
+
+    const bool fired = clickDownColumn(rig, 0, [&] {
+        return rig.edit.midiTrack(midi)->mute;
+    }, 0.25f);   // still the left half; no audio-only R was inserted
+    REQUIRE(fired);
+    CHECK(rig.edit.midiTrack(midi)->mute);
+    CHECK_FALSE(rig.edit.midiTrack(midi)->solo);
 }
 
 TEST_CASE("an empty session draws a mixer without crashing", "[mixerstrip]") {
@@ -197,4 +251,42 @@ TEST_CASE("pan reads as a side and a magnitude, not a signed fraction",
             REQUIRE(r == "R" + std::to_string(i));
         }
     }
+}
+
+TEST_CASE("dragging the mixer pan knob changes only that track's pan",
+          "[mixerstrip][pan]") {
+    ImGuiRig rig;
+    const std::string a = rig.edit.addTrack("A");
+    const std::string b = rig.edit.addTrack("B");
+
+    const bool fired = dragUpColumn(rig, 1, [&] {
+        return rig.edit.track(b)->pan > 0.0;
+    });
+    REQUIRE(fired);
+    CHECK(rig.edit.track(b)->pan > 0.0);
+    CHECK(rig.edit.track(a)->pan == 0.0);
+}
+
+TEST_CASE("Option-clicking mixer pan resets it to center",
+          "[mixerstrip][pan][reset]") {
+    ImGuiRig rig;
+    const std::string track = rig.edit.addTrack("A");
+    rig.edit.track(track)->pan = 0.73;
+
+    REQUIRE(optionClickDownColumn(rig, 0, [&] {
+        return rig.edit.track(track)->pan == 0.0;
+    }));
+    CHECK(rig.edit.track(track)->pan == 0.0);
+}
+
+TEST_CASE("Option-clicking mixer volume resets it to zero dB",
+          "[mixerstrip][gain][reset]") {
+    ImGuiRig rig;
+    const std::string track = rig.edit.addTrack("A");
+    rig.edit.track(track)->gain = 0.25;
+
+    REQUIRE(optionClickDownColumn(rig, 0, [&] {
+        return rig.edit.track(track)->gain == 1.0;
+    }));
+    CHECK(rig.edit.track(track)->gain == 1.0);
 }

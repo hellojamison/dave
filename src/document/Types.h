@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cstdint>
+#include <algorithm>
 #include <functional>
 #include <string>
 #include <unordered_map>
@@ -55,11 +56,87 @@ struct PluginSlot {
     std::string stateBase64;     // VST3 state chunk (base64-encoded) for persistence
 };
 
+// Hardware channels are zero-based in the model and displayed one-based in
+// the UI. A span is deliberately device-independent: unavailable assignments
+// remain in the project so reconnecting the interface restores the route.
+struct HardwareChannelSpan {
+    int firstChannel = 0;
+    int channelCount = 2;
+
+    bool operator==(const HardwareChannelSpan&) const = default;
+};
+
+inline constexpr const char* kMainBusId = "bus_main";
+
+struct RouteTarget {
+    enum class Kind { None, HardwareOutput, AudioTrack, Bus };
+
+    Kind kind = Kind::Bus;
+    std::string targetId = kMainBusId;
+    HardwareChannelSpan hardware{};
+
+    static RouteTarget none() {
+        RouteTarget r;
+        r.kind = Kind::None;
+        r.targetId.clear();
+        return r;
+    }
+    static RouteTarget hardwareOutput(int firstChannel, int channelCount) {
+        RouteTarget r;
+        r.kind = Kind::HardwareOutput;
+        r.targetId.clear();
+        r.hardware = {firstChannel, channelCount};
+        return r;
+    }
+    static RouteTarget audioTrack(std::string id) {
+        RouteTarget r;
+        r.kind = Kind::AudioTrack;
+        r.targetId = std::move(id);
+        return r;
+    }
+    static RouteTarget bus(std::string id = kMainBusId) {
+        RouteTarget r;
+        r.kind = Kind::Bus;
+        r.targetId = std::move(id);
+        return r;
+    }
+
+    bool operator==(const RouteTarget&) const = default;
+};
+
+enum class SendTap { PreFader, PostFader };
+
+struct AuxSend {
+    std::string id;
+    RouteTarget target = RouteTarget::none();
+    SendTap tap = SendTap::PostFader;
+    // Linear amplitude. Zero is -infinity and is the safe default for a new
+    // send; the send is also muted so neither control can surprise the user.
+    double gain = 0.0;
+    bool muted = true;
+};
+
+// Channel identity colors are stored as CSS-style #RRGGBB strings so project
+// JSON stays readable. Empty means "use the type's default color".
+inline bool validTrackColor(const std::string& color) noexcept {
+    if (color.empty()) return true;
+    if (color.size() != 7 || color[0] != '#') return false;
+    for (size_t i = 1; i < color.size(); ++i) {
+        const char c = color[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+              (c >= 'A' && c <= 'F'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // A track holds an ordered list of clips, a plugin chain, and a gain/pan.
 // Audio tracks; MIDI tracks are a parallel type below (MidiTrack).
 struct Track {
     std::string id;              // stable id
     std::string name;
+    std::string color;           // #RRGGBB; empty = default audio color
     double gain = 1.0;
     double pan = 0.0;            // -1 (L) .. +1 (R)
     // Mute and solo are stored per track, but solo is only meaningful relative
@@ -68,9 +145,42 @@ struct Track {
     // all tracks at once. See Edit::anyTrackSoloed().
     bool mute = false;
     bool solo = false;
+    // Recording state belongs to the document so arming and routing survive
+    // save/load. inputChannel is zero-based; inputChannelCount is the width of
+    // the contiguous hardware-input span (1 = mono, 2 = stereo).
+    bool recordArm = false;
+    int inputChannel = 0;
+    int inputChannelCount = 1;
+    HardwareChannelSpan hardwareInput{0, 1};
+    bool inputMonitor = false;
+    RouteTarget mainOutput = RouteTarget::bus();
+    std::vector<AuxSend> sends;
     std::vector<AudioClip> clips;
     std::vector<PluginSlot> plugins;  // effect chain, processed in order
 };
+
+// Constrains a saved input span to a live capture device without coupling the
+// document layer to AudioEngine or miniaudio. A device-less state has no valid
+// channels; otherwise at least one channel remains selected and the whole span
+// fits. Returns true when the route changed, which lets a caller decide whether
+// the repaired value should dirty the document.
+inline bool clampTrackInputToCaptureChannels(Track& track,
+                                             int liveCaptureChannels) {
+    const int oldChannel = track.inputChannel;
+    const int oldCount = track.inputChannelCount;
+    const int available = std::max(0, liveCaptureChannels);
+    if (available == 0) {
+        track.inputChannel = 0;
+        track.inputChannelCount = 0;
+    } else {
+        track.inputChannelCount =
+            std::clamp(track.inputChannelCount, 1, available);
+        track.inputChannel = std::clamp(
+            track.inputChannel, 0, available - track.inputChannelCount);
+    }
+    return track.inputChannel != oldChannel ||
+           track.inputChannelCount != oldCount;
+}
 
 // Whether a track should be heard, given whether anything in the edit is
 // soloed. Mute wins over solo, so a track that is both stays silent — that
@@ -140,16 +250,40 @@ struct MidiClip {
 struct MidiTrack {
     std::string id;
     std::string name;
+    std::string color;           // #RRGGBB; empty = default MIDI color
     double gain = 1.0;
     double pan = 0.0;
     bool mute = false;
     bool solo = false;
+    RouteTarget mainOutput = RouteTarget::bus();
+    std::vector<AuxSend> sends;
     PluginSlot instrument;            // empty uidString = no instrument yet
     std::vector<MidiClip> clips;
     std::vector<PluginSlot> plugins;  // post-instrument effect chain, in order
 };
 
 inline bool trackAudible(const MidiTrack& t, bool anySoloed) {
+    return trackAudible(t.mute, t.solo, anySoloed);
+}
+
+// A bus is a stereo software channel. Main is represented by the same type so
+// graph construction and the mixer do not need a special DSP path; isMain
+// supplies the document restrictions (permanent, hardware-only destination).
+struct BusTrack {
+    std::string id;
+    std::string name;
+    std::string color;           // #RRGGBB; empty = default bus/Main color
+    double gain = 1.0;
+    double pan = 0.0;
+    bool mute = false;
+    bool solo = false;
+    bool isMain = false;
+    RouteTarget mainOutput = RouteTarget::hardwareOutput(0, 2);
+    std::vector<AuxSend> sends;
+    std::vector<PluginSlot> plugins;
+};
+
+inline bool trackAudible(const BusTrack& t, bool anySoloed) {
     return trackAudible(t.mute, t.solo, anySoloed);
 }
 

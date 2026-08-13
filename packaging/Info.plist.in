@@ -25,7 +25,7 @@
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSMicrophoneUsageDescription</key>
-    <string>Dave needs microphone access for audio recording.</string>
+    <string>Dave needs microphone access to meter the selected audio input.</string>
     <key>NSDocumentTypes</key>
     <array>
         <dict>

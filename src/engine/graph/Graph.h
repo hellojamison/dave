@@ -50,6 +50,14 @@ public:
     // Disconnect a specific edge. Returns true if it existed.
     bool disconnect(NodeId srcNode, int srcPin, NodeId dstNode, int dstPin);
 
+    // Name the node whose output reaches the speakers. Without this, compile()
+    // falls back to whichever node happens to sort last, which is only the
+    // master by luck — any sink with no outgoing edge (a meter tap, a recorder,
+    // a hardware output) can sort after it and silently become the output.
+    // Setting an unknown id is ignored; compile() falls back as before.
+    void setRoot(NodeId id) { rootNode_ = id; }
+    NodeId root() const { return rootNode_; }
+
     Node* node(NodeId id) const;
     std::shared_ptr<Node> sharedNode(NodeId id) const;
     const std::vector<std::pair<NodeId, std::shared_ptr<Node>>>& nodes() const { return nodes_; }
@@ -59,6 +67,8 @@ private:
     std::vector<std::pair<NodeId, std::shared_ptr<Node>>> nodes_;
     std::vector<Edge> edges_;
     NodeId nextId_ = 1;
+    // 0 = unset; compile() then uses the last node in topological order.
+    NodeId rootNode_ = 0;
 };
 
 // Result of compile(): either a ready-to-run CompiledGraph or an error
@@ -87,9 +97,20 @@ public:
 
     // RT thread entry point. Walks nodes in topological order, gathering each
     // node's inputs (summed per pin) and calling node->process().
-    void process(AudioBus& rootOutput, const TimeInfo& time);
+    void process(AudioBus& rootOutput, const AudioBus& hardwareInput,
+                 const TimeInfo& time);
+    void process(AudioBus& rootOutput, const TimeInfo& time) {
+        const AudioBus empty{};
+        process(rootOutput, empty, time);
+    }
 
     bool empty() const { return nodes_.empty(); }
+
+    // The largest block this graph was compiled for. Every node's buffers are
+    // exactly this long, so handing process() more than this would write past
+    // them. process() clamps rather than trusting the caller: a short block is
+    // a glitch, an overrun is heap corruption.
+    int maxBlock() const { return maxBlock_; }
 
 private:
     friend std::pair<std::unique_ptr<CompiledGraph>, std::optional<CompileError>>
@@ -102,7 +123,14 @@ private:
         std::vector<float> outStorage;    // backing storage for outChannels
         std::vector<float*> outChannels;  // pointers into outStorage
         // For each input pin: list of (source compiled-node index, source pin)
-        std::vector<std::vector<std::pair<size_t, int>>> inputSources;
+        struct InputSource {
+            size_t nodeIndex = 0;
+            int sourcePin = 0;
+            uint32_t delaySamples = 0;
+            size_t writePosition = 0;
+            std::vector<float> delayStorage;
+        };
+        std::vector<std::vector<InputSource>> inputSources;
         // Pre-allocated input bus structures for RT: per pin, the AudioBus and
         // its channel pointer array. Pointers point into inputScratch_ pool.
         // These are reused every block — NO allocation in process().
@@ -113,6 +141,11 @@ private:
     };
 
     std::vector<CompiledNode> nodes_;
+    int maxBlock_ = 0;
+    // Which entry of nodes_ feeds the host output. Resolved in compile() from
+    // Graph::root(); defaults to the last node so a graph that never named one
+    // behaves exactly as it did before roots existed.
+    size_t rootIndex_ = 0;
     // Pool of sample buffers for summed inputs. Sized precisely in compile():
     // one slot per (node, input-pin, channel). Owned here, never resized post-
     // compile. RT-safe.

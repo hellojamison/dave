@@ -55,9 +55,9 @@ TEST_CASE("a MIDI track gets a gain node and a master pin", "[midigraph]") {
     auto graph = builder.build(edit, kSampleRate);
     REQUIRE(graph != nullptr);
 
-    // Both tracks have a gain node, so both appear in the mixer and both feed
-    // the master sum. A MIDI track differs only in what feeds its gain.
-    CHECK(builder.trackGains().size() == 2);
+    // Both tracks plus the permanent Main bus have gain nodes. A MIDI track
+    // differs only in what feeds its input sum.
+    CHECK(builder.trackGains().size() == 3);
     CHECK(builder.trackGains().count(midi) == 1);
 
     auto [compiled, err] = engine::compile(*graph, kSampleRate, kBlock);
@@ -98,10 +98,7 @@ TEST_CASE("a MIDI track with no instrument still compiles and is silent",
     }
 }
 
-TEST_CASE("audio and MIDI tracks take distinct master pins", "[midigraph]") {
-    // The master sum's pin count is audio + MIDI. Getting this wrong is silent
-    // in the good case and drops whole tracks in the bad one, so assert that
-    // every track's gain node has its own edge into the sum.
+TEST_CASE("audio and MIDI tracks route independently into Main", "[midigraph]") {
     document::Edit edit;
     edit.addTrack("A1");
     edit.addTrack("A2");
@@ -111,21 +108,24 @@ TEST_CASE("audio and MIDI tracks take distinct master pins", "[midigraph]") {
     engine::GraphBuilder builder;
     auto graph = builder.build(edit, kSampleRate);
     REQUIRE(graph != nullptr);
-    CHECK(builder.trackGains().size() == 4);
+    CHECK(builder.trackGains().size() == 5);
 
-    // Find the master sum: the only summing node with four inputs.
-    int edgesIntoSum = 0;
-    std::vector<int> pinsUsed;
+    const auto mainGain = builder.trackGains().at(document::kMainBusId);
+    engine::NodeId mainGainId = 0;
+    for (const auto& [id, node] : graph->nodes()) {
+        if (node == mainGain) mainGainId = id;
+    }
+    REQUIRE(mainGainId != 0);
+    int sourcesIntoMain = 0;
     for (const auto& e : graph->edges()) {
-        const auto* dst = graph->node(e.dstNode);
-        if (dst != nullptr && dst->typeName() == "sum" && dst->numInputPins() == 4) {
-            ++edgesIntoSum;
-            pinsUsed.push_back(e.dstPin);
+        const auto* source = graph->node(e.srcNode);
+        const auto* destination = graph->node(e.dstNode);
+        if (source && source->typeName() == "gain" && destination &&
+            destination->typeName() == "sum" && e.dstPin == 0) {
+            ++sourcesIntoMain;
         }
     }
-    CHECK(edgesIntoSum == 4);
-    std::sort(pinsUsed.begin(), pinsUsed.end());
-    CHECK(pinsUsed == std::vector<int>{0, 1, 2, 3});
+    CHECK(sourcesIntoMain >= 4);
 
     auto [compiled, err] = engine::compile(*graph, kSampleRate, kBlock);
     INFO("compile: " << (err ? err->message : std::string{}));

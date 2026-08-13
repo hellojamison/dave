@@ -3,6 +3,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -75,11 +76,98 @@ static PluginSlot pluginSlotFromJson(const json& jp) {
     return p;
 }
 
+static const char* routeKindStr(RouteTarget::Kind kind) {
+    switch (kind) {
+        case RouteTarget::Kind::None: return "none";
+        case RouteTarget::Kind::HardwareOutput: return "hardware";
+        case RouteTarget::Kind::AudioTrack: return "audioTrack";
+        case RouteTarget::Kind::Bus: return "bus";
+    }
+    return "none";
+}
+
+static RouteTarget::Kind parseRouteKind(const std::string& value) {
+    if (value == "hardware") return RouteTarget::Kind::HardwareOutput;
+    if (value == "audioTrack") return RouteTarget::Kind::AudioTrack;
+    if (value == "bus") return RouteTarget::Kind::Bus;
+    return RouteTarget::Kind::None;
+}
+
+static json routeToJson(const RouteTarget& route) {
+    json result{{"kind", routeKindStr(route.kind)}};
+    if (route.kind == RouteTarget::Kind::HardwareOutput) {
+        result["firstChannel"] = route.hardware.firstChannel;
+        result["channelCount"] = route.hardware.channelCount;
+    } else if (route.kind == RouteTarget::Kind::AudioTrack ||
+               route.kind == RouteTarget::Kind::Bus) {
+        result["targetId"] = route.targetId;
+    }
+    return result;
+}
+
+static RouteTarget routeFromJson(const json& value, RouteTarget fallback) {
+    if (!value.is_object()) return fallback;
+    RouteTarget result;
+    result.kind = parseRouteKind(value.value("kind", "none"));
+    if (result.kind == RouteTarget::Kind::HardwareOutput) {
+        result.targetId.clear();
+        result.hardware.firstChannel = value.value("firstChannel", 0);
+        result.hardware.channelCount = value.value("channelCount", 2);
+    } else if (result.kind == RouteTarget::Kind::AudioTrack ||
+               result.kind == RouteTarget::Kind::Bus) {
+        result.targetId = value.value("targetId", "");
+    } else {
+        result = RouteTarget::none();
+    }
+    return result;
+}
+
+static json sendToJson(const AuxSend& send) {
+    return json{{"id", send.id},
+                {"target", routeToJson(send.target)},
+                {"tap", send.tap == SendTap::PreFader ? "preFader" : "postFader"},
+                {"gain", send.gain},
+                {"muted", send.muted}};
+}
+
+static AuxSend sendFromJson(const json& value) {
+    AuxSend send;
+    send.id = value.value("id", "");
+    if (value.contains("target")) {
+        send.target = routeFromJson(value["target"], RouteTarget::none());
+    }
+    send.tap = value.value("tap", "postFader") == "preFader"
+        ? SendTap::PreFader : SendTap::PostFader;
+    send.gain = std::max(0.0, value.value("gain", 0.0));
+    send.muted = value.value("muted", true);
+    return send;
+}
+
+template <typename Channel>
+static void writeChannelRouting(json& value, const Channel& channel) {
+    value["mainOutput"] = routeToJson(channel.mainOutput);
+    json sends = json::array();
+    for (const auto& send : channel.sends) sends.push_back(sendToJson(send));
+    value["sends"] = std::move(sends);
+}
+
+template <typename Channel>
+static void readChannelRouting(const json& value, Channel& channel) {
+    if (value.contains("mainOutput")) {
+        channel.mainOutput = routeFromJson(value["mainOutput"], RouteTarget::bus());
+    }
+    if (value.contains("sends") && value["sends"].is_array()) {
+        for (const auto& send : value["sends"]) {
+            channel.sends.push_back(sendFromJson(send));
+        }
+    }
+}
+
 // ─── Serialize ──────────────────────────────────────────────────────────────
 
 std::string serializeEdit(const Edit& edit) {
     json j;
-    j["format"] = "dave.doc/v1";
+    j["format"] = "dave.doc/v2";
     // The session's own format, not a constant: sample positions in this
     // document are only meaningful against the rate that produced them.
     j["sampleRate"] = edit.sampleRate();
@@ -91,10 +179,23 @@ std::string serializeEdit(const Edit& edit) {
         json jt;
         jt["id"] = t.id;
         jt["name"] = t.name;
+        jt["color"] = t.color;
         jt["gain"] = t.gain;
         jt["pan"] = t.pan;
         jt["mute"] = t.mute;
         jt["solo"] = t.solo;
+        jt["recordArm"] = t.recordArm;
+        jt["inputChannel"] = t.inputChannel;
+        jt["inputChannelCount"] = t.inputChannelCount;
+        jt["hardwareInput"] = {
+            // inputChannel/inputChannelCount remain a compatibility surface
+            // during the v1->v2 transition. All new mutators synchronize the
+            // pair, and preferring them here preserves older callers too.
+            {"firstChannel", t.inputChannel},
+            {"channelCount", t.inputChannelCount},
+        };
+        jt["inputMonitor"] = t.inputMonitor;
+        writeChannelRouting(jt, t);
         json clips = json::array();
         for (const auto& c : t.clips) {
             clips.push_back({
@@ -125,10 +226,12 @@ std::string serializeEdit(const Edit& edit) {
         json jmt;
         jmt["id"] = mt.id;
         jmt["name"] = mt.name;
+        jmt["color"] = mt.color;
         jmt["gain"] = mt.gain;
         jmt["pan"] = mt.pan;
         jmt["mute"] = mt.mute;
         jmt["solo"] = mt.solo;
+        writeChannelRouting(jmt, mt);
         jmt["instrument"] = pluginSlotToJson(mt.instrument);
         json mclips = json::array();
         for (const auto& c : mt.clips) {
@@ -160,6 +263,26 @@ std::string serializeEdit(const Edit& edit) {
         midiTracks.push_back(jmt);
     }
     j["midiTracks"] = midiTracks;
+
+    json buses = json::array();
+    for (const auto& bus : edit.buses()) {
+        json jb{{"id", bus.id},
+                {"name", bus.name},
+                {"color", bus.color},
+                {"gain", bus.gain},
+                {"pan", bus.pan},
+                {"mute", bus.mute},
+                {"solo", bus.solo},
+                {"isMain", bus.isMain}};
+        writeChannelRouting(jb, bus);
+        json plugins = json::array();
+        for (const auto& plugin : bus.plugins) {
+            plugins.push_back(pluginSlotToJson(plugin));
+        }
+        jb["plugins"] = std::move(plugins);
+        buses.push_back(std::move(jb));
+    }
+    j["buses"] = std::move(buses);
 
     // Assets.
     json assets = json::array();
@@ -240,8 +363,10 @@ ProjectResult deserializeEdit(const std::string& text, Edit& edit) {
     } catch (const std::exception& e) {
         return {false, std::string("JSON parse error: ") + e.what()};
     }
-    if (j.value("format", "") != "dave.doc/v1") {
-        return {false, "not a dave.doc/v1 project (format missing or wrong)"};
+    const std::string format = j.value("format", "");
+    const bool legacyV1 = format == "dave.doc/v1";
+    if (!legacyV1 && format != "dave.doc/v2") {
+        return {false, "not a supported dave.doc project (expected v1 or v2)"};
     }
 
     // Projects written before the session format was configurable carry no
@@ -259,12 +384,34 @@ ProjectResult deserializeEdit(const std::string& text, Edit& edit) {
             Track t;
             t.id = jt.value("id", "");
             t.name = jt.value("name", "");
+            t.color = jt.value("color", "");
+            if (!validTrackColor(t.color)) t.color.clear();
             t.gain = jt.value("gain", 1.0);
             t.pan = jt.value("pan", 0.0);
             // Defaults keep projects written before mute/solo existed loading
             // as fully audible rather than silent.
             t.mute = jt.value("mute", false);
             t.solo = jt.value("solo", false);
+            // Legacy projects were never armed and implicitly used the first
+            // mono input. Only lower bounds are knowable here; the eventual
+            // capture device supplies the upper bound to
+            // clampTrackInputToCaptureChannels().
+            t.recordArm = jt.value("recordArm", false);
+            t.inputChannel = std::max(0, jt.value("inputChannel", 0));
+            t.inputChannelCount =
+                std::max(1, jt.value("inputChannelCount", 1));
+            t.hardwareInput = {t.inputChannel, t.inputChannelCount};
+            if (!legacyV1 && jt.contains("hardwareInput")) {
+                const auto& input = jt["hardwareInput"];
+                t.hardwareInput.firstChannel =
+                    std::max(0, input.value("firstChannel", t.inputChannel));
+                t.hardwareInput.channelCount =
+                    std::clamp(input.value("channelCount", t.inputChannelCount), 1, 2);
+                t.inputChannel = t.hardwareInput.firstChannel;
+                t.inputChannelCount = t.hardwareInput.channelCount;
+            }
+            t.inputMonitor = legacyV1 ? false : jt.value("inputMonitor", false);
+            if (!legacyV1) readChannelRouting(jt, t);
             if (jt.contains("clips")) {
                 for (const auto& jc : jt["clips"]) {
                     AudioClip c;
@@ -296,10 +443,13 @@ ProjectResult deserializeEdit(const std::string& text, Edit& edit) {
             MidiTrack mt;
             mt.id = jmt.value("id", "");
             mt.name = jmt.value("name", "");
+            mt.color = jmt.value("color", "");
+            if (!validTrackColor(mt.color)) mt.color.clear();
             mt.gain = jmt.value("gain", 1.0);
             mt.pan = jmt.value("pan", 0.0);
             mt.mute = jmt.value("mute", false);
             mt.solo = jmt.value("solo", false);
+            if (!legacyV1) readChannelRouting(jmt, mt);
             if (jmt.contains("instrument")) {
                 mt.instrument = pluginSlotFromJson(jmt["instrument"]);
             }
@@ -348,6 +498,30 @@ ProjectResult deserializeEdit(const std::string& text, Edit& edit) {
             edit.loadMidiTrack_(std::move(mt));
         }
     }
+
+    edit.clearBuses_();
+    if (!legacyV1 && j.contains("buses") && j["buses"].is_array()) {
+        for (const auto& jb : j["buses"]) {
+            BusTrack bus;
+            bus.id = jb.value("id", "");
+            bus.name = jb.value("name", "");
+            bus.color = jb.value("color", "");
+            if (!validTrackColor(bus.color)) bus.color.clear();
+            bus.gain = jb.value("gain", 1.0);
+            bus.pan = jb.value("pan", 0.0);
+            bus.mute = jb.value("mute", false);
+            bus.solo = jb.value("solo", false);
+            bus.isMain = bus.id == kMainBusId && jb.value("isMain", true);
+            readChannelRouting(jb, bus);
+            if (jb.contains("plugins")) {
+                for (const auto& plugin : jb["plugins"]) {
+                    bus.plugins.push_back(pluginSlotFromJson(plugin));
+                }
+            }
+            edit.loadBus_(std::move(bus));
+        }
+    }
+    edit.ensureMainBus_();
 
     // Assets — re-add via the asset map. We can't reach the private map, so we
     // re-import by path (which re-hashes; for bundled files the hash matches
@@ -425,6 +599,8 @@ ProjectResult deserializeEdit(const std::string& text, Edit& edit) {
         }
     }
 
+    const auto routing = edit.validateRouting();
+    if (!routing.ok) return {false, "invalid routing: " + routing.message};
     return {true, ""};
 }
 
@@ -435,15 +611,41 @@ bool isDaveBundle(const std::string& path) {
            fs::is_directory(path);
 }
 
+namespace {
+
+bool isPathWithin(const fs::path& child, const fs::path& parent) {
+    std::error_code error;
+    const fs::path childPath = fs::weakly_canonical(child, error);
+    if (error) return false;
+    const fs::path parentPath = fs::weakly_canonical(parent, error);
+    if (error) return false;
+    auto childIt = childPath.begin();
+    for (auto parentIt = parentPath.begin(); parentIt != parentPath.end();
+         ++parentIt, ++childIt) {
+        if (childIt == childPath.end() || *childIt != *parentIt) return false;
+    }
+    return true;
+}
+
+bool looksLikeBundledRecording(const fs::path& path) {
+    const fs::path parent = path.parent_path();
+    return parent.filename() == "recordings" &&
+           parent.parent_path().extension() == ".dave";
+}
+
+} // namespace
+
 ProjectResult saveBundle(const std::string& bundlePath, const Edit& edit,
                          bool copyAssets) {
     try {
         fs::create_directories(bundlePath);
         fs::path assetsDir = fs::path(bundlePath) / "assets";
         fs::path videoDir = fs::path(bundlePath) / "video";
+        fs::path recordingsDir = fs::path(bundlePath) / "recordings";
         if (copyAssets) {
             fs::create_directories(assetsDir);
             fs::create_directories(videoDir);
+            fs::create_directories(recordingsDir);
         }
 
         // For saveBundle we write the JSON with asset paths rewritten to be
@@ -461,6 +663,30 @@ ProjectResult saveBundle(const std::string& bundlePath, const Edit& edit,
                     if (!orig.empty() && fs::exists(orig)) {
                         // Determine extension from original.
                         fs::path src(orig);
+                        // Finished takes already inside this bundle are not
+                        // copied into assets/: retain their human-readable
+                        // filename and only make the JSON path relative. Save
+                        // As copies takes from the old bundle's recordings
+                        // directory into the new one.
+                        if (isPathWithin(src, recordingsDir) ||
+                            looksLikeBundledRecording(src)) {
+                            fs::path dst = recordingsDir / src.filename();
+                            if (!isPathWithin(src, recordingsDir)) {
+                                const std::string stem = dst.stem().string();
+                                const std::string extension =
+                                    dst.extension().string();
+                                for (int suffix = 2; fs::exists(dst);
+                                     ++suffix) {
+                                    dst = recordingsDir /
+                                        (stem + "_" +
+                                         std::to_string(suffix) + extension);
+                                }
+                                fs::copy_file(src, dst);
+                            }
+                            ja["path"] =
+                                "recordings/" + dst.filename().string();
+                            continue;
+                        }
                         std::string ext = src.extension().string();
                         fs::path dst = assetsDir / (sha + ext);
                         if (!fs::exists(dst)) {
@@ -522,10 +748,12 @@ ProjectResult loadBundle(const std::string& bundlePath, Edit& edit) {
         auto r = deserializeEdit(text, edit);
         if (!r.ok) return r;
 
-        // Rewrite relative asset/video paths to absolute (bundle-rooted).
+        // Rewrite relative media paths to absolute (bundle-rooted).
         fs::path base(bundlePath);
         for (auto& [id, a] : const_cast<std::unordered_map<AssetId, AudioAsset>&>(edit.assets())) {
-            if (!a.path.empty() && a.path.find("assets/") == 0) {
+            if (!a.path.empty() &&
+                (a.path.find("assets/") == 0 ||
+                 a.path.find("recordings/") == 0)) {
                 a.path = (base / a.path).string();
             }
         }

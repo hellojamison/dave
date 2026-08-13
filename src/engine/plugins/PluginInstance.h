@@ -83,6 +83,9 @@ public:
     // effects that take MIDI (an arpeggiator, a MIDI-triggered gate). Only
     // meaningful once loaded.
     bool acceptsMidi() const { return acceptsMidi_; }
+    uint32_t latencySamples() const;
+    bool consumeLatencyChange();
+    bool latencyChangePending() const;
 
     // Unload: deactivate, terminate processor, release controller/component.
     // Main thread. Idempotent.

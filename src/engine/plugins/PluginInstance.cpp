@@ -16,12 +16,38 @@
 
 #include <cstdio>
 #include <cstring>
+#include <atomic>
 #include <vector>
 
 namespace dave::engine {
 
 using namespace Steinberg;
 using namespace Steinberg::Vst;
+
+class DaveComponentHandler final : public IComponentHandler {
+public:
+    tresult PLUGIN_API beginEdit(ParamID) override { return kResultTrue; }
+    tresult PLUGIN_API performEdit(ParamID, ParamValue) override {
+        return kResultTrue;
+    }
+    tresult PLUGIN_API endEdit(ParamID) override { return kResultTrue; }
+    tresult PLUGIN_API restartComponent(int32 flags) override {
+        if ((flags & kLatencyChanged) != 0) {
+            latencyChanged.store(true, std::memory_order_release);
+        }
+        return kResultTrue;
+    }
+    tresult PLUGIN_API queryInterface(const TUID iid, void** object) override {
+        QUERY_INTERFACE(iid, object, FUnknown::iid, IComponentHandler)
+        QUERY_INTERFACE(iid, object, IComponentHandler::iid, IComponentHandler)
+        *object = nullptr;
+        return kNoInterface;
+    }
+    uint32 PLUGIN_API addRef() override { return 1000; }
+    uint32 PLUGIN_API release() override { return 1000; }
+
+    std::atomic<bool> latencyChanged{false};
+};
 
 // Hidden SDK-owned state. We keep this in a struct so PluginInstance.h doesn't
 // have to include the VST3 SDK headers (keeps the rest of the engine SDK-free).
@@ -31,6 +57,7 @@ struct PluginInstance::Impl {
     IPtr<IAudioProcessor> processor;
     IPtr<IEditController> controller;
     IPtr<HostApplication> hostContext;
+    DaveComponentHandler componentHandler;
 
     // HostProcessData is the SDK helper that allocates per-bus buffers.
     std::unique_ptr<HostProcessData> processData;
@@ -137,6 +164,9 @@ bool PluginInstance::load(const PluginDescriptor& desc, double sampleRate, int m
         // Note: do NOT call initialize on a component-obtained controller — it
         // shares the component's already-initialized state.
     }
+    if (p_->controller) {
+        p_->controller->setComponentHandler(&p_->componentHandler);
+    }
 
     // 6) Activate only the main audio buses (bus 0 in/out). Plugins with extra
     //    buses (sidechain, aux) need those deactivated, or their unwired
@@ -239,6 +269,33 @@ void PluginInstance::prepare(double sampleRate, int maxBlock) {
     if (p_->processor) p_->processor->setProcessing(true);
 }
 
+uint32_t PluginInstance::latencySamples() const {
+    return loaded_ && p_->processor ? p_->processor->getLatencySamples() : 0;
+}
+
+bool PluginInstance::consumeLatencyChange() {
+    if (!loaded_ || !p_->component || !p_->processor ||
+        !p_->componentHandler.latencyChanged.exchange(
+            false, std::memory_order_acq_rel)) {
+        return false;
+    }
+    // VST3 requires a deactivate/reactivate cycle before querying the new
+    // latency. This runs on the UI thread; the live immutable graph continues
+    // using the old instance until the caller publishes its replacement.
+    p_->processor->setProcessing(false);
+    p_->component->setActive(false);
+    ProcessSetup setup{kRealtime, kSample32, p_->maxBlock, p_->sampleRate};
+    p_->processor->setupProcessing(setup);
+    p_->component->setActive(true);
+    p_->processor->setProcessing(true);
+    return true;
+}
+
+bool PluginInstance::latencyChangePending() const {
+    return loaded_ &&
+        p_->componentHandler.latencyChanged.load(std::memory_order_acquire);
+}
+
 void PluginInstance::process(const float* const* in, float* const* out,
                               int numChannels, int numSamples,
                               const MidiEvent* events, int numEvents,
@@ -337,7 +394,10 @@ void PluginInstance::unload() {
         p_->processData->unprepare();
         p_->processData.reset();
     }
-    if (p_->controller) { p_->controller = nullptr; }
+    if (p_->controller) {
+        p_->controller->setComponentHandler(nullptr);
+        p_->controller = nullptr;
+    }
     if (p_->component) {
         p_->component->terminate();
         p_->component = nullptr;

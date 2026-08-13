@@ -2,7 +2,9 @@
 #include "gui/Mixer.h"
 
 #include "editing/Commands.h"
+#include "gui/RoutingViewModel.h"
 #include "gui/Theme.h"
+#include "gui/TrackColorPicker.h"
 
 #include <imgui.h>
 
@@ -24,6 +26,7 @@ ImU32 C(const ImVec4& v) {
 constexpr float kInsertRowHeight = 17.0f;
 constexpr float kRowGap = 2.0f;
 constexpr float kSectionGap = 6.0f;
+constexpr float kPanKnobDiameter = 34.0f;
 // Enough of the strip is fixed-height that the fader is what absorbs a resize.
 // Below this the fader stops being usable as a fader, so the strip clips
 // instead of shrinking it further.
@@ -36,14 +39,24 @@ constexpr float kMinFaderHeight = 60.0f;
 struct StripModel {
     std::string trackId;
     std::string* name = nullptr;
+    std::string* color = nullptr;
     double* gain = nullptr;
     double* pan = nullptr;
     bool* mute = nullptr;
     bool* solo = nullptr;
+    // Audio only. MIDI has no record-arm state in this milestone and passes
+    // null so its existing two-control layout remains unchanged.
+    bool* recordArm = nullptr;
+    document::HardwareChannelSpan* hardwareInput = nullptr;
+    bool* inputMonitor = nullptr;
+    document::RouteTarget* mainOutput = nullptr;
+    std::vector<document::AuxSend>* sends = nullptr;
     std::vector<document::PluginSlot>* inserts = nullptr;
     // Null for an audio track. Non-null (though possibly empty) for MIDI.
     document::PluginSlot* instrument = nullptr;
     bool isMidi = false;
+    bool isBus = false;
+    bool isMain = false;
 };
 
 // What a strip decided to do, applied by the caller once the loop over strips
@@ -56,6 +69,91 @@ struct StripAction {
     std::string slotId;
     bool isMidi = false;
 };
+
+bool drawPanKnob(const char* id, float& value) {
+    const auto& pal = theme::palette();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 knobSize(kPanKnobDiameter, kPanKnobDiameter);
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
+
+    ImGui::InvisibleButton(id, knobSize, ImGuiButtonFlags_MouseButtonLeft);
+    const bool hovered = ImGui::IsItemHovered();
+    const bool active = ImGui::IsItemActive();
+    bool changed = false;
+
+    if (active) {
+        const ImGuiIO& io = ImGui::GetIO();
+        const float sensitivity = io.KeyShift ? 0.0025f : 0.01f;
+        const float delta = io.MouseDelta.x - io.MouseDelta.y;
+        if (delta != 0.0f) {
+            const float next = std::clamp(value + delta * sensitivity,
+                                          -1.0f, 1.0f);
+            if (next != value) {
+                value = next;
+                changed = true;
+            }
+        }
+    }
+    if ((ImGui::IsItemClicked() && ImGui::GetIO().KeyAlt) ||
+        (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))) {
+        if (value != 0.0f) {
+            value = 0.0f;
+            changed = true;
+        }
+    }
+    if (hovered && ImGui::GetIO().MouseWheel != 0.0f) {
+        const float step = ImGui::GetIO().KeyShift ? 0.01f : 0.05f;
+        const float next = std::clamp(
+            value + ImGui::GetIO().MouseWheel * step, -1.0f, 1.0f);
+        if (next != value) {
+            value = next;
+            changed = true;
+        }
+    }
+
+    constexpr float pi = 3.14159265358979323846f;
+    constexpr float startAngle = pi * 0.75f;
+    constexpr float endAngle = pi * 2.25f;
+    constexpr float centerAngle = pi * 1.5f;
+    const float angle = startAngle + (value + 1.0f) * 0.5f *
+                                         (endAngle - startAngle);
+    const ImVec2 center(pos.x + kPanKnobDiameter * 0.5f,
+                        pos.y + kPanKnobDiameter * 0.5f);
+    const float radius = kPanKnobDiameter * 0.5f - 2.0f;
+
+    dl->AddCircleFilled(center, radius - 2.0f,
+                        C(active ? pal.surfaceStrong
+                                 : (hovered ? pal.trackControlInactive
+                                            : pal.surfaceBase)),
+                        32);
+    dl->PathArcTo(center, radius, startAngle, endAngle, 28);
+    dl->PathStroke(C(active ? pal.textMuted : pal.borderStrong), false, 2.0f);
+    if (value < 0.0f) {
+        dl->PathArcTo(center, radius, angle, centerAngle, 16);
+        dl->PathStroke(C(pal.accent), false, 2.0f);
+    } else if (value > 0.0f) {
+        dl->PathArcTo(center, radius, centerAngle, angle, 16);
+        dl->PathStroke(C(pal.accent), false, 2.0f);
+    }
+    for (const float tickAngle : {startAngle, centerAngle, endAngle}) {
+        const ImVec2 outer(center.x + std::cos(tickAngle) * (radius + 1.0f),
+                           center.y + std::sin(tickAngle) * (radius + 1.0f));
+        const ImVec2 inner(center.x + std::cos(tickAngle) * (radius - 2.0f),
+                           center.y + std::sin(tickAngle) * (radius - 2.0f));
+        dl->AddLine(inner, outer, C(pal.textSubtle), 1.0f);
+    }
+    const ImVec2 needleEnd(
+        center.x + std::cos(angle) * (radius - 5.0f),
+        center.y + std::sin(angle) * (radius - 5.0f));
+    dl->AddLine(center, needleEnd, C(pal.accentStrong), 2.0f);
+    dl->AddCircleFilled(center, 2.0f, C(pal.accentStrong), 12);
+
+    if (hovered) {
+        ImGui::SetTooltip("Pan %s\nDrag up/right or down/left\nShift for fine adjustment\nOption/Alt-click or double-click to center",
+                          theme::formatPan(value).c_str());
+    }
+    return changed;
+}
 
 // A compact slot button: bypass dot on the left, name filling the rest.
 // Left-click opens the plugin's editor, right-click opens a menu. Returns true
@@ -150,9 +248,40 @@ bool drawAddInsertRow(int uid, float width) {
     return pressed;
 }
 
+void drawRouteChoices(const StripModel& model, const document::Edit& edit,
+                      TimelineViewState& view, int playbackChannels) {
+    const auto options = routingTargetOptions(edit, model.trackId,
+                                              playbackChannels, false);
+    RoutingTargetOption::Group previous = RoutingTargetOption::Group::HardwareOutputs;
+    bool first = true;
+    for (const auto& option : options) {
+        if (first || option.group != previous) {
+            if (!first) ImGui::Separator();
+            const char* label = option.group == RoutingTargetOption::Group::MainAndBuses
+                ? "Main / Buses"
+                : option.group == RoutingTargetOption::Group::AudioTracks
+                    ? "Audio Tracks" : "Hardware Outputs";
+            ImGui::TextDisabled("%s", label);
+            previous = option.group;
+            first = false;
+        }
+        const bool selected = model.mainOutput && *model.mainOutput == option.target;
+        if (ImGui::MenuItem(option.label.c_str(), nullptr, selected,
+                            option.enabled)) {
+            view.routing.request({RoutingRequest::Kind::SetMainOutput,
+                                  model.trackId, {}, false, option.target, {}});
+        }
+        if (!option.enabled &&
+            ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip("%s", option.disabledReason.c_str());
+        }
+    }
+}
+
 StripAction drawStrip(const StripModel& m, document::Edit& edit,
                       TimelineViewState& view, int uid, bool selected,
-                      bool anySoloed, float stripWidth, float stripHeight) {
+                      bool anySoloed, float stripWidth, float stripHeight,
+                      int captureChannels, int playbackChannels) {
     const auto& pal = theme::palette();
     StripAction action;
     ImGui::PushID(uid);
@@ -183,10 +312,27 @@ StripAction drawStrip(const StripModel& m, document::Edit& edit,
     // row are recognisably the same track.
     {
         const ImVec2 pos = ImGui::GetCursorScreenPos();
-        dl->AddRectFilled(ImVec2(pos.x, pos.y),
-                          ImVec2(pos.x + inner, pos.y + 3.0f),
-                          C(m.isMidi ? pal.clipMidiBorder : pal.clipAudioBorder));
-        ImGui::Dummy(ImVec2(inner, 4.0f));
+        const ImVec4 defaultColor = m.isMain
+            ? pal.accentStrong
+            : (m.isBus ? pal.success
+                       : (m.isMidi ? pal.clipMidiBorder : pal.clipAudioBorder));
+        const ImVec4 identityColor =
+            trackColorValue(m.color ? *m.color : std::string{}, defaultColor);
+        if (ImGui::InvisibleButton("##color", ImVec2(inner, 7.0f))) {
+            ImGui::OpenPopup("##trackColor");
+        }
+        const bool hovered = ImGui::IsItemHovered();
+        dl->AddRectFilled(ImVec2(pos.x, pos.y + 2.0f),
+                          ImVec2(pos.x + inner, pos.y + 5.0f),
+                          C(identityColor));
+        if (hovered) ImGui::SetTooltip("Choose track color");
+        std::string selectedColor;
+        if (drawTrackColorPopup("##trackColor",
+                                m.color ? *m.color : std::string{},
+                                selectedColor)) {
+            view.requestTrackColorId = m.trackId;
+            view.requestTrackColor = std::move(selectedColor);
+        }
     }
     {
         const ImVec2 pos = ImGui::GetCursorScreenPos();
@@ -198,6 +344,76 @@ StripAction drawStrip(const StripModel& m, document::Edit& edit,
                     m.name->c_str());
         dl->PopClipRect();
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", m.name->c_str());
+    }
+    ImGui::Dummy(ImVec2(inner, kSectionGap * 0.5f));
+
+    // ─── Compact routing ───────────────────────────────────────────────────
+    if (m.hardwareInput != nullptr) {
+        const std::string inputLabel = m.hardwareInput->channelCount == 2
+            ? "IN " + std::to_string(m.hardwareInput->firstChannel + 1) + "-" +
+                  std::to_string(m.hardwareInput->firstChannel + 2)
+            : "IN " + std::to_string(m.hardwareInput->firstChannel + 1);
+        const float monitorWidth = 22.0f;
+        if (ImGui::Button(inputLabel.c_str(), ImVec2(inner - monitorWidth - 4.0f, 18.0f))) {
+            ImGui::OpenPopup("##inputRoute");
+        }
+        ImGui::SameLine(0.0f, 4.0f);
+        const bool monitoring = m.inputMonitor && *m.inputMonitor;
+        if (monitoring) ImGui::PushStyleColor(ImGuiCol_Button, pal.success);
+        if (ImGui::Button("I", ImVec2(monitorWidth, 18.0f)) && m.inputMonitor) {
+            RoutingRequest request;
+            request.kind = RoutingRequest::Kind::SetInputMonitor;
+            request.ownerId = m.trackId;
+            request.enabled = !*m.inputMonitor;
+            view.routing.request(std::move(request));
+        }
+        if (monitoring) ImGui::PopStyleColor();
+        if (ImGui::BeginPopup("##inputRoute")) {
+            for (int channel = 0; channel < captureChannels; ++channel) {
+                const std::string label = "Input " + std::to_string(channel + 1);
+                if (ImGui::MenuItem(label.c_str())) {
+                    RoutingRequest request;
+                    request.kind = RoutingRequest::Kind::SetHardwareInput;
+                    request.ownerId = m.trackId;
+                    request.hardware = {channel, 1};
+                    view.routing.request(std::move(request));
+                }
+            }
+            for (int channel = 0; channel + 1 < captureChannels; channel += 2) {
+                const std::string label = "Input " + std::to_string(channel + 1) +
+                    "-" + std::to_string(channel + 2);
+                if (ImGui::MenuItem(label.c_str())) {
+                    RoutingRequest request;
+                    request.kind = RoutingRequest::Kind::SetHardwareInput;
+                    request.ownerId = m.trackId;
+                    request.hardware = {channel, 2};
+                    view.routing.request(std::move(request));
+                }
+            }
+            if (captureChannels == 0) ImGui::TextDisabled("No capture channels");
+            ImGui::EndPopup();
+        }
+    }
+    if (m.mainOutput != nullptr) {
+        const std::string route = routeTargetLabel(edit, *m.mainOutput,
+                                                   playbackChannels);
+        if (ImGui::Button(("OUT " + route).c_str(), ImVec2(inner, 18.0f))) {
+            ImGui::OpenPopup("##mainRoute");
+        }
+        if (ImGui::BeginPopup("##mainRoute")) {
+            drawRouteChoices(m, edit, view, playbackChannels);
+            ImGui::EndPopup();
+        }
+    }
+    if (m.sends != nullptr) {
+        int active = 0;
+        for (const auto& send : *m.sends) if (!send.muted && send.gain > 0.0) ++active;
+        const std::string summary = "SENDS " + std::to_string(active) + "/" +
+            std::to_string(m.sends->size());
+        ImGui::TextDisabled("%s", summary.c_str());
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Edit sends in the selected channel's Routing inspector");
+        }
     }
     ImGui::Dummy(ImVec2(inner, kSectionGap * 0.5f));
 
@@ -239,39 +455,68 @@ StripAction drawStrip(const StripModel& m, document::Edit& edit,
                              m.isMidi};
     }
 
-    // ─── Mute / solo ────────────────────────────────────────────────────────
+    // ─── Record arm / mute / solo ───────────────────────────────────────────
     ImGui::Dummy(ImVec2(inner, kSectionGap));
     {
-        const float half = (inner - 4.0f) * 0.5f;
-        struct Toggle { const char* label; bool* flag; ImVec4 active; };
-        const Toggle toggles[2] = {
-            {"M", m.mute, pal.trackMuteActive},
-            {"S", m.solo, pal.trackSoloActive},
+        const int toggleCount = m.recordArm != nullptr ? 3 : 2;
+        const float buttonWidth =
+            (inner - 4.0f * static_cast<float>(toggleCount - 1)) /
+            static_cast<float>(toggleCount);
+        struct Toggle {
+            const char* label;
+            bool* flag;
+            ImVec4 active;
+            const char* tooltip;
         };
-        for (int b = 0; b < 2; ++b) {
+        Toggle toggles[3];
+        int nextToggle = 0;
+        if (m.recordArm != nullptr) {
+            toggles[nextToggle++] =
+                Toggle{"R", m.recordArm, pal.danger, "Record arm"};
+        }
+        toggles[nextToggle++] =
+            Toggle{"M", m.mute, pal.trackMuteActive, "Mute"};
+        toggles[nextToggle++] =
+            Toggle{"S", m.solo, pal.trackSoloActive, "Solo"};
+        for (int b = 0; b < toggleCount; ++b) {
             ImGui::PushID(b);
             const ImVec2 pos = ImGui::GetCursorScreenPos();
-            if (ImGui::InvisibleButton("##ms", ImVec2(half, 18.0f))) {
-                *toggles[b].flag = !*toggles[b].flag;
-                edit.notifyChanged();
+            if (ImGui::InvisibleButton("##rms", ImVec2(buttonWidth, 18.0f))) {
+                if (b == 0 && m.recordArm != nullptr &&
+                    view.deferRecordArmRequests) {
+                    view.requestRecordArmTrackId = m.trackId;
+                } else {
+                    *toggles[b].flag = !*toggles[b].flag;
+                    edit.notifyChanged();
+                }
             }
             const bool hovered = ImGui::IsItemHovered();
             const ImVec2 bMin = pos;
-            const ImVec2 bMax(pos.x + half, pos.y + 18.0f);
+            const ImVec2 bMax(pos.x + buttonWidth, pos.y + 18.0f);
             const bool on = *toggles[b].flag;
-            dl->AddRectFilled(bMin, bMax,
-                              on ? C(toggles[b].active)
-                                 : (hovered ? C(pal.surfaceStrong)
-                                            : C(pal.trackControlInactive)),
-                              3.0f);
-            dl->AddRect(bMin, bMax, on ? C(toggles[b].active) : C(pal.border), 3.0f);
-            const ImVec2 ts = ImGui::CalcTextSize(toggles[b].label);
-            dl->AddText(ImVec2((bMin.x + bMax.x - ts.x) * 0.5f,
-                               (bMin.y + bMax.y - ts.y) * 0.5f),
-                        on ? IM_COL32(32, 30, 28, 255) : C(pal.textMuted),
-                        toggles[b].label);
+            const bool isRecordArm = b == 0 && m.recordArm != nullptr;
+            if (isRecordArm) {
+                theme::drawRecordArmIndicator(
+                    dl, ImVec2((bMin.x + bMax.x) * 0.5f,
+                               (bMin.y + bMax.y) * 0.5f),
+                    6.5f, on, hovered);
+            } else {
+                dl->AddRectFilled(
+                    bMin, bMax,
+                    on ? C(toggles[b].active)
+                       : (hovered ? C(pal.surfaceStrong)
+                                  : C(pal.trackControlInactive)),
+                    3.0f);
+                dl->AddRect(bMin, bMax,
+                            on ? C(toggles[b].active) : C(pal.border), 3.0f);
+                theme::drawCenteredControlLabel(
+                    dl, theme::Rect{bMin, bMax},
+                    on ? IM_COL32(32, 30, 28, 255) : C(pal.textMuted),
+                    toggles[b].label);
+            }
+            if (hovered) ImGui::SetTooltip("%s", toggles[b].tooltip);
             ImGui::PopID();
-            if (b == 0) ImGui::SameLine(0.0f, 4.0f);
+            if (b + 1 < toggleCount) ImGui::SameLine(0.0f, 4.0f);
         }
     }
 
@@ -286,19 +531,17 @@ StripAction drawStrip(const StripModel& m, document::Edit& edit,
     ImGui::Dummy(ImVec2(inner, kRowGap));
     {
         float panVal = static_cast<float>(*m.pan);
-        ImGui::SetNextItemWidth(inner);
-        // The format string is the readout: ImGui prints it verbatim when it
-        // holds no conversion specifier, which "L50" does not.
-        const std::string panText = theme::formatPan(panVal);
-        if (ImGui::SliderFloat("##pan", &panVal, -1.0f, 1.0f,
-                               panText.c_str())) {
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                             (inner - kPanKnobDiameter) * 0.5f);
+        if (drawPanKnob("##pan", panVal)) {
             *m.pan = panVal;
             edit.notifyChanged();
         }
-        if (ImGui::IsItemClicked() && ImGui::GetIO().KeyAlt) {
-            *m.pan = 0.0;
-            edit.notifyChanged();
-        }
+        const std::string panText = theme::formatPan(panVal);
+        const ImVec2 textSize = ImGui::CalcTextSize(panText.c_str());
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                             std::max(0.0f, (inner - textSize.x) * 0.5f));
+        ImGui::TextUnformatted(panText.c_str());
     }
 
     // ─── Fader ──────────────────────────────────────────────────────────────
@@ -317,16 +560,21 @@ StripAction drawStrip(const StripModel& m, document::Edit& edit,
             20.0f * std::log10(std::max(0.0001f, static_cast<float>(*m.gain)));
         constexpr float faderW = 24.0f;
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (inner - faderW) * 0.5f);
-        if (ImGui::VSliderFloat("##fader", ImVec2(faderW, faderH), &gainDb,
-                                -60.0f, 6.0f, "")) {
-            *m.gain = std::pow(10.0f, gainDb / 20.0f);
+        const bool faderDragged = ImGui::VSliderFloat(
+            "##fader", ImVec2(faderW, faderH), &gainDb,
+            -60.0f, 6.0f, "");
+        const bool faderReset =
+            ImGui::IsItemClicked(ImGuiMouseButton_Left) &&
+            ImGui::GetIO().KeyAlt;
+        if (faderReset) gainDb = 0.0f;
+        const double nextGain = std::pow(10.0f, gainDb / 20.0f);
+        if ((faderDragged || faderReset) && *m.gain != nextGain) {
+            *m.gain = nextGain;
             edit.notifyChanged();
         }
-        if (ImGui::IsItemClicked() && ImGui::GetIO().KeyAlt) {
-            *m.gain = 1.0;
-            edit.notifyChanged();
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Fader (Option/Alt-click for 0 dB)");
         }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Fader (alt-click for 0 dB)");
         char dbText[16];
         std::snprintf(dbText, sizeof(dbText), "%+.1f", gainDb);
         const ImVec2 ts = ImGui::CalcTextSize(dbText);
@@ -343,10 +591,12 @@ StripAction drawStrip(const StripModel& m, document::Edit& edit,
 } // namespace
 
 void drawMixer(document::Edit& edit, editing::UndoStack& undo,
-               TimelineViewState& view, float stripWidth) {
+               TimelineViewState& view, float stripWidth,
+               int captureChannels, int playbackChannels) {
     const bool anySoloed = edit.anySoloed();
 
-    if (edit.tracks().empty() && edit.midiTracks().empty()) {
+    if (edit.tracks().empty() && edit.midiTracks().empty() &&
+        edit.buses().empty()) {
         const auto& pal = theme::palette();
         const char* msg = "No tracks yet";
         const ImVec2 ts = ImGui::CalcTextSize(msg);
@@ -377,14 +627,21 @@ void drawMixer(document::Edit& edit, editing::UndoStack& undo,
         StripModel m;
         m.trackId = t.id;
         m.name = &t.name;
+        m.color = &t.color;
         m.gain = &t.gain;
         m.pan = &t.pan;
         m.mute = &t.mute;
         m.solo = &t.solo;
+        m.recordArm = &t.recordArm;
+        m.hardwareInput = &t.hardwareInput;
+        m.inputMonitor = &t.inputMonitor;
+        m.mainOutput = &t.mainOutput;
+        m.sends = &t.sends;
         m.inserts = &t.plugins;
         const StripAction a = drawStrip(m, edit, view, uid,
                                         view.selectedTrackIndex == uid,
-                                        anySoloed, stripWidth, stripHeight);
+                                        anySoloed, stripWidth, stripHeight,
+                                        captureChannels, playbackChannels);
         if (a.kind != StripAction::Kind::None) action = a;
         ImGui::SameLine(0.0f, 3.0f);
         ++uid;
@@ -393,21 +650,58 @@ void drawMixer(document::Edit& edit, editing::UndoStack& undo,
         StripModel m;
         m.trackId = t.id;
         m.name = &t.name;
+        m.color = &t.color;
         m.gain = &t.gain;
         m.pan = &t.pan;
         m.mute = &t.mute;
         m.solo = &t.solo;
+        m.mainOutput = &t.mainOutput;
+        m.sends = &t.sends;
         m.inserts = &t.plugins;
         m.instrument = &t.instrument;
         m.isMidi = true;
         const StripAction a = drawStrip(m, edit, view, uid,
                                         view.selectedTrackIndex == uid,
-                                        anySoloed, stripWidth, stripHeight);
+                                        anySoloed, stripWidth, stripHeight,
+                                        captureChannels, playbackChannels);
+        if (a.kind != StripAction::Kind::None) action = a;
+        ImGui::SameLine(0.0f, 3.0f);
+        ++uid;
+    }
+    for (auto& bus : edit.busesMut()) {
+        StripModel m;
+        m.trackId = bus.id;
+        m.name = &bus.name;
+        m.color = &bus.color;
+        m.gain = &bus.gain;
+        m.pan = &bus.pan;
+        m.mute = &bus.mute;
+        m.solo = &bus.solo;
+        m.mainOutput = &bus.mainOutput;
+        m.sends = &bus.sends;
+        m.inserts = &bus.plugins;
+        m.isBus = true;
+        m.isMain = bus.isMain;
+        const StripAction a = drawStrip(m, edit, view, uid,
+                                        view.selectedTrackIndex == uid,
+                                        anySoloed, stripWidth, stripHeight,
+                                        captureChannels, playbackChannels);
         if (a.kind != StripAction::Kind::None) action = a;
         ImGui::SameLine(0.0f, 3.0f);
         ++uid;
     }
     ImGui::EndChild();
+    if (ImGui::BeginPopupContextWindow("##mixerChannelMenu",
+                                       ImGuiPopupFlags_MouseButtonRight |
+                                       ImGuiPopupFlags_NoOpenOverItems)) {
+        if (ImGui::MenuItem("Add Audio Track", "Shift+Cmd+N")) {
+            undo.execute(std::make_unique<editing::AddTrackCommand>("Track"));
+        }
+        if (ImGui::MenuItem("Add Bus", "Shift+Cmd+B")) {
+            undo.execute(std::make_unique<editing::AddBusCommand>("Bus"));
+        }
+        ImGui::EndPopup();
+    }
 
     // Applied after the loop: every one of these reallocates a track vector or
     // a plugin vector that the strips above were drawn from.
@@ -433,6 +727,12 @@ void drawMixer(document::Edit& edit, editing::UndoStack& undo,
             undo.execute(std::make_unique<editing::SetMidiInstrumentCommand>(
                 action.trackId, document::PluginSlot{}));
             break;
+    }
+    if (!view.requestTrackColorId.empty()) {
+        undo.execute(std::make_unique<editing::SetTrackColorCommand>(
+            view.requestTrackColorId, view.requestTrackColor));
+        view.requestTrackColorId.clear();
+        view.requestTrackColor.clear();
     }
 }
 

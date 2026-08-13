@@ -10,17 +10,23 @@ system, free node-graph routing, and VST3 / AU / CLAP plugin hosting.
 
 ## Status
 
-🚧 **Early, but it runs.** macOS only so far. Not ready for real work — there
-is no recording, and nothing here should be trusted with a session you care
-about.
+🚧 **Early, but it runs.** macOS only so far. Not ready for real work, and the
+new recording path still needs broad hardware and failure-recovery testing;
+nothing here should be trusted with a session you care about.
 
-**Works today:** audio playback through our own node graph, with device
-selection, a transport that returns to where playback started, and loop
+**Works today:** audio playback through our own node graph, with separate
+output/input device selection and all-channel live input metering. Audio tracks
+can be armed to a mono input or stereo pair and recorded as linear WAV takes
+inside a saved `.dave` bundle; stopping commits aligned clips with undo/redo.
+A transport
+that returns to where playback started, and loop
 playback over a selection or a loop marker. A timeline with tracks, clips,
 drag editing, peak waveforms, undo/redo, and lane-scoped range selection that
 snaps to the divisions of the current timing format — min:sec, timecode,
 bars|beats, feet+frames or samples, each with a matching grid. A mixer with
-per-track gain, pan, mute and solo. VST3 hosting — scanning, loading, native
+per-track gain, pan, mute and solo, per-track hardware inputs, explicit input monitoring, hardware output spans,
+a permanent Main bus, user buses, pre/post auxiliary sends, cycle-safe
+track-to-track/bus routing, and plug-in delay compensation. VST3 hosting — scanning, loading, native
 plugin editor windows, bypass and state save/restore — including instruments
 on MIDI tracks. MIDI file import onto MIDI tracks. A multi-track marker lane
 with Reaper CSV import/export and loop regions. Video playback with a preview
@@ -28,10 +34,10 @@ panel synced to the audio clock, plus a video lane with thumbnails. Projects
 save and load as `.dave` bundles with content-addressed assets, carrying the
 session sample rate and bit depth.
 
-**Not yet:** recording of any kind — the audio device is opened for playback
-only, so there is no capture, no record arm, and no take handling. Also
-Windows (untested), automation, video editing, rendering and export (the bit
-depth setting is stored but nothing consumes it yet), AU and CLAP hosting,
+**Not yet:** punch/loop recording, takes/playlists, live
+waveforms, unsaved-session scratch recording, crash recovery, orphan cleanup,
+or MIDI recording. Also Windows (untested), automation, video editing,
+rendering and export, AU and CLAP hosting,
 live MIDI I/O, and time/pitch. See the roadmap.
 
 ## Goals
@@ -85,6 +91,14 @@ cmake --build build
 
 Already cloned without submodules? `git submodule update --init --recursive`.
 
+### Recording latency calibration
+
+The I/O panel's **Offset** field is a per-machine compensation in samples.
+Send a short click from an output to an input with a physical loopback, record
+it onto an armed track, measure how many samples the recorded click lands late,
+and enter that positive number. New takes are moved earlier by that amount.
+Leave it at the default `0` until you have measured the actual device path.
+
 The app can also capture itself, which is useful for UI work in environments
 where screen recording isn't available:
 
@@ -114,7 +128,7 @@ stays available under the project's licence.
 | 5 — Video playback | FFmpeg decode; A/V sync; preview; video lane | ✅ |
 | 6 — Video NLE | Video tracks; transitions; compositor; render/export | ⬜ |
 | — | MIDI | 🟡 File import, MIDI tracks and instrument hosting; live I/O and editing pending |
-| — | Recording | ⬜ Playback-only device; no capture, arm or takes |
+| — | Recording | 🟡 Linear armed-track WAV takes and explicit input monitoring; punch, loop record, takes model and recovery pending |
 | — | Automation, time/pitch | ⬜ |
 | — | Test suite + CI | 🟡 Unit tests + macOS CI; RT-safety checks (TSan/ASan, no allocs or locks on the audio thread) pending |
 | 7 — Polish / 1.0 | Theming; a11y; crash reporting; packaging; DAWproject | 🟡 Theming done; rest pending |

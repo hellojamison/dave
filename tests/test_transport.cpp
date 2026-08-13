@@ -165,6 +165,45 @@ TEST_CASE("a project written before the session format existed still loads",
     CHECK(edit.bitDepth() == 24);
 }
 
+TEST_CASE("audio track arm and input routing round-trip independently",
+          "[session][record-arm]") {
+    document::Edit edit;
+    const std::string first = edit.addTrack("Boom");
+    const std::string second = edit.addTrack("Lav");
+    edit.track(first)->recordArm = true;
+    edit.track(first)->inputChannel = 3;
+    edit.track(first)->inputChannelCount = 2;
+
+    document::Edit loaded;
+    REQUIRE(document::deserializeEdit(document::serializeEdit(edit), loaded).ok);
+    REQUIRE(loaded.tracks().size() == 2);
+    const auto* loadedFirst = loaded.track(first);
+    const auto* loadedSecond = loaded.track(second);
+    REQUIRE(loadedFirst != nullptr);
+    REQUIRE(loadedSecond != nullptr);
+    CHECK(loadedFirst->recordArm);
+    CHECK(loadedFirst->inputChannel == 3);
+    CHECK(loadedFirst->inputChannelCount == 2);
+    CHECK_FALSE(loadedSecond->recordArm);
+    CHECK(loadedSecond->inputChannel == 0);
+    CHECK(loadedSecond->inputChannelCount == 1);
+}
+
+TEST_CASE("legacy audio tracks load unarmed on the first mono input",
+          "[session][record-arm]") {
+    const std::string legacy = R"({
+        "format":"dave.doc/v1",
+        "tracks":[{"id":"track_1","name":"Legacy","clips":[],"plugins":[]}]
+    })";
+    document::Edit edit;
+    REQUIRE(document::deserializeEdit(legacy, edit).ok);
+    REQUIRE(edit.tracks().size() == 1);
+    const auto& track = edit.tracks().front();
+    CHECK_FALSE(track.recordArm);
+    CHECK(track.inputChannel == 0);
+    CHECK(track.inputChannelCount == 1);
+}
+
 TEST_CASE("setting the session rate notifies listeners", "[session]") {
     // DaveApp reopens the audio device off this notification; without it the
     // engine keeps running at the old rate.

@@ -6,6 +6,7 @@
 #include "engine/nodes/AudioClipNode.h"
 #include "engine/nodes/GainNode.h"
 #include "engine/nodes/InstrumentNode.h"
+#include "engine/nodes/RoutingNodes.h"
 #include "engine/nodes/SummingNode.h"
 #include "engine/plugins/PluginInstance.h"
 #include "engine/plugins/PluginNode.h"
@@ -41,7 +42,8 @@ public:
     ~GraphBuilder();
 
     // Build a fresh engine::Graph from the given Edit.
-    std::unique_ptr<Graph> build(const document::Edit& edit, double sampleRate);
+    std::unique_ptr<Graph> build(const document::Edit& edit, double sampleRate,
+                                 int playbackChannels = 2);
 
     std::shared_ptr<GainNode> master() const { return master_; }
     const std::unordered_map<std::string, std::shared_ptr<GainNode>>& trackGains() const {
@@ -67,6 +69,11 @@ public:
         return it == pluginInstances_.end() ? nullptr : it->second;
     }
 
+    // UI-thread poll for VST3 latency changes. The app rebuilds the immutable
+    // graph before the next publication when this returns true.
+    bool consumeLatencyChange();
+    bool latencyChangePending() const;
+
 private:
     // Get-or-create the cached PluginInstance for a slot, restoring its saved
     // state on first load. Returns nullptr if the slot names no plugin or the
@@ -85,6 +92,7 @@ private:
     // Plugin instances keyed by slot id. Survive re-derives; pruned of slots
     // no longer in the Edit at the start of each build().
     std::unordered_map<std::string, std::shared_ptr<PluginInstance>> pluginInstances_;
+    std::unordered_map<std::string, uint32_t> pluginLatencies_;
 
     std::shared_ptr<GainNode> master_;
     std::unordered_map<std::string, std::shared_ptr<GainNode>> trackGains_;

@@ -53,3 +53,33 @@ TEST_CASE("tracks default to audible", "[mixer]") {
     CHECK_FALSE(t.solo);
     CHECK(trackAudible(t, false));
 }
+
+TEST_CASE("audio tracks default to a safe mono input and are not armed",
+          "[mixer][record-arm]") {
+    Track t;
+    CHECK_FALSE(t.recordArm);
+    CHECK(t.inputChannel == 0);
+    CHECK(t.inputChannelCount == 1);
+}
+
+TEST_CASE("saved track inputs clamp to a supplied live capture width",
+          "[mixer][record-arm]") {
+    using dave::document::clampTrackInputToCaptureChannels;
+    Track t;
+    t.inputChannel = 7;
+    t.inputChannelCount = 4;
+
+    CHECK(clampTrackInputToCaptureChannels(t, 2));
+    CHECK(t.inputChannel == 0);
+    CHECK(t.inputChannelCount == 2);
+    CHECK_FALSE(clampTrackInputToCaptureChannels(t, 2));
+
+    CHECK(clampTrackInputToCaptureChannels(t, 0));
+    CHECK(t.inputChannel == 0);
+    CHECK(t.inputChannelCount == 0);
+
+    // A route repaired after the input returns always selects at least mono.
+    CHECK(clampTrackInputToCaptureChannels(t, 8));
+    CHECK(t.inputChannel == 0);
+    CHECK(t.inputChannelCount == 1);
+}

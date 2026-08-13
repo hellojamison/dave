@@ -121,6 +121,10 @@ void Window::setFileDropCallback(FileDropCallback cb) {
     fileDropCallback_ = std::move(cb);
 }
 
+void Window::close() {
+    if (!closeGuard_ || closeGuard_()) shouldClose_ = true;
+}
+
 void Window::run() {
     if (window_ == nullptr) {
         return;
@@ -134,6 +138,9 @@ void Window::run() {
     int completedFrames = 0;
     while (!shouldClose_ && !glfwWindowShouldClose(window_)) {
         glfwPollEvents();
+        if (glfwWindowShouldClose(window_) && closeGuard_ && !closeGuard_()) {
+            glfwSetWindowShouldClose(window_, GLFW_FALSE);
+        }
         if (frameCallback_) {
             frameCallback_();
         }

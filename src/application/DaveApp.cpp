@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "application/DaveApp.h"
+#include "application/MainEditorLayout.h"
 #include "document/MarkerCsv.h"
 #include "document/ProjectFile.h"
 #include "editing/Commands.h"
@@ -13,16 +14,110 @@
 #include <nfd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cfloat>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
+#include <filesystem>
 #include <fstream>
+#include <unordered_set>
 #include <string>
 
 namespace dave::application {
 
 namespace {
+
+constexpr const char* kOutputDefaultId = "output:default";
+constexpr const char* kInputOffId = gui::IoPanelState::kInputOffId;
+constexpr const char* kInputDefaultId = gui::IoPanelState::kInputDefaultId;
+
+std::string outputDeviceId(std::size_t index) {
+    return "output:" + std::to_string(index);
+}
+
+std::string inputDeviceId(std::size_t index) {
+    return "input:" + std::to_string(index);
+}
+
+int firstNameIndex(const std::vector<std::string>& names,
+                   const std::string& wanted) {
+    const auto found = std::find(names.begin(), names.end(), wanted);
+    return found == names.end()
+        ? -1
+        : static_cast<int>(std::distance(names.begin(), found));
+}
+
+std::string safeTakeName(const std::string& name) {
+    std::string safe;
+    safe.reserve(name.size());
+    for (unsigned char c : name) {
+        if (std::isalnum(c) || c == '-' || c == '_') {
+            safe.push_back(static_cast<char>(c));
+        } else if (std::isspace(c)) {
+            safe.push_back('_');
+        }
+    }
+    return safe.empty() ? "Track" : safe;
+}
+
+std::string takeTimestamp() {
+    const std::time_t now = std::time(nullptr);
+    std::tm local{};
+#if defined(_WIN32)
+    localtime_s(&local, &now);
+#else
+    localtime_r(&now, &local);
+#endif
+    char buffer[32]{};
+    std::strftime(buffer, sizeof(buffer), "%Y%m%d-%H%M%S", &local);
+    return buffer;
+}
+
+std::filesystem::path uniqueTakePath(
+    const std::filesystem::path& directory, const std::string& trackName,
+    const std::string& timestamp, std::unordered_set<std::string>& reserved) {
+    const std::string base = safeTakeName(trackName) + "_" + timestamp;
+    for (int suffix = 0;; ++suffix) {
+        const std::string filename =
+            base + (suffix == 0 ? "" : ("_" + std::to_string(suffix + 1))) +
+            ".wav";
+        const auto candidate = directory / filename;
+        const std::string key = candidate.lexically_normal().string();
+        if (!std::filesystem::exists(candidate) && reserved.insert(key).second) {
+            return candidate;
+        }
+    }
+}
+
+struct CompensatedTakeRange {
+    int64_t timelineStart = 0;
+    int64_t sourceOffset = 0;
+    int64_t length = 0;
+    bool calibrationExceedsTake = false;
+};
+
+CompensatedTakeRange compensateTakeRange(int64_t takeStart,
+                                         int64_t capturedFrames,
+                                         int64_t requestedOffset) {
+    takeStart = std::max<int64_t>(0, takeStart);
+    capturedFrames = std::max<int64_t>(0, capturedFrames);
+    int64_t offset = std::max<int64_t>(0, requestedOffset);
+    bool calibrationExceedsTake = false;
+    if (offset > takeStart && offset - takeStart >= capturedFrames) {
+        // Keep a short but valid take audible instead of trimming it away.
+        // The caller reports this as a calibration warning when committing.
+        offset = takeStart;
+        calibrationExceedsTake = capturedFrames > 0;
+    }
+
+    const int64_t timelineStart = std::max<int64_t>(0, takeStart - offset);
+    const int64_t sourceOffset = std::max<int64_t>(0, offset - takeStart);
+    return {timelineStart, sourceOffset,
+            std::max<int64_t>(0, capturedFrames - sourceOffset),
+            calibrationExceedsTake};
+}
 
 bool drawCenteredEmptyState(const char* message, const char* detail,
                             const char* actionLabel) {
@@ -89,6 +184,7 @@ bool panelHeaderAction(const char* label, const char* actionLabel,
 } // namespace
 
 DaveApp::~DaveApp() {
+    if (recordingActive()) stopRecording();
     audio_.stop();
     audio_.setCompiledGraph(nullptr);
 }
@@ -97,6 +193,7 @@ bool DaveApp::init() {
     if (!window_.valid() || !imgui_.init(window_)) {
         return false;
     }
+    window_.setCloseGuard([this] { return requestClose(); });
     window_.setFileDropCallback([this](const std::vector<std::string>& paths) {
         for (const auto& path : paths) {
             const auto extension = path.find_last_of('.');
@@ -130,9 +227,21 @@ bool DaveApp::init() {
     platform::g_menuLoadVideo    = [this](){ openVideoDialog(); };
     platform::g_menuImportMarkers= [this](){ importMarkersDialog(); };
     platform::g_menuExportMarkers= [this](){ exportMarkersDialog(); };
-    platform::g_menuUndo         = [this](){ undo_.undo(); };
-    platform::g_menuRedo         = [this](){ undo_.redo(); };
-    platform::g_menuPlayStop     = [this](){ audio_.transport().toggle(); };
+    platform::g_menuUndo         = [this](){
+        if (!recordingActive()) undo_.undo();
+        else showStatus("Stop recording before Undo", true);
+    };
+    platform::g_menuRedo         = [this](){
+        if (!recordingActive()) undo_.redo();
+        else showStatus("Stop recording before Redo", true);
+    };
+    platform::g_menuAddTrack     = [this](){
+        undo_.execute(std::make_unique<editing::AddTrackCommand>("Track"));
+    };
+    platform::g_menuPlayStop     = [this](){
+        if (recordingActive()) stopRecording();
+        else audio_.transport().toggle();
+    };
     platform::g_menuReturnToStart= [this](){ audio_.transport().seek(0); };
     // The native item is always present; with no picture loaded there is
     // nothing for it to move, so it does nothing rather than opening an
@@ -140,15 +249,23 @@ bool DaveApp::init() {
     platform::g_menuToggleVideoWindow = [this](){
         if (!edit_.videoTracks().empty()) setVideoPoppedOut(!videoPoppedOut_);
     };
+    platform::g_menuToggleIoPanel = [this](){ showIoPanel_ = !showIoPanel_; };
     platform::g_menuQuit         = [this](){ window_.close(); };
     platform::setupMacMenuBar();
 #endif
-    if (!audio_.start(static_cast<double>(edit_.sampleRate()), 2)) {
+    audioPreferences_ = audioPreferencesStore_.load();
+    refreshAudioDevices();
+    if (!applyAudioPreferences(audioPreferences_, false)) {
         std::fprintf(stderr, "Dave: audio engine failed to start\n");
+    }
+    if (audio_.playbackChannelCount() == 1) {
+        edit_.bus(document::kMainBusId)->mainOutput =
+            document::RouteTarget::hardwareOutput(0, 1);
     }
 
     // Wire the Edit's change signal to graph re-derivation.
     edit_.setChangeListener([this] { onEditChanged(); });
+    view_.deferRecordArmRequests = true;
 
     // Seed an initial track so the timeline isn't empty.
     undo_.execute(std::make_unique<editing::AddTrackCommand>("Track 1"));
@@ -179,57 +296,82 @@ void DaveApp::handleShortcuts() {
     // Ignore shortcuts while typing in a text field.
     if (io.WantTextInput) return;
 
-    const bool ctrl = io.KeyCtrl;
+#ifdef __APPLE__
+    const bool primaryModifier = io.KeySuper;
+#else
+    const bool primaryModifier = io.KeyCtrl;
+#endif
     const bool shift = io.KeyShift;
 
     // repeat=false: these are edge-triggered actions — ignore key auto-repeat
     // so a single Space press doesn't toggle play on then off again.
     if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
-        transport.toggle();
+        if (recordingActive()) stopRecording();
+        else transport.toggle();
     } else if (ImGui::IsKeyPressed(ImGuiKey_Enter, false)) {
         // Return/Enter: jump playhead to start (standard DAW shortcut).
         transport.seek(0);
-    } else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Z, false) && !shift && undo_.canUndo()) {
+    } else if (!recordingActive() && primaryModifier &&
+               ImGui::IsKeyPressed(ImGuiKey_Z, false) && !shift &&
+               undo_.canUndo()) {
         undo_.undo();
-    } else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Z, false) && shift && undo_.canRedo()) {
+    } else if (!recordingActive() && primaryModifier &&
+               ImGui::IsKeyPressed(ImGuiKey_Z, false) && shift &&
+               undo_.canRedo()) {
         undo_.redo();
-    } else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_O, false)) {
-        // Cmd+O: open project (audio import is Cmd+I now).
-    } else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_I, false)) {
-        openWavDialog();
-    } else if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_O, false)) {
+    } else if (primaryModifier && shift && ImGui::IsKeyPressed(ImGuiKey_O, false)) {
         openProjectDialog();
-    } else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_S, false)) {
-        saveProject(false);
-    } else if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_S, false)) {
+    } else if (primaryModifier && ImGui::IsKeyPressed(ImGuiKey_O, false)) {
+        // Cmd+O: open project (audio import is Cmd+I now).
+    } else if (primaryModifier && ImGui::IsKeyPressed(ImGuiKey_I, false)) {
+        openWavDialog();
+    } else if (primaryModifier && shift && ImGui::IsKeyPressed(ImGuiKey_S, false)) {
         saveProject(true);
-    } else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_N, false) && !shift) {
-        newProject();
-    } else if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_N, false)) {
+    } else if (primaryModifier && ImGui::IsKeyPressed(ImGuiKey_S, false)) {
+        saveProject(false);
+    } else if (primaryModifier && shift && ImGui::IsKeyPressed(ImGuiKey_N, false)) {
         undo_.execute(std::make_unique<editing::AddTrackCommand>("Track"));
-    } else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Q, false)) {
+    } else if (primaryModifier && ImGui::IsKeyPressed(ImGuiKey_N, false)) {
+        newProject();
+    } else if (primaryModifier && ImGui::IsKeyPressed(ImGuiKey_Q, false)) {
         window_.close();
+    } else if (primaryModifier && !shift && ImGui::IsKeyPressed(ImGuiKey_R, false)) {
+        toggleRecording();
+    } else if (!primaryModifier && shift && ImGui::IsKeyPressed(ImGuiKey_R, false)) {
+        toggleSelectedTrackArm();
     } else if (ImGui::IsKeyPressed(ImGuiKey_T, false)) {
         // T = zoom in (Pro Tools convention).
         gui::zoomAroundSample(view_, view_.samplesPerPixel * 0.5,
                               audio_.transport().position());
-    } else if (ImGui::IsKeyPressed(ImGuiKey_R, false)) {
+    } else if (!primaryModifier && !shift && ImGui::IsKeyPressed(ImGuiKey_R, false)) {
         // R = zoom out.
         gui::zoomAroundSample(view_, view_.samplesPerPixel * 2.0,
                               audio_.transport().position());
-    } else if (!ctrl && ImGui::IsKeyPressed(ImGuiKey_L, false)) {
+    } else if (!primaryModifier && ImGui::IsKeyPressed(ImGuiKey_L, false)) {
         // L = loop on/off, over whatever range is current.
-        loopEnabled_ = !loopEnabled_;
-        syncTransportLoop();
-    } else if (!ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_M, false)) {
+        const bool anyArmed = std::any_of(
+            edit_.tracks().begin(), edit_.tracks().end(),
+            [](const document::Track& track) { return track.recordArm; });
+        if (!loopEnabled_ && anyArmed) {
+            showStatus("Disarm recording tracks before enabling Loop", true);
+        } else {
+            loopEnabled_ = !loopEnabled_;
+            syncTransportLoop();
+        }
+    } else if (!primaryModifier && shift && ImGui::IsKeyPressed(ImGuiKey_M, false)) {
         // Shift+M / Shift+S toggle the selected track. The modifier keeps the
         // bare letters free and stops a stray keypress from silencing a track
-        // the user was only looking at. Guarded on !ctrl so they don't shadow
-        // Ctrl+Shift+S (Save As).
+        // the user was only looking at. Guarded on !primaryModifier so they
+        // don't shadow Cmd/Ctrl+Shift+S (Save As).
         toggleSelectedTrackMute();
-    } else if (!ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_S, false)) {
+    } else if (!primaryModifier && shift && ImGui::IsKeyPressed(ImGuiKey_S, false)) {
         toggleSelectedTrackSolo();
-    } else if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_V, false)) {
+    } else if (primaryModifier && shift && ImGui::IsKeyPressed(ImGuiKey_B, false)) {
+        undo_.execute(std::make_unique<editing::AddBusCommand>("Bus"));
+        view_.selectedTrackIndex = static_cast<int>(
+            edit_.tracks().size() + edit_.midiTracks().size() +
+            edit_.buses().size() - 2);
+    } else if (primaryModifier && shift && ImGui::IsKeyPressed(ImGuiKey_V, false)) {
         // Pop the picture in or out of its own window. macOS reaches the same
         // action through the native Window menu's Cmd+Shift+V. With no video
         // loaded there is no picture to move, so the binding does nothing.
@@ -264,12 +406,23 @@ document::MidiTrack* DaveApp::selectedMidiTrack() {
     return &edit_.midiTracksMut()[static_cast<size_t>(midiIndex)];
 }
 
+document::BusTrack* DaveApp::selectedBus() {
+    const int first = static_cast<int>(edit_.tracks().size() +
+                                       edit_.midiTracks().size());
+    const int index = view_.selectedTrackIndex - first;
+    if (index < 0 || index >= static_cast<int>(edit_.buses().size())) return nullptr;
+    return &edit_.busesMut()[static_cast<size_t>(index)];
+}
+
 void DaveApp::toggleSelectedTrackMute() {
     if (document::Track* track = selectedTrack()) {
         track->mute = !track->mute;
         edit_.notifyChanged();
     } else if (document::MidiTrack* midi = selectedMidiTrack()) {
         midi->mute = !midi->mute;
+        edit_.notifyChanged();
+    } else if (document::BusTrack* bus = selectedBus()) {
+        bus->mute = !bus->mute;
         edit_.notifyChanged();
     }
 }
@@ -281,7 +434,273 @@ void DaveApp::toggleSelectedTrackSolo() {
     } else if (document::MidiTrack* midi = selectedMidiTrack()) {
         midi->solo = !midi->solo;
         edit_.notifyChanged();
+    } else if (document::BusTrack* bus = selectedBus()) {
+        bus->solo = !bus->solo;
+        edit_.notifyChanged();
     }
+}
+
+void DaveApp::showStatus(std::string message, bool error) {
+    statusMessage_ = std::move(message);
+    statusIsError_ = error;
+    statusUntil_ = ImGui::GetTime() + 5.0;
+    std::fprintf(stderr, "Dave: %s\n", statusMessage_.c_str());
+}
+
+bool DaveApp::requestClose() {
+    if (!recordingActive()) return true;
+    showStatus("Stop recording before closing Dave", true);
+    return false;
+}
+
+void DaveApp::toggleSelectedTrackArm() {
+    auto* track = selectedTrack();
+    if (track == nullptr) {
+        showStatus("Select an audio track to arm", true);
+        return;
+    }
+    toggleTrackArm(track->id);
+}
+
+void DaveApp::toggleTrackArm(const std::string& trackId) {
+    auto* track = edit_.track(trackId);
+    if (track == nullptr) return;
+    if (recordingActive()) {
+        showStatus("Track arming cannot change during a recording", true);
+        return;
+    }
+    // Disarming is always safe. In particular, an unplugged input must not
+    // trap a track in the armed state merely because new arming is refused.
+    if (track->recordArm) {
+        track->recordArm = false;
+        edit_.notifyChanged();
+        return;
+    }
+    if (projectPath_.empty()) {
+        showStatus("Save the project before arming a track", true);
+        return;
+    }
+    if (loopEnabled_) {
+        showStatus("Turn Loop off before arming; loop recording is not available yet",
+                   true);
+        return;
+    }
+    if (!audio_.captureAvailable() || audio_.captureChannelCount() == 0) {
+        showStatus("Select an available input device before arming", true);
+        return;
+    }
+    const int channels = static_cast<int>(audio_.captureChannelCount());
+    if (track->inputChannel < 0 || track->inputChannelCount < 1 ||
+        track->inputChannelCount > 2 ||
+        track->inputChannel + track->inputChannelCount > channels) {
+        showStatus("The saved track input is unavailable on this device", true);
+        return;
+    }
+    track->recordArm = true;
+    edit_.notifyChanged();
+}
+
+bool DaveApp::startRecording() {
+    if (recordingActive()) return true;
+    if (projectPath_.empty()) {
+        showStatus("Save the project before recording", true);
+        return false;
+    }
+    if (loopEnabled_) {
+        showStatus("Turn Loop off before recording; loop recording is not available yet",
+                   true);
+        return false;
+    }
+    const int captureChannels =
+        static_cast<int>(audio_.captureChannelCount());
+    if (!audio_.captureAvailable() || captureChannels <= 0) {
+        showStatus("Recording refused: no capture input is available", true);
+        return false;
+    }
+
+    std::vector<document::Track*> armed;
+    for (auto& track : edit_.tracksMut()) {
+        if (track.recordArm) armed.push_back(&track);
+    }
+    if (armed.empty()) {
+        showStatus("Arm at least one audio track before recording", true);
+        return false;
+    }
+
+    for (auto* track : armed) {
+        if (track->inputChannel < 0 || track->inputChannelCount < 1 ||
+            track->inputChannelCount > 2 ||
+            track->inputChannel + track->inputChannelCount > captureChannels) {
+            showStatus("Recording refused: an armed track input is unavailable",
+                       true);
+            return false;
+        }
+    }
+    const std::filesystem::path recordings =
+        std::filesystem::path(projectPath_) / "recordings";
+    std::error_code directoryError;
+    std::filesystem::create_directories(recordings, directoryError);
+    if (directoryError) {
+        showStatus("Recording refused: cannot create the project recordings folder",
+                   true);
+        return false;
+    }
+
+    auto session = std::make_unique<RecordingSession>();
+    std::vector<std::unique_ptr<engine::DiskWriter::Track>> writerTracks;
+    writerTracks.reserve(armed.size());
+    session->armedTrackIds.reserve(armed.size());
+    std::unordered_set<std::string> reservedPaths;
+    const std::string timestamp = takeTimestamp();
+    for (const auto* track : armed) {
+        auto destination = std::make_unique<engine::DiskWriter::Track>();
+        destination->path = uniqueTakePath(
+            recordings, track->name, timestamp, reservedPaths).string();
+        destination->trackId = track->id;
+        destination->channels = track->inputChannelCount;
+        session->armedTrackIds.push_back(track->id);
+        writerTracks.push_back(std::move(destination));
+    }
+
+    const auto ringFrames = engine::RecordController::ringFramesForSampleRate(
+        static_cast<double>(edit_.sampleRate()));
+    if (!session->writer.start(
+            std::move(writerTracks), edit_.sampleRate(),
+            engine::WavWriter::formatForBitDepth(edit_.bitDepth()),
+            ringFrames)) {
+        showStatus("Recording refused: one or more take files could not be opened",
+                   true);
+        return false;
+    }
+
+    std::vector<engine::RecordController::ArmedTrackConfig> mappings;
+    mappings.reserve(armed.size());
+    for (std::size_t i = 0; i < armed.size(); ++i) {
+        auto* ring = session->writer.ring(i);
+        const auto& track = *armed[i];
+        if (track.inputChannelCount == 2) {
+            mappings.push_back(engine::RecordController::ArmedTrackConfig::stereo(
+                *ring, track.inputChannel, track.inputChannel + 1));
+        } else {
+            mappings.push_back(engine::RecordController::ArmedTrackConfig::mono(
+                *ring, track.inputChannel));
+        }
+    }
+    if (!session->controller.prepare(
+            std::move(mappings), captureChannels,
+            static_cast<std::size_t>(platform::AudioEngine::maxBlockSize())) ||
+        !audio_.publishRecordController(&session->controller)) {
+        session->writer.stop();
+        showStatus("Recording refused: the capture session could not be published",
+                   true);
+        return false;
+    }
+
+    session->takeStartSample =
+        audio_.transport().beginRecordingAndPlay();
+    session->latencyOffsetSamples =
+        std::max(0, audioPreferences_.recordLatencyOffsetSamples);
+    view_.recordingActive = true;
+    view_.recordingStartSample = std::max<int64_t>(
+        0, session->takeStartSample - session->latencyOffsetSamples);
+    view_.recordingEndSample = view_.recordingStartSample;
+    recordingSession_ = std::move(session);
+    showStatus("Recording", false);
+    return true;
+}
+
+void DaveApp::stopRecording() {
+    if (!recordingActive()) return;
+
+    audio_.transport().setRecording(false);
+    audio_.transport().stop();
+    view_.recordingActive = false;
+
+    if (!audio_.retireRecordController()) {
+        // The controller cannot be destroyed while the callback might still
+        // own it. Stopping miniaudio joins that callback; this exceptional
+        // path favors memory safety and then reopens the confirmed devices.
+        audio_.stop();
+        if (!audio_.retireRecordController(std::chrono::milliseconds(1000))) {
+            showStatus("Recording stop failed: capture callback did not quiesce",
+                       true);
+            return;
+        }
+    }
+
+    std::unique_ptr<RecordingSession> finished =
+        std::move(recordingSession_);
+    const int64_t firstCapturedSample =
+        finished->controller.firstSamplePosition();
+    if (firstCapturedSample >= 0) {
+        finished->takeStartSample = firstCapturedSample;
+    }
+    finished->writer.stop();
+
+    int committed = 0;
+    bool hadFailure = false;
+    bool hadDrops = false;
+    bool badLatencyCalibration = false;
+    for (std::size_t i = 0; i < finished->writer.trackCount(); ++i) {
+        const auto stats = finished->writer.stats(i);
+        const std::string sha = finished->writer.shaOf(i);
+        if (stats.failed || sha.empty()) {
+            hadFailure = true;
+            continue;
+        }
+        if (stats.droppedFrames > 0) hadDrops = true;
+        if (stats.framesWritten == 0) continue;
+
+        document::AudioAsset asset;
+        asset.id = document::AssetId{sha};
+        asset.path = finished->writer.pathOf(i);
+        asset.sampleRate = edit_.sampleRate();
+        const auto* track = edit_.track(finished->writer.trackIdOf(i));
+        if (track == nullptr) {
+            hadFailure = true;
+            continue;
+        }
+        asset.channels = track->inputChannelCount;
+        asset.lengthSamples = static_cast<int64_t>(stats.framesWritten);
+
+        const auto range = compensateTakeRange(
+            finished->takeStartSample, asset.lengthSamples,
+            finished->latencyOffsetSamples);
+        badLatencyCalibration =
+            badLatencyCalibration || range.calibrationExceedsTake;
+        document::AudioClip clip;
+        clip.asset = asset.id;
+        clip.timelineStart = range.timelineStart;
+        clip.sourceOffset = range.sourceOffset;
+        clip.length = range.length;
+        if (clip.length == 0) continue;
+
+        undo_.execute(std::make_unique<editing::CommitTakeCommand>(
+            track->id, std::move(asset), std::move(clip)));
+        ++committed;
+    }
+
+    if (!audio_.isRunning()) applyAudioPreferences(audioPreferences_, false);
+    if (hadFailure) {
+        showStatus("Recording stopped, but one or more take files failed", true);
+    } else if (badLatencyCalibration) {
+        showStatus("Take committed, but the latency offset exceeded its length",
+                   true);
+    } else if (hadDrops) {
+        showStatus("Recording committed with dropout silence; check disk performance",
+                   true);
+    } else if (committed == 0) {
+        showStatus("Recording stopped before any audio was captured", true);
+    } else {
+        showStatus(committed == 1 ? "Take committed to the timeline"
+                                  : std::to_string(committed) +
+                                        " takes committed to the timeline");
+    }
+}
+
+void DaveApp::toggleRecording() {
+    if (recordingActive()) stopRecording();
+    else startRecording();
 }
 
 void DaveApp::setTimelineSamplesPerPixel(double samplesPerPixel) {
@@ -292,10 +711,45 @@ void DaveApp::setTimelineSamplesPerPixel(double samplesPerPixel) {
 }
 
 void DaveApp::onEditChanged() {
+    bool armRefused = false;
+    if (recordingSession_) {
+        const std::unordered_set<std::string> armedIds(
+            recordingSession_->armedTrackIds.begin(),
+            recordingSession_->armedTrackIds.end());
+        for (auto& track : edit_.tracksMut()) {
+            const bool shouldBeArmed = armedIds.contains(track.id);
+            if (track.recordArm != shouldBeArmed) {
+                track.recordArm = shouldBeArmed;
+                armRefused = true;
+            }
+        }
+        if (armRefused) {
+            showStatus("Track arming cannot change during a recording", true);
+        }
+    } else if (projectPath_.empty() || loopEnabled_) {
+        for (auto& track : edit_.tracksMut()) {
+            if (track.recordArm) {
+                track.recordArm = false;
+                armRefused = true;
+            }
+        }
+        if (armRefused) {
+            showStatus(projectPath_.empty()
+                           ? "Save the project before arming a track"
+                           : "Turn Loop off before arming; loop recording is not available yet",
+                       true);
+        }
+    }
+
     // UI thread. Re-derive the engine graph from the Edit, compile, publish.
     dirty_ = true; // any edit marks the project dirty
-    auto graph = builder_.build(edit_, audio_.sampleRate());
-    auto [compiled, err] = engine::compile(*graph, audio_.sampleRate(), 256);
+    auto graph = builder_.build(
+        edit_, audio_.sampleRate(),
+        std::max(1, static_cast<int>(audio_.playbackChannelCount())));
+    // Compile for the engine's own maximum, not a literal — the callback
+    // sizes its passes from the same constant, so the two cannot drift.
+    auto [compiled, err] = engine::compile(*graph, audio_.sampleRate(),
+                                           platform::AudioEngine::maxBlockSize());
     if (err.has_value()) {
         std::fprintf(stderr, "Dave: compile failed: %s\n", err->message.c_str());
         return;
@@ -424,6 +878,38 @@ bool DaveApp::loadWavIntoNewTrack(const std::string& path) {
 void DaveApp::drawUI() {
     auto& transport = audio_.transport();
     const auto& pal = gui::theme::palette();
+    if (builder_.latencyChangePending() && !recordingActive()) {
+        // VST3 requires deactivation before its new latency is queried. Stop
+        // the device first so the UI thread never mutates a processor while
+        // the callback is inside process().
+        const double deviceRate = audio_.sampleRate();
+        const int deviceOutputs = std::max(
+            1, static_cast<int>(audio_.playbackChannelCount()));
+        audio_.stop();
+        const bool latencyChanged = builder_.consumeLatencyChange();
+        auto graph = builder_.build(edit_, deviceRate, deviceOutputs);
+        auto [compiled, error] = engine::compile(
+            *graph, deviceRate, platform::AudioEngine::maxBlockSize());
+        if (error) {
+            std::fprintf(stderr, "Dave: latency rebuild refused: %s\n",
+                         error->message.c_str());
+        } else {
+            audio_.setCompiledGraph(std::move(compiled));
+        }
+        if (latencyChanged) applyAudioPreferences(audioPreferences_, false);
+    }
+    if (recordingSession_) {
+        const int64_t firstCaptured =
+            recordingSession_->controller.firstSamplePosition();
+        if (firstCaptured >= 0) {
+            const auto range = compensateTakeRange(
+                firstCaptured,
+                std::max<int64_t>(0, transport.position() - firstCaptured),
+                recordingSession_->latencyOffsetSamples);
+            view_.recordingStartSample = range.timelineStart;
+            view_.recordingEndSample = range.timelineStart + range.length;
+        }
+    }
 
     // Pop-out toggles land here, at the frame boundary, so the sidebar split
     // and the picture window agree for the whole frame.
@@ -446,9 +932,8 @@ void DaveApp::drawUI() {
     }
 
     // ─── Layout constants ────────────────────────────────────────────────
-    // Fixed panel windows remain predictable, while the two gaps between
-    // them are live splitters. The ratio-based picture panel keeps its visual
-    // priority on taller displays without starving the plugin chain.
+    // Utility panes retain their explicit splitter sizes. The arrangement is
+    // the flexible editor surface and absorbs native window resize deltas.
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     // WorkPos already excludes an in-window menu bar on platforms that use
     // one; adding that offset again would push the entire panel stack down.
@@ -459,20 +944,32 @@ void DaveApp::drawUI() {
     const float splitterSize = 6.0f;
     const float contentY = baseY + menuH + toolbarH;
     const float contentH = vp->WorkSize.y - toolbarH;
-    const float availablePanelW =
-        std::max(2.0f, vp->WorkSize.x - splitterSize);
-    const float minSidebarW =
-        std::min(320.0f, availablePanelW * 0.5f);
-    const float minTimelineW =
-        std::min(560.0f, availablePanelW - minSidebarW);
-    const float maxSidebarW =
-        std::max(minSidebarW, availablePanelW - minTimelineW);
-    const float sidebarW = std::clamp(sidebarWidth_, minSidebarW, maxSidebarW);
-    sidebarWidth_ = sidebarW;
-    const float timelineW = availablePanelW - sidebarW;
+    constexpr float minEditorW = 320.0f;
+    constexpr float minEditorH = 120.0f;
+    const auto mainLayout = application::calculateMainEditorLayout(
+        vp->WorkSize.x, contentH, splitterSize, sidebarWidth_, mixerHeight_,
+        showMixer_, minEditorW, minEditorH);
+    const float sidebarW = mainLayout.sidebarWidth;
+    const float timelineW = mainLayout.editorWidth;
     const float sidebarX = baseX + timelineW + splitterSize;
+    const float availablePanelW =
+        std::max(0.0f, vp->WorkSize.x - splitterSize);
+    const float maxSidebarW =
+        std::max(0.0f, availablePanelW - minEditorW);
+    const float minSidebarW = std::min(320.0f, maxSidebarW);
 
-    const float splitContentH = std::max(1.0f, contentH - splitterSize);
+    // Hardware I/O is global and always starts the sidebar stack. Its height
+    // is responsive only within a narrow useful range; the document panels
+    // divide whatever remains below it.
+    const float ioPanelH = showIoPanel_
+        ? std::min(220.0f, contentH)
+        : 0.0f;
+    const float ioGap = showIoPanel_ ? splitterSize : 0.0f;
+    const float sidebarContentY = contentY + ioPanelH + ioGap;
+    const float sidebarContentH =
+        std::max(1.0f, contentH - ioPanelH - ioGap);
+    const float splitContentH =
+        std::max(1.0f, sidebarContentH - splitterSize);
     const float minVideoH = std::min(260.0f, splitContentH * 0.55f);
     const float minPluginsH = std::min(180.0f, splitContentH * 0.38f);
     const float maxVideoH = std::max(minVideoH, splitContentH - minPluginsH);
@@ -482,17 +979,14 @@ void DaveApp::drawUI() {
     const bool hasVideo = !edit_.videoTracks().empty();
     const bool videoDocked = hasVideo && !videoPoppedOut_;
     // With the picture popped out or absent there is no split to maintain: the
-    // plugin chain takes the whole sidebar and videoShare_ is preserved
+    // plugin chain takes the whole sidebar and videoHeight_ is preserved
     // untouched so the old proportions come back when the picture returns.
     const float videoPanelH =
         videoDocked
-            ? std::clamp(splitContentH * videoShare_, minVideoH, maxVideoH)
+            ? std::clamp(videoHeight_, minVideoH, maxVideoH)
             : 0.0f;
     const float pluginsH =
-        videoDocked ? splitContentH - videoPanelH : contentH;
-    if (videoDocked) {
-        videoShare_ = videoPanelH / splitContentH;
-    }
+        videoDocked ? splitContentH - videoPanelH : sidebarContentH;
 
     // Common flags for all docked panels — nothing can move or overlap.
     const ImGuiWindowFlags panelFlags =
@@ -522,16 +1016,25 @@ void DaveApp::drawUI() {
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Edit")) {
-            if (ImGui::MenuItem("Undo", "Ctrl+Z", false, undo_.canUndo())) undo_.undo();
-            if (ImGui::MenuItem("Redo", "Ctrl+Shift+Z", false, undo_.canRedo())) undo_.redo();
+            if (ImGui::MenuItem("Undo", "Ctrl+Z", false,
+                                undo_.canUndo() && !recordingActive()))
+                undo_.undo();
+            if (ImGui::MenuItem("Redo", "Ctrl+Shift+Z", false,
+                                undo_.canRedo() && !recordingActive()))
+                undo_.redo();
             ImGui::Separator();
-            if (ImGui::MenuItem("Add Track"))
+            if (ImGui::MenuItem("Add Track", "Ctrl+Shift+N"))
                 undo_.execute(std::make_unique<editing::AddTrackCommand>("Track"));
+            if (ImGui::MenuItem("Add Bus", "Ctrl+Shift+B"))
+                undo_.execute(std::make_unique<editing::AddBusCommand>("Bus"));
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Transport")) {
             if (ImGui::MenuItem(transport.isPlaying() ? "Stop" : "Play", "Space"))
-                transport.toggle();
+                recordingActive() ? stopRecording() : transport.toggle();
+            if (ImGui::MenuItem(recordingActive() ? "Stop Recording" : "Record",
+                                "Ctrl+R"))
+                toggleRecording();
             if (ImGui::MenuItem("Return to Start", "Return")) transport.seek(0);
             if (ImGui::MenuItem("Stop & Rewind")) { transport.stop(); transport.seek(0); }
             ImGui::EndMenu();
@@ -539,6 +1042,8 @@ void DaveApp::drawUI() {
         if (ImGui::BeginMenu("Window")) {
             if (ImGui::MenuItem("Mixer", "Ctrl+=", showMixer_))
                 showMixer_ = !showMixer_;
+            if (ImGui::MenuItem("I/O Panel", nullptr, showIoPanel_))
+                showIoPanel_ = !showIoPanel_;
             if (ImGui::MenuItem("Video Window", "Ctrl+Shift+V",
                                 videoPoppedOut_ && hasVideo, hasVideo))
                 setVideoPoppedOut(!videoPoppedOut_);
@@ -549,7 +1054,7 @@ void DaveApp::drawUI() {
             ImGui::TextDisabled(
                 "Scroll: pan | Cmd/Ctrl+scroll: zoom | R-click clip: menu");
             ImGui::TextDisabled(
-                "Space: play/stop | L: loop | Shift+M / Shift+S: mute / solo");
+                "Cmd/Ctrl+R: record | Shift+R/M/S: arm / mute / solo");
             ImGui::EndMenu();
         }
         ImGui::EndMainMenuBar();
@@ -575,6 +1080,7 @@ void DaveApp::drawUI() {
     ImGui::PopStyleVar();
     {
         const float controlH = kToolbarControlH;
+        const bool compactToolbar = vp->WorkSize.x < 1050.0f;
         // Every framed control derives its height from FramePadding, so one
         // value here makes buttons, combos and the checkbox agree instead of
         // each settling at whatever its own content implies.
@@ -584,9 +1090,10 @@ void DaveApp::drawUI() {
                    std::max(0.0f, (controlH - ImGui::GetFontSize()) * 0.5f)));
         // Two gaps, used consistently: tight between a label and the control
         // it names, wider between separate controls.
-        constexpr float kGap = 8.0f;
+        const float kGap = compactToolbar ? 5.0f : 8.0f;
         constexpr float kLabelGap = 6.0f;
-        constexpr float kComboW = 118.0f;
+        const float kComboW = compactToolbar ? 94.0f : 118.0f;
+        const float groupGap = compactToolbar ? 7.0f : 12.0f;
         // Labels sit on the text baseline by default, which floats them to
         // the top of a 30 px row.
         auto label = [&](const char* text) {
@@ -595,15 +1102,27 @@ void DaveApp::drawUI() {
             ImGui::SameLine(0.0f, kLabelGap);
         };
         auto groupSeparator = [&] {
-            ImGui::SameLine(0.0f, 12.0f);
+            ImGui::SameLine(0.0f, groupGap);
             const ImVec2 lineTop = ImGui::GetCursorScreenPos();
             ImGui::Dummy(ImVec2(1.0f, controlH));
             ImGui::GetWindowDrawList()->AddLine(
                 lineTop, ImVec2(lineTop.x, lineTop.y + controlH),
                 ImGui::GetColorU32(pal.borderStrong));
-            ImGui::SameLine(0.0f, 12.0f);
+            ImGui::SameLine(0.0f, groupGap);
         };
 
+        const bool wasRecording = recordingActive();
+        if (gui::theme::iconButton(
+                "##transportRecord", gui::theme::TransportIcon::Record,
+                wasRecording ? "Stop recording (Cmd/Ctrl+R)"
+                             : "Record and roll (Cmd/Ctrl+R)",
+                ImVec2(controlH, controlH),
+                wasRecording ? gui::theme::ButtonVariant::Danger
+                             : gui::theme::ButtonVariant::Normal)) {
+            toggleRecording();
+        }
+
+        ImGui::SameLine(0.0f, kGap);
         const bool wasPlaying = transport.isPlaying();
         if (gui::theme::iconButton(
                 "##transportPlay",
@@ -613,14 +1132,16 @@ void DaveApp::drawUI() {
                 ImVec2(controlH, controlH),
                 wasPlaying ? gui::theme::ButtonVariant::Primary
                            : gui::theme::ButtonVariant::Normal)) {
-            transport.toggle();
+            if (wasRecording) stopRecording();
+            else transport.toggle();
         }
 
         ImGui::SameLine(0.0f, kGap);
         if (gui::theme::iconButton(
                 "##transportRewind", gui::theme::TransportIcon::ReturnToStart,
                 "Stop and return to start (Return)", ImVec2(controlH, controlH))) {
-            transport.stop();
+            if (wasRecording) stopRecording();
+            else transport.stop();
             transport.seek(0);
         }
 
@@ -637,8 +1158,18 @@ void DaveApp::drawUI() {
                     loopTip, ImVec2(controlH, controlH),
                     loopEnabled_ ? gui::theme::ButtonVariant::Primary
                                  : gui::theme::ButtonVariant::Normal)) {
-                loopEnabled_ = !loopEnabled_;
-                syncTransportLoop();
+                const bool anyArmed = std::any_of(
+                    edit_.tracks().begin(), edit_.tracks().end(),
+                    [](const document::Track& track) {
+                        return track.recordArm;
+                    });
+                if (!loopEnabled_ && anyArmed) {
+                    showStatus("Disarm recording tracks before enabling Loop",
+                               true);
+                } else {
+                    loopEnabled_ = !loopEnabled_;
+                    syncTransportLoop();
+                }
             }
         }
         groupSeparator();
@@ -647,7 +1178,7 @@ void DaveApp::drawUI() {
         int64_t pos = transport.position();
         const char* tcModes[] = {"min:sec", "timecode", "bars|beats", "feet+frames", "samples"};
         int tcIdx = static_cast<int>(view_.tcMode);
-        constexpr float counterW = 150.0f;
+        const float counterW = compactToolbar ? 132.0f : 150.0f;
         if (!view_.editingPosition) {
             std::string tcStr = gui::formatTimecode(pos, view_.tcMode);
             const ImVec2 counterMin = ImGui::GetCursorScreenPos();
@@ -740,15 +1271,20 @@ void DaveApp::drawUI() {
         }
         groupSeparator();
 
-        if (ImGui::Button("+Track", ImVec2(76.0f, controlH)))
+        if (ImGui::Button("+Track", ImVec2(compactToolbar ? 64.0f : 76.0f,
+                                            controlH)))
             undo_.execute(std::make_unique<editing::AddTrackCommand>("Track"));
 
         ImGui::SameLine(0.0f, kGap);
-        ImGui::Checkbox("Snap", &view_.snapToMarkers);
+        ImGui::Checkbox("Snap", &view_.snapEnabled);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Snap timeline edits to the current %s grid",
+                              tcModes[tcIdx]);
+        }
         groupSeparator();
 
         // ─── Session format ──────────────────────────────────────────────
-        label("Session");
+        if (!compactToolbar) label("Session");
         static constexpr int kRates[] = {44100, 48000, 88200, 96000,
                                          176400, 192000};
         static const char* kRateLabels[] = {"44.1 kHz", "48 kHz", "88.2 kHz",
@@ -757,6 +1293,7 @@ void DaveApp::drawUI() {
         for (int i = 0; i < IM_ARRAYSIZE(kRates); ++i) {
             if (kRates[i] == edit_.sampleRate()) rateIdx = i;
         }
+        ImGui::BeginDisabled(wasRecording);
         ImGui::SetNextItemWidth(kComboW);
         if (ImGui::Combo("##sessionRate", &rateIdx, kRateLabels,
                          IM_ARRAYSIZE(kRateLabels))) {
@@ -790,40 +1327,7 @@ void DaveApp::drawUI() {
                 "Stored with the project; nothing renders yet, so it has no "
                 "effect on playback.");
         }
-        groupSeparator();
-
-        label("Output");
-        static int selectedDevice = -1;
-        static std::vector<std::string> devices;
-        static bool listed = false;
-        if (!listed) {
-            devices = audio_.enumerateDevices();
-            selectedDevice = audio_.currentDeviceIndex();
-            listed = true;
-        }
-        static std::vector<std::string> labelStore;
-        labelStore = devices;
-        std::vector<const char*> labels;
-        labels.reserve(labelStore.size());
-        for (const auto& n : labelStore) labels.push_back(n.c_str());
-        const char* preview = (selectedDevice >= 0 && selectedDevice < static_cast<int>(labels.size()))
-                              ? labels[selectedDevice] : "Default";
-        ImGui::SetNextItemWidth(-FLT_MIN);
-        if (ImGui::BeginCombo("##output", preview)) {
-            for (int i = 0; i < static_cast<int>(labels.size()); ++i) {
-                bool sel = (i == selectedDevice);
-                if (ImGui::Selectable(labels[i], &sel)) {
-                    selectedDevice = i;
-                    // Open the new device at the session's rate, not the
-                    // default — switching outputs must not silently retune
-                    // the session.
-                    audio_.selectDevice(
-                        i, static_cast<double>(edit_.sampleRate()), 2);
-                }
-                if (sel) ImGui::SetItemDefaultFocus();
-            }
-            ImGui::EndCombo();
-        }
+        ImGui::EndDisabled();
         ImGui::PopStyleVar();   // FramePadding
     }
     ImGui::End();
@@ -832,13 +1336,12 @@ void DaveApp::drawUI() {
     // The mixer takes the bottom of the timeline column rather than a slot in
     // the sidebar: strips sit side by side, so the panel needs width, and the
     // sidebar is a ~360px inspector column.
-    const float minMixerH = 190.0f;
-    const float maxMixerH = std::max(minMixerH, contentH - 200.0f);
-    const float mixerH = showMixer_
-        ? std::clamp(mixerHeight_, minMixerH, maxMixerH) : 0.0f;
-    if (showMixer_) mixerHeight_ = mixerH;
-    const float timelineH =
-        showMixer_ ? std::max(1.0f, contentH - mixerH - splitterSize) : contentH;
+    const float minMixerH = std::min(
+        190.0f, std::max(0.0f, contentH - splitterSize - minEditorH));
+    const float maxMixerH =
+        std::max(minMixerH, contentH - splitterSize - minEditorH);
+    const float mixerH = mainLayout.mixerHeight;
+    const float timelineH = mainLayout.timelineHeight;
 
     ImGui::SetNextWindowPos(ImVec2(baseX, contentY), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(timelineW, timelineH), ImGuiCond_Always);
@@ -867,7 +1370,9 @@ void DaveApp::drawUI() {
                               "Hide the mixer (View > Mixer to bring it back)")) {
             showMixer_ = false;
         }
-        gui::drawMixer(edit_, undo_, view_);
+        gui::drawMixer(edit_, undo_, view_, 124.0f,
+                       static_cast<int>(audio_.captureChannelCount()),
+                       static_cast<int>(audio_.playbackChannelCount()));
         ImGui::End();
     }
     // Both the timeline and the mixer can ask for a picker or an editor, so
@@ -879,12 +1384,26 @@ void DaveApp::drawUI() {
     // at it without a second gesture.
     syncTransportLoop();
 
+    // I/O is global rather than document state, so it stays at the top of the
+    // sidebar even when the current project has no tracks or picture.
+    if (showIoPanel_) {
+        syncIoPanelState();
+        ImGui::SetNextWindowPos(ImVec2(sidebarX, contentY), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(sidebarW, ioPanelH), ImGuiCond_Always);
+        ImGui::Begin("I/O", nullptr,
+                     panelFlags | ImGuiWindowFlags_NoScrollbar |
+                         ImGuiWindowFlags_NoScrollWithMouse);
+        gui::drawIoPanel(ioPanel_);
+        ImGui::End();
+        serviceIoPanelRequests();
+    }
+
     // Picture stays above the plugin chain because sync-to-picture is the
     // primary post-production task — unless it has been popped out or never
     // imported, in which case the sidebar slot disappears entirely rather
     // than leaving a hole.
     if (videoDocked) {
-        videoPanelPos_ = ImVec2(sidebarX, contentY);
+        videoPanelPos_ = ImVec2(sidebarX, sidebarContentY);
         videoPanelSize_ = ImVec2(sidebarW, videoPanelH);
         ImGui::SetNextWindowPos(videoPanelPos_, ImGuiCond_Always);
         ImGui::SetNextWindowSize(videoPanelSize_, ImGuiCond_Always);
@@ -900,8 +1419,8 @@ void DaveApp::drawUI() {
 
     ImGui::SetNextWindowPos(
         ImVec2(sidebarX,
-               videoDocked ? contentY + videoPanelH + splitterSize
-                           : contentY),
+               videoDocked ? sidebarContentY + videoPanelH + splitterSize
+                           : sidebarContentY),
         ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(sidebarW, pluginsH), ImGuiCond_Always);
     ImGui::Begin("Plugins", nullptr, panelFlags);
@@ -977,7 +1496,7 @@ void DaveApp::drawUI() {
     // No picture in the sidebar means no split to drag.
     if (videoDocked) {
         ImGui::SetNextWindowPos(
-            ImVec2(sidebarX, contentY + videoPanelH), ImGuiCond_Always);
+            ImVec2(sidebarX, sidebarContentY + videoPanelH), ImGuiCond_Always);
         ImGui::SetNextWindowSize(
             ImVec2(sidebarW, splitterSize), ImGuiCond_Always);
         ImGui::Begin("##videoPluginsSplitter", nullptr, splitterFlags);
@@ -990,9 +1509,9 @@ void DaveApp::drawUI() {
             ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
         }
         if (ImGui::IsItemActive()) {
-            videoShare_ = std::clamp(
-                (videoPanelH + ImGui::GetIO().MouseDelta.y) / splitContentH,
-                minVideoH / splitContentH, maxVideoH / splitContentH);
+            videoHeight_ = std::clamp(
+                videoPanelH + ImGui::GetIO().MouseDelta.y,
+                minVideoH, maxVideoH);
         }
         ImGui::GetWindowDrawList()->AddLine(
             ImVec2(panelSplitterOrigin.x,
@@ -1012,15 +1531,47 @@ void DaveApp::drawUI() {
     // Modals (browser) still float — they're temporary popups, not panels.
     drawPluginBrowser();
 
+    if (!statusMessage_.empty() && ImGui::GetTime() < statusUntil_) {
+        ImDrawList* foreground = ImGui::GetForegroundDrawList();
+        const ImVec2 textSize = ImGui::CalcTextSize(statusMessage_.c_str());
+        const ImVec2 padding(12.0f, 8.0f);
+        const ImVec2 boxSize(textSize.x + padding.x * 2.0f,
+                             textSize.y + padding.y * 2.0f);
+        const ImVec2 boxMin(
+            vp->WorkPos.x + (vp->WorkSize.x - boxSize.x) * 0.5f,
+            vp->WorkPos.y + vp->WorkSize.y - boxSize.y - 18.0f);
+        const ImVec2 boxMax(boxMin.x + boxSize.x, boxMin.y + boxSize.y);
+        foreground->AddRectFilled(
+            boxMin, boxMax,
+            ImGui::GetColorU32(statusIsError_ ? pal.danger
+                                              : pal.surfaceStrong),
+            5.0f);
+        foreground->AddRect(boxMin, boxMax,
+                            ImGui::GetColorU32(statusIsError_ ? pal.danger
+                                                             : pal.borderStrong),
+                            5.0f);
+        foreground->AddText(ImVec2(boxMin.x + padding.x,
+                                   boxMin.y + padding.y),
+                            ImGui::GetColorU32(statusIsError_
+                                                  ? ImVec4(1, 1, 1, 1)
+                                                  : pal.text),
+                            statusMessage_.c_str());
+    }
+
     // ─── Auto-stop ───────────────────────────────────────────────────────
     // Only auto-stop if there's actual content (clips) on the timeline. An
     // empty timeline has contentEnd=24000 (just the 0.5s tail), which would
     // instantly stop playback before the user can do anything.
-    if (audio_.transport().isPlaying()) {
+    if (audio_.transport().isPlaying() && !recordingActive()) {
         int64_t end = edit_.contentEndSamples();
         bool hasClips = false;
         for (const auto& t : edit_.tracks())
             if (!t.clips.empty()) { hasClips = true; break; }
+        if (!hasClips) {
+            for (const auto& track : edit_.midiTracks()) {
+                if (!track.clips.empty()) { hasClips = true; break; }
+            }
+        }
         if (!edit_.videoTracks().empty())
             for (const auto& vt : edit_.videoTracks())
                 if (!vt.clips.empty()) { hasClips = true; break; }
@@ -1284,7 +1835,18 @@ void DaveApp::openVideoDialog() {
 }
 
 void DaveApp::newProject() {
+    if (recordingActive()) {
+        showStatus("Stop recording before creating a new project", true);
+        return;
+    }
     edit_.tracksMut().clear();
+    edit_.clearMidiTracks_();
+    edit_.clearBuses_();
+    edit_.ensureMainBus_();
+    if (audio_.playbackChannelCount() == 1) {
+        edit_.bus(document::kMainBusId)->mainOutput =
+            document::RouteTarget::hardwareOutput(0, 1);
+    }
     edit_.clearMarkerTracks_();
     edit_.clearVideoTracks_();
     builder_ = {};
@@ -1301,14 +1863,206 @@ void DaveApp::newProject() {
     audio_.transport().seek(0);
 }
 
-// Reopen the output device at the session rate and re-derive the graph
+void DaveApp::refreshAudioDevices() {
+    audioDevices_ = audio_.enumerateDevices();
+
+    std::vector<gui::IoDevice> playback;
+    playback.reserve(audioDevices_.playbackNames.size() + 1);
+    playback.push_back({kOutputDefaultId, "Default", 0, true});
+    for (std::size_t index = 0; index < audioDevices_.playbackNames.size();
+         ++index) {
+        playback.push_back({outputDeviceId(index),
+                            audioDevices_.playbackNames[index], 0, false});
+    }
+    ioPanel_.setPlaybackCatalog(std::move(playback));
+
+    std::vector<gui::IoDevice> capture;
+    capture.reserve(audioDevices_.captureNames.size());
+    for (std::size_t index = 0; index < audioDevices_.captureNames.size();
+         ++index) {
+        capture.push_back({inputDeviceId(index),
+                           audioDevices_.captureNames[index], 0, false});
+    }
+    ioPanel_.setCaptureCatalog(std::move(capture));
+
+    if (audioPreferences_.outputDeviceName.empty()) {
+        ioPanel_.setSelectedOutput(
+            gui::IoDeviceSelection{kOutputDefaultId, "Default"});
+    } else {
+        const int index = firstNameIndex(audioDevices_.playbackNames,
+                                         audioPreferences_.outputDeviceName);
+        ioPanel_.setSelectedOutput(gui::IoDeviceSelection{
+            index >= 0 ? outputDeviceId(static_cast<std::size_t>(index))
+                       : "output:missing",
+            audioPreferences_.outputDeviceName});
+    }
+
+    if (audioPreferences_.inputMode == InputMode::Off) {
+        ioPanel_.setSelectedInput(
+            gui::IoDeviceSelection{kInputOffId, "Off"});
+    } else if (audioPreferences_.inputMode == InputMode::Default) {
+        ioPanel_.setSelectedInput(
+            gui::IoDeviceSelection{kInputDefaultId, "Default"});
+    } else {
+        const int index = firstNameIndex(audioDevices_.captureNames,
+                                         audioPreferences_.inputDeviceName);
+        ioPanel_.setSelectedInput(gui::IoDeviceSelection{
+            index >= 0 ? inputDeviceId(static_cast<std::size_t>(index))
+                       : "input:missing",
+            audioPreferences_.inputDeviceName});
+    }
+}
+
+bool DaveApp::applyAudioPreferences(const AudioPreferences& preferences,
+                                    bool saveOnSuccess) {
+    if (recordingActive()) {
+        showStatus("Stop recording before changing audio devices", true);
+        return false;
+    }
+    int outputIndex = -1;
+    if (!preferences.outputDeviceName.empty()) {
+        outputIndex = firstNameIndex(audioDevices_.playbackNames,
+                                     preferences.outputDeviceName);
+        // Keep a missing remembered output visible in the panel while using
+        // the system output as a safe startup fallback.
+        if (outputIndex < 0) outputIndex = -1;
+    }
+
+    platform::InputDeviceSelection input =
+        platform::InputDeviceSelection::off();
+    if (preferences.inputMode == InputMode::Default) {
+        input = platform::InputDeviceSelection::defaultDevice();
+    } else if (preferences.inputMode == InputMode::Device) {
+        input = platform::InputDeviceSelection::device(
+            firstNameIndex(audioDevices_.captureNames,
+                           preferences.inputDeviceName));
+    }
+
+    const bool opened = audio_.selectDevices(
+        outputIndex, input, static_cast<double>(edit_.sampleRate()), 2);
+    if (!opened) return false;
+
+    audioPreferences_ = preferences;
+    if (saveOnSuccess && !audioPreferencesStore_.save(audioPreferences_)) {
+        std::fprintf(stderr, "Dave: could not save audio preferences: %s\n",
+                     audioPreferencesStore_.path().string().c_str());
+    }
+    refreshAudioDevices();
+    return true;
+}
+
+void DaveApp::syncIoPanelState() {
+    ioPanel_.setRecordingActive(recordingActive());
+    ioPanel_.setRecordLatencyOffset(
+        audioPreferences_.recordLatencyOffsetSamples);
+    gui::IoMeterSnapshot meters;
+    const auto channels = audio_.captureChannelCount();
+    meters.inputs.reserve(channels);
+    for (std::uint32_t channel = 0; channel < channels; ++channel) {
+        const auto meter = audio_.inputMeter(channel);
+        meters.inputs.push_back(
+            gui::IoInputMeter{meter.peak, meter.rms, meter.clipped});
+    }
+    ioPanel_.setMeterSnapshot(std::move(meters));
+
+    if (audioPreferences_.inputMode == InputMode::Off) {
+        ioPanel_.setCaptureStatus("Input Off");
+    } else if (audio_.captureAvailable()) {
+        ioPanel_.setCaptureStatus(
+            std::to_string(audio_.captureChannelCount()) +
+            "-channel input ready");
+    } else {
+        ioPanel_.setCaptureStatus("Playback only", audio_.captureError());
+    }
+}
+
+void DaveApp::serviceIoPanelRequests() {
+    for (const auto& request : ioPanel_.takeRequests()) {
+        if (request.kind == gui::IoPanelRequest::Kind::ClearInputClips) {
+            audio_.clearInputClips();
+            continue;
+        }
+        if (request.kind ==
+            gui::IoPanelRequest::Kind::SetRecordLatencyOffset) {
+            if (recordingActive()) {
+                showStatus("Stop recording before changing latency calibration",
+                           true);
+                continue;
+            }
+            audioPreferences_.recordLatencyOffsetSamples =
+                std::clamp(request.value, 0, 1000000);
+            if (!audioPreferencesStore_.save(audioPreferences_)) {
+                showStatus("Could not save the recording latency preference",
+                           true);
+            }
+            continue;
+        }
+        if (recordingActive()) {
+            showStatus("Stop recording before refreshing or changing audio devices",
+                       true);
+            continue;
+        }
+        if (request.kind == gui::IoPanelRequest::Kind::RefreshDevices) {
+            refreshAudioDevices();
+            applyAudioPreferences(audioPreferences_, false);
+            continue;
+        }
+
+        AudioPreferences requested = audioPreferences_;
+        if (request.kind == gui::IoPanelRequest::Kind::SelectOutput) {
+            if (request.deviceId == kOutputDefaultId) {
+                requested.outputDeviceName.clear();
+            } else {
+                const auto& catalog = ioPanel_.playbackCatalog();
+                const auto found = std::find_if(
+                    catalog.begin(), catalog.end(), [&](const gui::IoDevice& device) {
+                        return device.id == request.deviceId;
+                    });
+                if (found == catalog.end()) continue;
+                requested.outputDeviceName = found->name;
+            }
+        } else if (request.kind == gui::IoPanelRequest::Kind::SelectInput) {
+            if (request.deviceId == kInputOffId) {
+                requested.inputMode = InputMode::Off;
+                requested.inputDeviceName.clear();
+            } else if (request.deviceId == kInputDefaultId) {
+                requested.inputMode = InputMode::Default;
+                requested.inputDeviceName.clear();
+            } else {
+                const auto& catalog = ioPanel_.captureCatalog();
+                const auto found = std::find_if(
+                    catalog.begin(), catalog.end(), [&](const gui::IoDevice& device) {
+                        return device.id == request.deviceId;
+                    });
+                if (found == catalog.end()) continue;
+                requested.inputMode = InputMode::Device;
+                requested.inputDeviceName = found->name;
+            }
+        }
+        if (!applyAudioPreferences(requested, true)) {
+            // A failed output switch may have stopped the old device. Reopen
+            // the last confirmed preference so one bad choice does not leave
+            // the rest of the session silent.
+            applyAudioPreferences(audioPreferences_, false);
+        }
+    }
+}
+
+// Reopen the output/capture device at the session rate and re-derive the graph
 // against it. Called when the rate changes and after loading a project that
 // carries a different one — otherwise the engine keeps running at the old
 // rate and everything plays back detuned.
 void DaveApp::applySessionSampleRate() {
+    if (recordingActive()) {
+        showStatus("Stop recording before changing the session sample rate",
+                   true);
+        return;
+    }
     const double rate = static_cast<double>(edit_.sampleRate());
     if (audio_.sampleRate() == rate) return;
-    if (!audio_.selectDevice(audio_.currentDeviceIndex(), rate, 2)) {
+    // Resolve exact remembered names against the freshly enumerated catalog;
+    // numeric device indices are only valid for one enumeration snapshot.
+    if (!applyAudioPreferences(audioPreferences_, false)) {
         std::fprintf(stderr,
                      "Dave: could not open the output device at %.0f Hz; "
                      "the engine is still running at %.0f Hz\n",
@@ -1319,6 +2073,10 @@ void DaveApp::applySessionSampleRate() {
 }
 
 void DaveApp::openProjectDialog() {
+    if (recordingActive()) {
+        showStatus("Stop recording before opening another project", true);
+        return;
+    }
     nfdnchar_t* outPath = nullptr;
     nfdnfilteritem_t filter{"Dave project", "dave"};
     // NFD's folder picker is more correct for a bundle (it's a directory), but
@@ -1337,10 +2095,12 @@ void DaveApp::openProjectDialog() {
         lastRequestedFrameIndex_ = -1;
         lastUploadedFrameIndex_ = -1;
         projectPath_ = path;
-        dirty_ = false;
         undo_.clear();
-        applySessionSampleRate();   // the project may carry a different rate
+        applySessionSampleRate();
         onEditChanged();  // rebuild graph for the loaded Edit
+        // Hardware channel numbers are project intent. Missing channels stay
+        // unavailable until the interface returns or the user changes them.
+        dirty_ = false;
         view_.selectedTrackIndex = edit_.tracks().empty() ? -1 : 0;
         std::fprintf(stderr, "Dave: opened %s\n", path.c_str());
     }
@@ -1357,6 +2117,19 @@ void DaveApp::saveProject(bool saveAs) {
             }
         }
     }
+    const auto captureSlotState = [&](document::PluginSlot& slot) {
+        auto instance = builder_.pluginInstance(slot.id);
+        if (instance && instance->isLoaded()) {
+            slot.stateBase64 = instance->getStateBase64();
+        }
+    };
+    for (auto& track : edit_.midiTracksMut()) {
+        captureSlotState(track.instrument);
+        for (auto& slot : track.plugins) captureSlotState(slot);
+    }
+    for (auto& bus : edit_.busesMut()) {
+        for (auto& slot : bus.plugins) captureSlotState(slot);
+    }
 
     std::string path = projectPath_;
     if (saveAs || path.empty()) {
@@ -1372,6 +2145,41 @@ void DaveApp::saveProject(bool saveAs) {
     if (!r.ok) {
         std::fprintf(stderr, "Dave: save failed: %s\n", r.message.c_str());
         return;
+    }
+    // Rebase in-memory media paths to exactly what project.json now names.
+    // This is essential on first save and Save As: continuing to reference
+    // the old bundle makes the next save depend on media the user may move or
+    // delete. Loading into a temporary Edit gives us the serializer's actual
+    // collision-resolved paths without disturbing ids, undo, or plugin state.
+    document::Edit rebased;
+    const auto rebasedResult = document::loadBundle(path, rebased);
+    if (!rebasedResult.ok) {
+        projectPath_ = path;
+        dirty_ = true;
+        showStatus("Project saved, but media paths could not be rebased: " +
+                       rebasedResult.message,
+                   true);
+        return;
+    }
+    for (auto& [id, asset] : edit_.assets()) {
+        if (const auto* savedAsset = rebased.asset(id)) {
+            asset.path = savedAsset->path;
+        }
+    }
+    for (auto& videoTrack : edit_.videoTracksMut()) {
+        for (auto& clip : videoTrack.clips) {
+            for (const auto& savedTrack : rebased.videoTracks()) {
+                const auto found = std::find_if(
+                    savedTrack.clips.begin(), savedTrack.clips.end(),
+                    [&](const document::VideoClip& savedClip) {
+                        return savedClip.id == clip.id;
+                    });
+                if (found != savedTrack.clips.end()) {
+                    clip.path = found->path;
+                    break;
+                }
+            }
+        }
     }
     projectPath_ = path;
     dirty_ = false;
@@ -1639,8 +2447,167 @@ void DaveApp::drawPluginsPanelContent() {
     int sel = view_.selectedTrackIndex;
     const int audioCount = static_cast<int>(edit_.tracks().size());
     const int midiCount = static_cast<int>(edit_.midiTracks().size());
+    const int busCount = static_cast<int>(edit_.buses().size());
+    auto drawRouting = [&](const std::string& ownerId,
+                           document::RouteTarget& mainOutput,
+                           std::vector<document::AuxSend>& sends,
+                           document::Track* audioTrack) {
+        ImGui::TextUnformatted("Routing");
+        ImGui::Separator();
+        ImGui::BeginDisabled(recordingActive());
+        if (audioTrack) {
+            const auto input = audioTrack->hardwareInput;
+            const std::string inputLabel = input.channelCount == 2
+                ? "Input " + std::to_string(input.firstChannel + 1) + "-" +
+                      std::to_string(input.firstChannel + 2)
+                : "Input " + std::to_string(input.firstChannel + 1);
+            ImGui::SetNextItemWidth(150.0f);
+            if (ImGui::BeginCombo("##routingInput", inputLabel.c_str())) {
+                const int inputs = static_cast<int>(audio_.captureChannelCount());
+                for (int channel = 0; channel < inputs; ++channel) {
+                    const std::string label = "Input " + std::to_string(channel + 1);
+                    if (ImGui::Selectable(label.c_str(), input.firstChannel == channel &&
+                                                          input.channelCount == 1)) {
+                        gui::RoutingRequest request;
+                        request.kind = gui::RoutingRequest::Kind::SetHardwareInput;
+                        request.ownerId = ownerId;
+                        request.hardware = {channel, 1};
+                        view_.routing.request(std::move(request));
+                    }
+                }
+                for (int channel = 0; channel + 1 < inputs; channel += 2) {
+                    const std::string label = "Input " + std::to_string(channel + 1) +
+                        "-" + std::to_string(channel + 2);
+                    if (ImGui::Selectable(label.c_str(), input.firstChannel == channel &&
+                                                          input.channelCount == 2)) {
+                        gui::RoutingRequest request;
+                        request.kind = gui::RoutingRequest::Kind::SetHardwareInput;
+                        request.ownerId = ownerId;
+                        request.hardware = {channel, 2};
+                        view_.routing.request(std::move(request));
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::SameLine();
+            bool monitor = audioTrack->inputMonitor;
+            if (ImGui::Checkbox("Monitor", &monitor)) {
+                gui::RoutingRequest request;
+                request.kind = gui::RoutingRequest::Kind::SetInputMonitor;
+                request.ownerId = ownerId;
+                request.enabled = monitor;
+                view_.routing.request(std::move(request));
+            }
+        }
+        const std::string route = gui::routeTargetLabel(
+            edit_, mainOutput, static_cast<int>(audio_.playbackChannelCount()));
+        ImGui::SetNextItemWidth(190.0f);
+        if (ImGui::BeginCombo("Main Output", route.c_str())) {
+            const auto options = gui::routingTargetOptions(
+                edit_, ownerId, static_cast<int>(audio_.playbackChannelCount()),
+                false);
+            for (const auto& option : options) {
+                const bool selected = mainOutput == option.target;
+                if (ImGui::Selectable(option.label.c_str(), selected,
+                                      option.enabled ? ImGuiSelectableFlags_None
+                                                     : ImGuiSelectableFlags_Disabled)) {
+                    gui::RoutingRequest request;
+                    request.kind = gui::RoutingRequest::Kind::SetMainOutput;
+                    request.ownerId = ownerId;
+                    request.route = option.target;
+                    view_.routing.request(std::move(request));
+                }
+                if (!option.enabled &&
+                    ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                    ImGui::SetTooltip("%s", option.disabledReason.c_str());
+                }
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::TextDisabled("Incoming sources are derived from the route graph");
+        ImGui::Separator();
+        ImGui::TextUnformatted("Sends");
+        for (const auto& existing : sends) {
+            auto send = existing;
+            ImGui::PushID(send.id.c_str());
+            bool changed = false;
+            changed |= ImGui::Checkbox("##sendMute", &send.muted);
+            ImGui::SameLine();
+            const std::string sendTarget = gui::routeTargetLabel(
+                edit_, send.target, static_cast<int>(audio_.playbackChannelCount()));
+            ImGui::SetNextItemWidth(150.0f);
+            if (ImGui::BeginCombo("##sendTarget", sendTarget.c_str())) {
+                const auto options = gui::routingTargetOptions(
+                    edit_, ownerId,
+                    static_cast<int>(audio_.playbackChannelCount()), true);
+                for (const auto& option : options) {
+                    if (ImGui::Selectable(option.label.c_str(),
+                                          send.target == option.target,
+                                          option.enabled ? ImGuiSelectableFlags_None
+                                                         : ImGuiSelectableFlags_Disabled)) {
+                        send.target = option.target;
+                        changed = true;
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::SameLine();
+            bool pre = send.tap == document::SendTap::PreFader;
+            if (ImGui::Checkbox("Pre", &pre)) {
+                send.tap = pre ? document::SendTap::PreFader
+                               : document::SendTap::PostFader;
+                changed = true;
+            }
+            float db = send.gain <= 0.0 ? -60.0f
+                : 20.0f * std::log10(static_cast<float>(send.gain));
+            ImGui::SetNextItemWidth(120.0f);
+            if (ImGui::SliderFloat("##sendGain", &db, -60.0f, 6.0f, "%.1f dB")) {
+                send.gain = db <= -59.9f ? 0.0 : std::pow(10.0, db / 20.0);
+                changed = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Remove")) {
+                gui::RoutingRequest request;
+                request.kind = gui::RoutingRequest::Kind::RemoveSend;
+                request.ownerId = ownerId;
+                request.send = existing;
+                view_.routing.request(std::move(request));
+            } else if (changed) {
+                gui::RoutingRequest request;
+                request.kind = gui::RoutingRequest::Kind::UpdateSend;
+                request.ownerId = ownerId;
+                request.send = std::move(send);
+                view_.routing.request(std::move(request));
+            }
+            ImGui::PopID();
+        }
+        if (ImGui::Button("Add Send")) {
+            document::AuxSend send;
+            send.target = ownerId == document::kMainBusId
+                ? document::RouteTarget::hardwareOutput(0,
+                      audio_.playbackChannelCount() == 1 ? 1 : 2)
+                : document::RouteTarget::bus();
+            gui::RoutingRequest request;
+            request.kind = gui::RoutingRequest::Kind::AddSend;
+            request.ownerId = ownerId;
+            request.send = std::move(send);
+            view_.routing.request(std::move(request));
+        }
+        ImGui::EndDisabled();
+        ImGui::Separator();
+    };
+
+    if (sel >= audioCount + midiCount &&
+        sel < audioCount + midiCount + busCount) {
+        auto& bus = edit_.busesMut()[sel - audioCount - midiCount];
+        ImGui::Text("Bus: %s", bus.name.c_str());
+        drawRouting(bus.id, bus.mainOutput, bus.sends, nullptr);
+        return;
+    }
     if (sel >= audioCount && sel < audioCount + midiCount) {
-        drawMidiTrackPanel(edit_.midiTracks()[sel - audioCount]);
+        auto& midi = edit_.midiTracksMut()[sel - audioCount];
+        drawRouting(midi.id, midi.mainOutput, midi.sends, nullptr);
+        drawMidiTrackPanel(midi);
         return;
     }
     if (sel < 0 || sel >= audioCount) {
@@ -1662,9 +2629,11 @@ void DaveApp::drawPluginsPanelContent() {
         return;
     }
 
-    const auto& track = edit_.tracks()[sel];
+    auto& track = edit_.tracksMut()[sel];
     ImGui::Text("Track: %s", track.name.c_str());
     ImGui::Separator();
+
+    drawRouting(track.id, track.mainOutput, track.sends, &track);
 
     if (track.plugins.empty()) {
         std::string message = "No plugins on " + track.name;
@@ -1742,10 +2711,58 @@ const document::PluginSlot* DaveApp::findSlot(const std::string& slotId) const {
             if (s.id == slotId) return &s;
         }
     }
+    for (const auto& bus : edit_.buses()) {
+        for (const auto& slot : bus.plugins) {
+            if (slot.id == slotId) return &slot;
+        }
+    }
     return nullptr;
 }
 
 void DaveApp::serviceViewRequests() {
+    for (auto& request : view_.routing.takeRequests()) {
+        using Kind = gui::RoutingRequest::Kind;
+        const bool topologyChange = request.kind == Kind::SetHardwareInput ||
+            request.kind == Kind::SetMainOutput || request.kind == Kind::AddSend ||
+            request.kind == Kind::UpdateSend || request.kind == Kind::RemoveSend ||
+            request.kind == Kind::AddBus || request.kind == Kind::RemoveBus;
+        if (recordingActive() && topologyChange) {
+            showStatus("Routing topology cannot change during recording", true);
+            continue;
+        }
+        switch (request.kind) {
+            case Kind::SetHardwareInput:
+                undo_.execute(std::make_unique<editing::SetHardwareInputCommand>(
+                    request.ownerId, request.hardware)); break;
+            case Kind::SetInputMonitor:
+                undo_.execute(std::make_unique<editing::SetInputMonitorCommand>(
+                    request.ownerId, request.enabled)); break;
+            case Kind::SetMainOutput:
+                undo_.execute(std::make_unique<editing::SetMainRouteCommand>(
+                    request.ownerId, request.route)); break;
+            case Kind::AddSend:
+                undo_.execute(std::make_unique<editing::AddSendCommand>(
+                    request.ownerId, request.send)); break;
+            case Kind::UpdateSend:
+                undo_.execute(std::make_unique<editing::UpdateSendCommand>(
+                    request.ownerId, request.send)); break;
+            case Kind::RemoveSend:
+                undo_.execute(std::make_unique<editing::RemoveSendCommand>(
+                    request.ownerId, request.send.id)); break;
+            case Kind::AddBus:
+                undo_.execute(std::make_unique<editing::AddBusCommand>("Bus"));
+                break;
+            case Kind::RemoveBus:
+                undo_.execute(std::make_unique<editing::RemoveBusCommand>(
+                    request.ownerId)); break;
+        }
+    }
+    if (!view_.requestRecordArmTrackId.empty()) {
+        const std::string trackId =
+            std::move(view_.requestRecordArmTrackId);
+        view_.requestRecordArmTrackId.clear();
+        toggleTrackArm(trackId);
+    }
     if (view_.requestPicker != gui::TimelineViewState::PluginPicker::None) {
         BrowserMode mode = BrowserMode::AudioFx;
         switch (view_.requestPicker) {

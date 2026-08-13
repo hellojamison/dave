@@ -95,7 +95,8 @@ void CompiledGraph::prepareAll(double sampleRate, int maxBlock) {
     }
 }
 
-void CompiledGraph::process(AudioBus& rootOutput, const TimeInfo& time) {
+void CompiledGraph::process(AudioBus& rootOutput, const AudioBus& hardwareInput,
+                            const TimeInfo& time) {
     // --- RT thread --------------------------------------------------------
     // Walk nodes in topological order. For each node:
     //   1. For each input pin, zero its scratch channels, then sum each source
@@ -103,7 +104,12 @@ void CompiledGraph::process(AudioBus& rootOutput, const TimeInfo& time) {
     //   2. Clear this node's output buffer.
     //   3. Call process().
     // All scratch is pre-allocated in compile() — NO allocation here.
-    const int n = rootOutput.numSamples;
+    // Clamp rather than trust. Every buffer below is exactly maxBlock_ long,
+    // and the host's block size is a request to the driver, not a guarantee
+    // from it — see AudioEngine::kMaxBlock, which slices to match. If the two
+    // ever disagree, losing the tail of a block is survivable; writing past
+    // these buffers is not.
+    const int n = std::min(rootOutput.numSamples, maxBlock_);
     const int chansPerPin = 2; // RB-1 fixed
 
     for (size_t i = 0; i < nodes_.size(); ++i) {
@@ -117,17 +123,32 @@ void CompiledGraph::process(AudioBus& rootOutput, const TimeInfo& time) {
                 std::memset(dst, 0, n * sizeof(float));
             }
             // Sum each source's output pin into this pin's scratch channels.
-            for (const auto& [srcIdx, srcPin] : cn.inputSources[pin]) {
-                auto& src = nodes_[srcIdx];
+            for (auto& source : cn.inputSources[pin]) {
+                auto& src = nodes_[source.nodeIndex];
                 for (int c = 0; c < chansPerPin; ++c) {
                     size_t scratchIdx = cn.inputScratchIndex[pin][c];
                     float* dst = inputScratch_[scratchIdx].data();
-                    const float* srcCh = src.outChannels[srcPin * chansPerPin + c];
+                    const float* srcCh =
+                        src.outChannels[source.sourcePin * chansPerPin + c];
                     if (dst != nullptr && srcCh != nullptr) {
-                        for (int s = 0; s < n; ++s) {
-                            dst[s] += srcCh[s];
+                        if (source.delaySamples == 0) {
+                            for (int s = 0; s < n; ++s) dst[s] += srcCh[s];
+                        } else {
+                            float* delay = source.delayStorage.data() +
+                                static_cast<size_t>(c) * source.delaySamples;
+                            size_t write = source.writePosition;
+                            for (int s = 0; s < n; ++s) {
+                                dst[s] += delay[write];
+                                delay[write] = srcCh[s];
+                                if (++write == source.delaySamples) write = 0;
+                            }
                         }
                     }
+                }
+                if (source.delaySamples != 0) {
+                    source.writePosition =
+                        (source.writePosition + static_cast<size_t>(n)) %
+                        source.delaySamples;
                 }
             }
         }
@@ -151,6 +172,7 @@ void CompiledGraph::process(AudioBus& rootOutput, const TimeInfo& time) {
         ctx.time = &time;
         ctx.inputs = cn.inputBuses.data();
         ctx.numInputs = static_cast<int>(cn.inputBuses.size());
+        ctx.hardwareInput = &hardwareInput;
         // Output bus: pointers + sizes already set at compile; refresh samples.
         // cn.outputBus is reconstructed each block to keep the struct POD-ish;
         // it borrows cn.outChannels.data() (stable post-compile).
@@ -163,9 +185,9 @@ void CompiledGraph::process(AudioBus& rootOutput, const TimeInfo& time) {
         cn.node->process(ctx);
     }
 
-    // Copy the last node's output (the root) into the host's output buffer.
-    if (!nodes_.empty()) {
-        auto& root = nodes_.back();
+    // Copy the root node's output into the host's output buffer.
+    if (!nodes_.empty() && rootIndex_ < nodes_.size()) {
+        auto& root = nodes_[rootIndex_];
         int copyChans = std::min(static_cast<int>(root.outChannels.size()),
                                  rootOutput.numChannels);
         for (int c = 0; c < copyChans; ++c) {
@@ -247,6 +269,24 @@ compile(const Graph& graph, double sampleRate, int maxBlock) {
         return {nullptr, CompileError{"cycle detected: graph must be a DAG"}};
     }
 
+    // Resolve the root into a topo-order index. Default: the last node, which
+    // is what process() used before roots were nameable — so a graph that
+    // never calls setRoot() keeps its old behaviour exactly.
+    result->maxBlock_ = maxBlock;
+    result->rootIndex_ = order.empty() ? 0 : order.size() - 1;
+    if (graph.root() != 0) {
+        auto rootIt = idToIndex.find(graph.root());
+        if (rootIt == idToIndex.end()) {
+            return {nullptr, CompileError{"root references unknown node"}};
+        }
+        for (size_t topo = 0; topo < order.size(); ++topo) {
+            if (order[topo] == rootIt->second) {
+                result->rootIndex_ = topo;
+                break;
+            }
+        }
+    }
+
     // Allocate per-node output buffers and build CompiledNodes in topo order.
     const int chansPerPin = 2;
     result->nodes_.reserve(order.size());
@@ -261,6 +301,31 @@ compile(const Graph& graph, double sampleRate, int maxBlock) {
     for (size_t ord = 0; ord < order.size(); ++ord) {
         graphIdxToTopo[order[ord]] = ord;
     }
+
+    // Calculate the arrival time at every node output. Parallel edges feeding
+    // the same input pin are aligned to the slowest source on that pin. Pins
+    // stay independent, which prevents one hardware output pair from delaying
+    // another merely because both are packed by the root node.
+    std::vector<uint64_t> outputLatency(gnodes.size(), 0);
+    std::vector<std::vector<uint64_t>> pinLatency(gnodes.size());
+    for (size_t ord = 0; ord < order.size(); ++ord) {
+        const size_t idx = order[ord];
+        pinLatency[idx].resize(inputSources[idx].size(), 0);
+        uint64_t latestInput = 0;
+        for (size_t pin = 0; pin < inputSources[idx].size(); ++pin) {
+            for (const auto& source : inputSources[idx][pin]) {
+                pinLatency[idx][pin] =
+                    std::max(pinLatency[idx][pin], outputLatency[source.first]);
+            }
+            latestInput = std::max(latestInput, pinLatency[idx][pin]);
+        }
+        outputLatency[idx] = latestInput + gnodes[idx].second->latencySamples();
+    }
+
+    const uint64_t maxDelaySamples = static_cast<uint64_t>(
+        std::max(0.0, sampleRate) * 10.0);
+    constexpr uint64_t kMaxDelayBytes = 256ULL * 1024ULL * 1024ULL;
+    uint64_t totalDelayBytes = 0;
 
     // First pass: allocate the output buffer pool and count total input-pins
     // so we can size inputScratch_ precisely (one slot per (node,pin,channel)).
@@ -283,12 +348,28 @@ compile(const Graph& graph, double sampleRate, int maxBlock) {
         // via atomic members (RT-safe), so shared access is safe.
         cn.owned = nodePtr;
         cn.node = cn.owned.get();
-        // Copy inputSources and translate graph-node indices -> topo-order
-        // indices so RT-time lookups (nodes_[srcIdx]) hit the right node.
-        cn.inputSources = inputSources[idx];
-        for (auto& pinSources : cn.inputSources) {
-            for (auto& src : pinSources) {
-                src.first = graphIdxToTopo[src.first];
+        cn.inputSources.resize(inputSources[idx].size());
+        for (size_t pin = 0; pin < inputSources[idx].size(); ++pin) {
+            for (const auto& source : inputSources[idx][pin]) {
+                const uint64_t delay =
+                    pinLatency[idx][pin] - outputLatency[source.first];
+                if (delay > maxDelaySamples) {
+                    return {nullptr, CompileError{
+                        "delay compensation exceeds 10 seconds on one path"}};
+                }
+                const uint64_t bytes = delay * 2ULL * sizeof(float);
+                if (bytes > kMaxDelayBytes - totalDelayBytes) {
+                    return {nullptr, CompileError{
+                        "delay compensation exceeds 256 MiB storage budget"}};
+                }
+                totalDelayBytes += bytes;
+                CompiledGraph::CompiledNode::InputSource compiledSource;
+                compiledSource.nodeIndex = graphIdxToTopo[source.first];
+                compiledSource.sourcePin = source.second;
+                compiledSource.delaySamples = static_cast<uint32_t>(delay);
+                compiledSource.delayStorage.assign(
+                    static_cast<size_t>(delay) * 2, 0.0f);
+                cn.inputSources[pin].push_back(std::move(compiledSource));
             }
         }
 

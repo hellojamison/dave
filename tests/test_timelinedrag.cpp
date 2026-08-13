@@ -158,6 +158,33 @@ TEST_CASE("dragging an audio clip moves it and stays moved after release",
     CHECK(moved->timelineStart == expected);
 }
 
+TEST_CASE("clip dragging snaps to the active timecode grid",
+          "[timelinedrag][timelinegrid]") {
+    TimelineRig rig;
+    rig.view.snapEnabled = true;
+    rig.view.tcMode = gui::TimecodeMode::Smpte;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string trackId = rig.edit.addTrack("Audio");
+    document::AudioClip clip;
+    clip.timelineStart = 0;
+    clip.length = 480000;
+    const std::string clipId = rig.edit.addClip(trackId, clip);
+
+    const float grabX = rig.xOfSample(48000);
+    const float rowCenterY =
+        rig.findRowY(grabX, gui::TimelineViewState::DragKind::AudioClip);
+    REQUIRE(rowCenterY > 0.0f);
+
+    rig.dragFrom(ImVec2(grabX, rowCenterY),
+                 ImVec2(grabX + 197.0f, rowCenterY));
+
+    const auto* moved = rig.edit.clip(trackId, clipId);
+    REQUIRE(moved != nullptr);
+    // 197 px is 98,500 samples. A 24 fps frame is 2,000 samples, so this
+    // lands on frame 49 rather than preserving the between-frame position.
+    CHECK(moved->timelineStart == 98'000);
+}
+
 TEST_CASE("a clip drag leaves markers alone", "[timelinedrag]") {
     // The marker lane's mouse-up handler used to run for every drag. It found
     // no marker matching the dragged clip's id, so it moved nothing — and then

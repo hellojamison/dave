@@ -171,6 +171,7 @@ TEST_CASE("the video lane consumes no height until picture is imported",
 TEST_CASE("dragging empty track area makes a time selection",
           "[timelinelayout]") {
     LayoutRig rig;
+    rig.view.snapEnabled = true;
     rig.edit.addMarkerTrack("Markers");
     rig.edit.addTrack("Audio 1");
     rig.settle();
@@ -226,6 +227,47 @@ TEST_CASE("a click without movement seeks and leaves no selection",
           static_cast<int64_t>(200.0 * rig.view.samplesPerPixel));
 }
 
+TEST_CASE("snap off keeps a dragged range at its raw sample positions",
+          "[timelinelayout][timelinegrid]") {
+    LayoutRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    rig.edit.addTrack("Audio 1");
+    rig.settle();
+
+    const float laneY = rig.origin.y + kRulerHeight + kMarkerLaneHeight +
+                        kTrackHeight * 0.5f;
+    const float x0 = rig.origin.x + kGutterWidth + 97.0f;
+    const float x1 = rig.origin.x + kGutterWidth + 350.0f;
+    rig.tick(x0, laneY, false);
+    rig.tick(x0, laneY, true);
+    rig.tick(x1, laneY, true);
+    rig.tick(x1, laneY, false);
+
+    REQUIRE(rig.view.hasSelection);
+    CHECK(rig.view.selectionStart == 97 * 500);
+    CHECK(rig.view.selectionEnd == 350 * 500);
+}
+
+TEST_CASE("snap on seeks to the active timecode frame",
+          "[timelinelayout][timelinegrid]") {
+    LayoutRig rig;
+    rig.view.snapEnabled = true;
+    rig.view.tcMode = gui::TimecodeMode::Smpte;
+    rig.edit.addMarkerTrack("Markers");
+    rig.edit.addTrack("Audio 1");
+    rig.settle();
+
+    const float laneY = rig.origin.y + kRulerHeight + kMarkerLaneHeight +
+                        kTrackHeight * 0.5f;
+    rig.clickTimelineAt(rig.origin.x + kGutterWidth + 101.0f, laneY);
+    engine::TimeInfo time{};
+    rig.transport.advanceAndFill(time, 0, 48000.0);
+
+    // 101 px at 500 samples/px is 50,500 samples. At 24 fps the adjacent
+    // frame boundaries are 50,000 and 52,000, so the nearest is 50,000.
+    CHECK(rig.transport.position() == 50000);
+}
+
 TEST_CASE("option-clicking a marker deletes it", "[timelinelayout]") {
     LayoutRig rig;
     const std::string mt = rig.edit.addMarkerTrack("Markers");
@@ -260,6 +302,7 @@ TEST_CASE("option-clicking a marker deletes it", "[timelinelayout]") {
 TEST_CASE("a lane drag selects only that lane; the ruler selects all",
           "[timelinelayout]") {
     LayoutRig rig;
+    rig.view.snapEnabled = true;
     rig.edit.addMarkerTrack("Markers");
     rig.edit.addTrack("Audio 1");
     rig.edit.addTrack("Audio 2");
@@ -319,7 +362,8 @@ TEST_CASE("a lane drag selects only that lane; the ruler selects all",
     }
 
     SECTION("dragging below the last track selects nothing") {
-        dragAcross(tracksTop + kTrackHeight * 2.0f + 20.0f);
+        // Audio rows are followed by the permanent Main bus row.
+        dragAcross(tracksTop + kTrackHeight * 3.0f + 20.0f);
         CHECK_FALSE(rig.view.hasSelection);
     }
 }
@@ -444,6 +488,7 @@ TEST_CASE("a selection dragged in timecode lands on whole frames",
     const int64_t frame = static_cast<int64_t>(kSr / kFps);
 
     LayoutRig rig;
+    rig.view.snapEnabled = true;
     rig.view.tcMode = gui::TimecodeMode::Smpte;
     rig.edit.addMarkerTrack("Markers");
     rig.edit.addTrack("Audio 1");
@@ -497,6 +542,31 @@ TEST_CASE("the snap increment stays in the format's units at every zoom",
     }
 }
 
+TEST_CASE("format snapping rounds positions in the active ruler units",
+          "[timelinegrid]") {
+    constexpr double kSr = 48000.0;
+    constexpr double kSpp = 500.0;
+
+    // SMPTE and feet+frames share exact whole-frame boundaries at 24 fps.
+    CHECK(gui::snapSampleToFormat(50'500, gui::TimecodeMode::Smpte,
+                                  kSpp, kSr, 24.0) == 50'000);
+    CHECK(gui::snapSampleToFormat(51'100, gui::TimecodeMode::FeetFrames,
+                                  kSpp, kSr, 24.0) == 52'000);
+
+    // At 120 bpm, the finest aimable musical division here is a sixteenth
+    // note (6,000 samples), not an arbitrary sample interval.
+    CHECK(gui::snapSampleToFormat(5'100, gui::TimecodeMode::BarsBeats,
+                                  kSpp, kSr, 24.0, 120.0) == 6'000);
+
+    // The remaining formats stay on their own round decimal ladders.
+    CHECK(gui::snapSampleToFormat(3'000, gui::TimecodeMode::MinSec,
+                                  kSpp, kSr) == 2'400);
+    CHECK(gui::snapSampleToFormat(3'100, gui::TimecodeMode::Samples,
+                                  kSpp, kSr) == 4'000);
+    CHECK(gui::snapSampleToFormat(-100, gui::TimecodeMode::Samples,
+                                  kSpp, kSr) == 0);
+}
+
 TEST_CASE("the zoom range reaches a feature-length session", "[timelinegrid]") {
     // The old 50,000 ceiling showed ~17 minutes across a 1000 px timeline.
     // A 2-hour session has to fit end to end.
@@ -519,6 +589,7 @@ TEST_CASE("the timeline reads its sample rate from the document",
     // 96 k must not be measured with a hardcoded 48 k, or every label is
     // half of what it should say.
     LayoutRig rig;
+    rig.view.snapEnabled = true;
     rig.edit.addMarkerTrack("Markers");
     rig.edit.addTrack("Audio 1");
     rig.view.tcMode = gui::TimecodeMode::Smpte;
@@ -543,13 +614,15 @@ TEST_CASE("the timeline reads its sample rate from the document",
     CHECK(rig.view.selectionEnd % frame96 == 0);
 }
 
-TEST_CASE("zooming keeps the playhead in the middle of the view",
+TEST_CASE("zooming keeps a visible playhead at the same screen position",
           "[timelinegrid]") {
     gui::TimelineViewState view;
     view.laneWidthPixels = 1000.0f;
     view.samplesPerPixel = 500.0;
-    view.scrollSamples = 0.0;
     constexpr int64_t kPlayhead = 4'000'000;
+    constexpr double kPlayheadPixel = 320.0;
+    view.scrollSamples =
+        kPlayhead - kPlayheadPixel * view.samplesPerPixel;
 
     // Screen offset of a sample from the left edge of the lane.
     auto pixelOf = [&](int64_t sample) {
@@ -558,28 +631,39 @@ TEST_CASE("zooming keeps the playhead in the middle of the view",
 
     gui::zoomAroundSample(view, 1000.0, kPlayhead);
     CHECK(view.samplesPerPixel == 1000.0);
-    CHECK(pixelOf(kPlayhead) == Catch::Approx(500.0));   // dead centre
+    CHECK(pixelOf(kPlayhead) == Catch::Approx(kPlayheadPixel));
 
-    // Still centred after several steps in, which is where the old
-    // left-edge-anchored zoom walked the playhead off the screen.
+    // The edit stays visually pinned under the playhead through repeated
+    // steps in instead of jumping the cursor to the lane centre.
     for (int i = 0; i < 6; ++i) {
         gui::zoomAroundSample(view, view.samplesPerPixel * 0.5, kPlayhead);
-        REQUIRE(pixelOf(kPlayhead) == Catch::Approx(500.0));
+        REQUIRE(pixelOf(kPlayhead) == Catch::Approx(kPlayheadPixel));
     }
-    // And back out again. Zoomed out far enough, half the visible span is
-    // wider than the playhead's distance from the session start, and it
-    // cannot be centred without scrolling before sample zero. The scroll
-    // pins at zero and the playhead drifts left of centre — never off the
-    // right edge, which is the failure that matters.
+    // And back out again. Zoomed out far enough, preserving the exact pixel
+    // would require scrolling before sample zero. The scroll pins at zero and
+    // the playhead moves left only because the timeline has a hard boundary.
     for (int i = 0; i < 10; ++i) {
         gui::zoomAroundSample(view, view.samplesPerPixel * 2.0, kPlayhead);
         if (view.scrollSamples > 0.0) {
-            REQUIRE(pixelOf(kPlayhead) == Catch::Approx(500.0));
+            REQUIRE(pixelOf(kPlayhead) == Catch::Approx(kPlayheadPixel));
         } else {
-            REQUIRE(pixelOf(kPlayhead) <= 500.0);
+            REQUIRE(pixelOf(kPlayhead) <= kPlayheadPixel);
             REQUIRE(pixelOf(kPlayhead) >= 0.0);
         }
     }
+}
+
+TEST_CASE("zooming centres an off-screen playhead", "[timelinegrid]") {
+    gui::TimelineViewState view;
+    view.laneWidthPixels = 1000.0f;
+    view.samplesPerPixel = 500.0;
+    view.scrollSamples = 0.0;
+    constexpr int64_t kPlayhead = 4'000'000;
+
+    gui::zoomAroundSample(view, 1000.0, kPlayhead);
+    const double playheadPixel =
+        (kPlayhead - view.scrollSamples) / view.samplesPerPixel;
+    CHECK(playheadPixel == Catch::Approx(500.0));
 }
 
 TEST_CASE("zoom respects the range limits and the start of the timeline",
@@ -607,7 +691,7 @@ TEST_CASE("zoom respects the range limits and the start of the timeline",
     CHECK(fresh.scrollSamples == 12345.0);
 }
 
-TEST_CASE("ctrl+wheel zoom through the real timeline re-centres",
+TEST_CASE("ctrl+wheel zoom preserves the playhead screen position",
           "[timelinegrid]") {
     LayoutRig rig;
     rig.edit.addMarkerTrack("Markers");
@@ -615,6 +699,9 @@ TEST_CASE("ctrl+wheel zoom through the real timeline re-centres",
     rig.seekTo(4'000'000);
     rig.settle();
     REQUIRE(rig.view.laneWidthPixels > 0.0f);   // the widget reported its width
+    constexpr double kPlayheadPixel = 200.0;
+    rig.view.scrollSamples =
+        4'000'000 - kPlayheadPixel * rig.view.samplesPerPixel;
 
     const float laneY = rig.origin.y + kRulerHeight + kMarkerLaneHeight +
                         kTrackHeight * 0.5f;
@@ -636,7 +723,7 @@ TEST_CASE("ctrl+wheel zoom through the real timeline re-centres",
     const double playheadPixel =
         (4'000'000 - rig.view.scrollSamples) / rig.view.samplesPerPixel;
     CHECK(playheadPixel ==
-          Catch::Approx(rig.view.laneWidthPixels * 0.5).margin(1.0));
+          Catch::Approx(kPlayheadPixel).margin(1.0));
 }
 
 TEST_CASE("finishing a selection puts the playhead at its head",
@@ -693,12 +780,118 @@ TEST_CASE("finishing a selection puts the playhead at its head",
     SECTION("a drag below the last track leaves the playhead alone") {
         // No lane means no selection, so there is no head to go to. The
         // press still counts as a click and seeks there.
+        // The permanent Main bus follows the audio row.
         const float belowTracks = rig.origin.y + kRulerHeight +
-                                  kMarkerLaneHeight + kTrackHeight + 20.0f;
+                                  kMarkerLaneHeight + kTrackHeight * 2.0f + 20.0f;
         rig.tick(x0, belowTracks, false);
         rig.tick(x0, belowTracks, true);
         rig.tick(x0 + 300.0f, belowTracks, true);
         rig.tick(x0 + 300.0f, belowTracks, false);
         CHECK_FALSE(rig.view.hasSelection);
     }
+}
+
+TEST_CASE("the track colour band toggles the disclosure state",
+          "[timelinelayout]") {
+    // The band is the click target for the arrow. Nothing consumes the open
+    // state yet, so this guards the affordance itself: the arrow direction is
+    // derived from expandedTracks, and if the click stops landing the arrow
+    // silently stops responding with no other symptom.
+    LayoutRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string t0 = rig.edit.addTrack("Audio 1");
+    const std::string t1 = rig.edit.addTrack("Audio 2");
+    rig.settle();
+
+    const float tracksTop = rig.origin.y + kRulerHeight + kMarkerLaneHeight;
+    // The band sits 8 px in from the gutter's left edge and is 18 px wide.
+    const float bandX = rig.origin.x + 17.0f;
+
+    CHECK(rig.view.expandedTracks.empty());
+
+    rig.clickTimelineAt(bandX, tracksTop + kTrackHeight * 0.5f);
+    CHECK(rig.view.expandedTracks.count(t0) == 1);
+    CHECK(rig.view.expandedTracks.count(t1) == 0);   // its neighbour is untouched
+
+    // Clicking again closes it.
+    rig.clickTimelineAt(bandX, tracksTop + kTrackHeight * 0.5f);
+    CHECK(rig.view.expandedTracks.count(t0) == 0);
+
+    // And the second track has its own band.
+    rig.clickTimelineAt(bandX, tracksTop + kTrackHeight * 1.5f);
+    CHECK(rig.view.expandedTracks.count(t1) == 1);
+    CHECK(rig.view.expandedTracks.count(t0) == 0);
+}
+
+TEST_CASE("clicking the gutter beside the band does not toggle it",
+          "[timelinelayout]") {
+    // The band shares the header row with the name, the sliders and M/S. A
+    // click on any of those must not open the track.
+    LayoutRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string t0 = rig.edit.addTrack("Audio 1");
+    rig.settle();
+
+    const float tracksTop = rig.origin.y + kRulerHeight + kMarkerLaneHeight;
+    // Well right of the band, over the name.
+    rig.clickTimelineAt(rig.origin.x + 90.0f, tracksTop + 10.0f);
+    CHECK(rig.view.expandedTracks.empty());
+}
+
+TEST_CASE("the timeline record button arms only its audio row",
+          "[timelinelayout][record-arm]") {
+    LayoutRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string first = rig.edit.addTrack("Boom");
+    const std::string second = rig.edit.addTrack("Lav");
+    rig.settle();
+
+    const float tracksTop = rig.origin.y + kRulerHeight + kMarkerLaneHeight;
+    // The record circle keeps the 21 px hit slot immediately left of M/S.
+    rig.clickTimelineAt(rig.origin.x + 189.5f, tracksTop + 14.5f);
+
+    CHECK(rig.edit.track(first)->recordArm);
+    CHECK_FALSE(rig.edit.track(second)->recordArm);
+}
+
+TEST_CASE("timeline MIDI rows keep M at its pre-recording position",
+          "[timelinelayout][record-arm]") {
+    LayoutRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string midi = rig.edit.addMidiTrack("Keys");
+    rig.settle();
+
+    const float tracksTop = rig.origin.y + kRulerHeight + kMarkerLaneHeight;
+    // The audio R position remains ordinary name space on MIDI.
+    rig.clickTimelineAt(rig.origin.x + 189.5f, tracksTop + 14.5f);
+    CHECK_FALSE(rig.edit.midiTrack(midi)->mute);
+    // M and S did not shift when audio gained R.
+    rig.clickTimelineAt(rig.origin.x + 213.5f, tracksTop + 14.5f);
+    CHECK(rig.edit.midiTrack(midi)->mute);
+    CHECK_FALSE(rig.edit.midiTrack(midi)->solo);
+}
+
+TEST_CASE("Option-clicking timeline pan and gain restores their defaults",
+          "[timelinelayout][gain][pan][reset]") {
+    LayoutRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string track = rig.edit.addTrack("Audio 1");
+    rig.edit.track(track)->gain = 0.25;
+    rig.edit.track(track)->pan = -0.75;
+    rig.settle();
+
+    const float tracksTop = rig.origin.y + kRulerHeight + kMarkerLaneHeight;
+    // Gutter controls begin at x=96. Gain is the first compact row and pan
+    // the second; probe their centers so this tests the real sliders.
+    const float controlX = rig.origin.x + 160.0f;
+    const float gainY = tracksTop + 31.5f;
+    const float panY = tracksTop + 49.5f;
+
+    rig.holdAlt(true);
+    rig.clickTimelineAt(controlX, panY);
+    rig.clickTimelineAt(controlX, gainY);
+    rig.holdAlt(false);
+
+    CHECK(rig.edit.track(track)->pan == 0.0);
+    CHECK(rig.edit.track(track)->gain == 1.0);
 }

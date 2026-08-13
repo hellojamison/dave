@@ -23,6 +23,9 @@ public:
     int numInputPins() const override { return 1; }
     int numOutputPins() const override { return 1; }
     int channelsPerPin() const override { return 2; }
+    uint32_t latencySamples() const override {
+        return instance_ ? instance_->latencySamples() : 0;
+    }
 
     void prepare(double sampleRate, int maxBlock) override {
         if (instance_) instance_->prepare(sampleRate, maxBlock);

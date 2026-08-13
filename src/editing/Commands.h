@@ -38,6 +38,44 @@ private:
     std::string clipId_;
 };
 
+// Commit a finished recording to the document. Audio I/O and hashing have
+// already completed before this command is constructed, so undo/redo is a
+// deterministic model edit and never observes a changing file.
+//
+// Undo deliberately keeps both the asset record and WAV on disk. A recorded
+// performance must not become unrecoverable because the user pressed Undo;
+// orphan cleanup belongs to a separate, explicitly recoverable workflow.
+class CommitTakeCommand : public Command {
+public:
+    CommitTakeCommand(std::string trackId, document::AudioAsset asset,
+                      document::AudioClip clip)
+        : trackId_(std::move(trackId)), asset_(std::move(asset)),
+          clip_(std::move(clip)) {}
+
+    void perform(document::Edit& e) override {
+        e.loadAsset_(asset_);
+        if (clipId_.empty()) {
+            clipId_ = e.addClip(trackId_, clip_);
+            clip_.id = clipId_;
+        } else {
+            e.restoreClip_(trackId_, clip_);
+        }
+    }
+
+    void undo(document::Edit& e) override {
+        e.removeClip(trackId_, clipId_);
+    }
+
+    std::string name() const override { return "Commit Take"; }
+    const std::string& clipId() const { return clipId_; }
+
+private:
+    std::string trackId_;
+    document::AudioAsset asset_;
+    document::AudioClip clip_;
+    std::string clipId_;
+};
+
 // MoveClip: changes a clip's timelineStart AND optionally its track.
 // Undo restores the original position and track. Used by the timeline drag
 // (which can move a clip sideways and/or drop it onto another track).
@@ -190,12 +228,21 @@ public:
         // Snapshot the slot for undo.
         const auto* t = e.track(trackId_);
         if (t) for (const auto& s : t->plugins) if (s.id == slotId_) { snapshot_ = s; break; }
+        const auto* b = e.bus(trackId_);
+        if (b) for (const auto& s : b->plugins) if (s.id == slotId_) { snapshot_ = s; break; }
         e.removePlugin(trackId_, slotId_);
     }
     void undo(document::Edit& e) override {
         std::string newId = e.addPlugin(trackId_, snapshot_);
         if (const auto* t = e.track(trackId_)) {
             for (const auto& s : t->plugins) {
+                if (s.id == newId) {
+                    const_cast<document::PluginSlot&>(s).id = slotId_;
+                    break;
+                }
+            }
+        } else if (const auto* b = e.bus(trackId_)) {
+            for (const auto& s : b->plugins) {
                 if (s.id == newId) {
                     const_cast<document::PluginSlot&>(s).id = slotId_;
                     break;
@@ -719,6 +766,229 @@ private:
     std::string trackId_;
     std::string markerId_;
     document::Marker snapshot_;
+};
+
+// ─── Routing commands (Phase 4) ────────────────────────────────────────────
+
+inline document::RouteTarget routeForOwner(const document::Edit& edit,
+                                           const std::string& id) {
+    if (const auto* track = edit.track(id)) return track->mainOutput;
+    if (const auto* track = edit.midiTrack(id)) return track->mainOutput;
+    if (const auto* bus = edit.bus(id)) return bus->mainOutput;
+    return document::RouteTarget::none();
+}
+
+inline std::string colorForOwner(const document::Edit& edit,
+                                 const std::string& id) {
+    if (const auto* track = edit.track(id)) return track->color;
+    if (const auto* track = edit.midiTrack(id)) return track->color;
+    if (const auto* bus = edit.bus(id)) return bus->color;
+    return {};
+}
+
+class SetTrackColorCommand : public Command {
+public:
+    SetTrackColorCommand(std::string ownerId, std::string color)
+        : ownerId_(std::move(ownerId)), color_(std::move(color)) {}
+    void perform(document::Edit& edit) override {
+        previous_ = colorForOwner(edit, ownerId_);
+        edit.setTrackColor(ownerId_, color_);
+    }
+    void undo(document::Edit& edit) override {
+        edit.setTrackColor(ownerId_, previous_);
+    }
+    std::string name() const override { return "Set Track Color"; }
+private:
+    std::string ownerId_;
+    std::string color_;
+    std::string previous_;
+};
+
+class SetMainRouteCommand : public Command {
+public:
+    SetMainRouteCommand(std::string ownerId, document::RouteTarget target)
+        : ownerId_(std::move(ownerId)), target_(std::move(target)) {}
+    void perform(document::Edit& edit) override {
+        previous_ = routeForOwner(edit, ownerId_);
+        edit.setMainOutput(ownerId_, target_);
+    }
+    void undo(document::Edit& edit) override {
+        edit.setMainOutput(ownerId_, previous_);
+    }
+    std::string name() const override { return "Set Main Route"; }
+private:
+    std::string ownerId_;
+    document::RouteTarget target_;
+    document::RouteTarget previous_ = document::RouteTarget::none();
+};
+
+class SetInputMonitorCommand : public Command {
+public:
+    SetInputMonitorCommand(std::string trackId, bool enabled)
+        : trackId_(std::move(trackId)), enabled_(enabled) {}
+    void perform(document::Edit& edit) override {
+        if (const auto* track = edit.track(trackId_)) previous_ = track->inputMonitor;
+        edit.setInputMonitor(trackId_, enabled_);
+    }
+    void undo(document::Edit& edit) override {
+        edit.setInputMonitor(trackId_, previous_);
+    }
+    std::string name() const override { return "Set Input Monitor"; }
+private:
+    std::string trackId_;
+    bool enabled_ = false;
+    bool previous_ = false;
+};
+
+class SetHardwareInputCommand : public Command {
+public:
+    SetHardwareInputCommand(std::string trackId,
+                            document::HardwareChannelSpan input)
+        : trackId_(std::move(trackId)), input_(input) {}
+    void perform(document::Edit& edit) override {
+        if (const auto* track = edit.track(trackId_)) previous_ = track->hardwareInput;
+        edit.setTrackHardwareInput(trackId_, input_);
+    }
+    void undo(document::Edit& edit) override {
+        edit.setTrackHardwareInput(trackId_, previous_);
+    }
+    std::string name() const override { return "Set Hardware Input"; }
+private:
+    std::string trackId_;
+    document::HardwareChannelSpan input_;
+    document::HardwareChannelSpan previous_;
+};
+
+class AddSendCommand : public Command {
+public:
+    AddSendCommand(std::string ownerId, document::AuxSend send)
+        : ownerId_(std::move(ownerId)), send_(std::move(send)) {}
+    void perform(document::Edit& edit) override {
+        if (send_.id.empty()) send_.id = edit.addSend(ownerId_, send_);
+        else edit.restoreSend_(ownerId_, send_, index_);
+    }
+    void undo(document::Edit& edit) override {
+        if (const auto* sends = ownerSends(edit)) {
+            for (size_t i = 0; i < sends->size(); ++i) {
+                if ((*sends)[i].id == send_.id) { index_ = i; break; }
+            }
+        }
+        edit.removeSend(ownerId_, send_.id);
+    }
+    std::string name() const override { return "Add Send"; }
+    const std::string& sendId() const { return send_.id; }
+private:
+    const std::vector<document::AuxSend>* ownerSends(
+        const document::Edit& edit) const {
+        if (const auto* track = edit.track(ownerId_)) return &track->sends;
+        if (const auto* track = edit.midiTrack(ownerId_)) return &track->sends;
+        if (const auto* bus = edit.bus(ownerId_)) return &bus->sends;
+        return nullptr;
+    }
+    std::string ownerId_;
+    document::AuxSend send_;
+    size_t index_ = 0;
+};
+
+class AddBusCommand : public Command {
+public:
+    explicit AddBusCommand(std::string name) : name_(std::move(name)) {}
+    void perform(document::Edit& edit) override {
+        if (snapshot_.id.empty()) {
+            const std::string id = edit.addBus(name_);
+            if (const auto* bus = edit.bus(id)) snapshot_ = *bus;
+        } else {
+            edit.restoreBus_(snapshot_, index_);
+        }
+    }
+    void undo(document::Edit& edit) override {
+        const auto& buses = edit.buses();
+        for (size_t i = 0; i < buses.size(); ++i) {
+            if (buses[i].id == snapshot_.id) { index_ = i; break; }
+        }
+        edit.removeBus(snapshot_.id);
+    }
+    std::string name() const override { return "Add Bus"; }
+    const std::string& busId() const { return snapshot_.id; }
+private:
+    std::string name_;
+    document::BusTrack snapshot_;
+    size_t index_ = 0;
+};
+
+class UpdateSendCommand : public Command {
+public:
+    UpdateSendCommand(std::string ownerId, document::AuxSend send)
+        : ownerId_(std::move(ownerId)), send_(std::move(send)) {}
+    void perform(document::Edit& edit) override {
+        if (const auto* list = sends(edit)) {
+            for (const auto& candidate : *list) {
+                if (candidate.id == send_.id) { previous_ = candidate; break; }
+            }
+        }
+        edit.updateSend(ownerId_, send_);
+    }
+    void undo(document::Edit& edit) override { edit.updateSend(ownerId_, previous_); }
+    std::string name() const override { return "Update Send"; }
+private:
+    const std::vector<document::AuxSend>* sends(const document::Edit& edit) const {
+        if (const auto* track = edit.track(ownerId_)) return &track->sends;
+        if (const auto* track = edit.midiTrack(ownerId_)) return &track->sends;
+        if (const auto* bus = edit.bus(ownerId_)) return &bus->sends;
+        return nullptr;
+    }
+    std::string ownerId_;
+    document::AuxSend send_;
+    document::AuxSend previous_;
+};
+
+class RemoveSendCommand : public Command {
+public:
+    RemoveSendCommand(std::string ownerId, std::string sendId)
+        : ownerId_(std::move(ownerId)), sendId_(std::move(sendId)) {}
+    void perform(document::Edit& edit) override {
+        if (const auto* list = sends(edit)) {
+            for (size_t i = 0; i < list->size(); ++i) {
+                if ((*list)[i].id == sendId_) { snapshot_ = (*list)[i]; index_ = i; break; }
+            }
+        }
+        edit.removeSend(ownerId_, sendId_);
+    }
+    void undo(document::Edit& edit) override {
+        edit.restoreSend_(ownerId_, snapshot_, index_);
+    }
+    std::string name() const override { return "Remove Send"; }
+private:
+    const std::vector<document::AuxSend>* sends(const document::Edit& edit) const {
+        if (const auto* track = edit.track(ownerId_)) return &track->sends;
+        if (const auto* track = edit.midiTrack(ownerId_)) return &track->sends;
+        if (const auto* bus = edit.bus(ownerId_)) return &bus->sends;
+        return nullptr;
+    }
+    std::string ownerId_;
+    std::string sendId_;
+    document::AuxSend snapshot_;
+    size_t index_ = 0;
+};
+
+class RemoveBusCommand : public Command {
+public:
+    explicit RemoveBusCommand(std::string id) : id_(std::move(id)) {}
+    void perform(document::Edit& edit) override {
+        const auto& buses = edit.buses();
+        for (size_t i = 0; i < buses.size(); ++i) {
+            if (buses[i].id == id_) { snapshot_ = buses[i]; index_ = i; break; }
+        }
+        edit.removeBus(id_);
+    }
+    void undo(document::Edit& edit) override {
+        edit.restoreBus_(snapshot_, index_);
+    }
+    std::string name() const override { return "Remove Bus"; }
+private:
+    std::string id_;
+    document::BusTrack snapshot_;
+    size_t index_ = 0;
 };
 
 } // namespace dave::editing

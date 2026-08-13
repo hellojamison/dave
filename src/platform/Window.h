@@ -20,6 +20,7 @@ class Window {
 public:
     using FrameCallback = std::function<void()>;
     using FileDropCallback = std::function<void(const std::vector<std::string>&)>;
+    using CloseGuard = std::function<bool()>;
 
     struct ScreenshotOptions {
         std::string outputPath;
@@ -45,12 +46,13 @@ public:
     // build ImGui UI and render.
     void setFrameCallback(FrameCallback cb) { frameCallback_ = std::move(cb); }
     void setFileDropCallback(FileDropCallback cb);
+    void setCloseGuard(CloseGuard guard) { closeGuard_ = std::move(guard); }
 
     // Run the event loop until the window is closed.
     void run();
 
     // Request the loop exit (safe from within the frame callback).
-    void close() { shouldClose_ = true; }
+    void close();
 
     GLFWwindow* handle() { return window_; }
 
@@ -60,6 +62,7 @@ private:
     GLFWwindow* window_ = nullptr;
     FrameCallback frameCallback_;
     FileDropCallback fileDropCallback_;
+    CloseGuard closeGuard_;
     bool shouldClose_ = false;
 };
 

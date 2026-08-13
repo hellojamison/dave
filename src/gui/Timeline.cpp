@@ -2,6 +2,7 @@
 #include "gui/Timeline.h"
 #include "editing/Commands.h"
 #include "gui/Theme.h"
+#include "gui/TrackColorPicker.h"
 
 #include <imgui.h>
 
@@ -121,6 +122,15 @@ std::vector<double> formatLadder(TimecodeMode mode, double sr, double fps,
     return ladder;
 }
 
+// The colour band down the left of every track header. Wide enough to hold a
+// disclosure arrow, so the band is both the track's identity colour and the
+// control that opens it — one target instead of a stripe plus a separate
+// twisty squeezed in beside the name.
+constexpr float kBandX = 8.0f;
+constexpr float kBandW = 18.0f;
+// Everything else in the gutter starts clear of the band.
+constexpr float kGutterContentX = kBandX + kBandW + 6.0f;   // 32
+
 // The first division at least `targetPixels` wide, so both callers scale
 // through the format's own units instead of falling back to raw samples.
 double ladderStepFor(const std::vector<double>& ladder, double targetPixels,
@@ -136,16 +146,28 @@ double ladderStepFor(const std::vector<double>& ladder, double targetPixels,
 
 void zoomAroundSample(TimelineViewState& view, double newSamplesPerPixel,
                       int64_t anchorSample) {
+    const double oldSamplesPerPixel = std::clamp(
+        view.samplesPerPixel, kMinSamplesPerPixel, kMaxSamplesPerPixel);
     view.samplesPerPixel = std::clamp(
         newSamplesPerPixel, kMinSamplesPerPixel, kMaxSamplesPerPixel);
     // Before the first frame the widget has not reported its width yet, so
-    // there is no "middle" to aim at. Change the zoom and leave the scroll
-    // where it is rather than guessing at a centre.
+    // there is no stable screen position to preserve. Change the zoom and
+    // leave the scroll where it is rather than guessing at an anchor.
     if (view.laneWidthPixels <= 0.0f) return;
-    const double halfSpan =
-        (view.laneWidthPixels * 0.5) * view.samplesPerPixel;
+
+    // Keep a visible playhead at exactly the same screen X. Recentring every
+    // zoom step makes the edit appear to slide underneath the user. If the
+    // playhead is currently off-screen, centring it is the useful recovery
+    // behaviour and preserves the previous keyboard-zoom affordance.
+    double anchorPixel =
+        (static_cast<double>(anchorSample) - view.scrollSamples) /
+        oldSamplesPerPixel;
+    if (anchorPixel < 0.0 || anchorPixel > view.laneWidthPixels) {
+        anchorPixel = view.laneWidthPixels * 0.5;
+    }
     view.scrollSamples =
-        std::max(0.0, static_cast<double>(anchorSample) - halfSpan);
+        std::max(0.0, static_cast<double>(anchorSample) -
+                          anchorPixel * view.samplesPerPixel);
 }
 
 GridStep gridStepFor(TimecodeMode mode, double samplesPerPixel,
@@ -191,6 +213,22 @@ int64_t snapStepFor(TimecodeMode mode, double samplesPerPixel, double sr,
         ladder, kTargetSnapPixels, samplesPerPixel, 1.0)));
 }
 
+int64_t snapSampleToFormat(int64_t sample, TimecodeMode mode,
+                           double samplesPerPixel, double sr,
+                           double fps, double bpm) {
+    sample = std::max<int64_t>(0, sample);
+    const int64_t step = snapStepFor(mode, samplesPerPixel, sr, fps, bpm);
+    if (step <= 1) return sample;
+
+    const int64_t wholeSteps = sample / step;
+    const int64_t remainder = sample % step;
+    if (remainder >= (step + 1) / 2 &&
+        wholeSteps < std::numeric_limits<int64_t>::max() / step) {
+        return (wholeSteps + 1) * step;
+    }
+    return wholeSteps * step;
+}
+
 // Helpers converting Palette ImVec4 -> ImU32 (ImDrawList wants packed colors).
 static inline ImU32 C(const ImVec4& v) {
     return IM_COL32(
@@ -225,11 +263,15 @@ struct GutterLayout {
 // const here (the timeline is a pure function of the document) and the call
 // sites already const_cast to write through.
 struct TrackGutterFields {
+    const std::string* trackId = nullptr;
     std::string* name = nullptr;
     double* gain = nullptr;
     double* pan = nullptr;
     bool* mute = nullptr;
     bool* solo = nullptr;
+    // Audio tracks expose record arm. MIDI passes null and retains the exact
+    // two-button M/S layout it had before recording existed.
+    bool* recordArm = nullptr;
 };
 
 // Draws one track's header column. `uid` must be unique across ALL track types
@@ -251,8 +293,9 @@ float drawTrackGutter(const GutterLayout& g, TimelineViewState& view,
         const bool thisRenaming = view.isRenaming && view.renameTrackIndex == uid;
 
         if (thisRenaming) {
-            ImGui::SetCursorScreenPos(ImVec2(origin.x + 20.0f, y + g.rowPadding));
-            ImGui::PushItemWidth(g.gutterWidth - 88.0f);
+            ImGui::SetCursorScreenPos(ImVec2(origin.x + kGutterContentX, y + g.rowPadding));
+            ImGui::PushItemWidth(
+                g.gutterWidth - (f.recordArm != nullptr ? 118.0f : 88.0f));
             ImGui::SetKeyboardFocusHere();
             char nameBuf[128];
             std::strncpy(nameBuf, f.name->c_str(), sizeof(nameBuf) - 1);
@@ -277,18 +320,20 @@ float drawTrackGutter(const GutterLayout& g, TimelineViewState& view,
             ImFont* nameFont = theme::fonts().label != nullptr
                 ? theme::fonts().label : ImGui::GetFont();
             dl->PushClipRect(
-                ImVec2(origin.x + 20.0f, y),
-                ImVec2(origin.x + g.gutterWidth - 62.0f,
+                ImVec2(origin.x + kGutterContentX, y),
+                ImVec2(origin.x + g.gutterWidth -
+                           (f.recordArm != nullptr ? 86.0f : 62.0f),
                        y + g.headerHeight + g.rowPadding * 2.0f),
                 true);
             dl->AddText(nameFont, g.labelHeight,
-                        ImVec2(origin.x + 20.0f, y + g.rowPadding),
+                        ImVec2(origin.x + kGutterContentX, y + g.rowPadding),
                         C(pal.text), f.name->c_str());
             dl->PopClipRect();
         }
         if (g.gutterHovered &&
             g.mouse.x >= origin.x + 16.0f &&
-            g.mouse.x <= origin.x + g.gutterWidth - 62.0f &&
+            g.mouse.x <= origin.x + g.gutterWidth -
+                             (f.recordArm != nullptr ? 86.0f : 62.0f) &&
             g.mouse.y >= y &&
             g.mouse.y <= y + g.headerHeight + g.rowPadding * 2.0f &&
             ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
@@ -297,50 +342,79 @@ float drawTrackGutter(const GutterLayout& g, TimelineViewState& view,
         }
     }
 
-    // Mute/solo, drawn to PTXExtractor's TrackStateIndicator spec: 21x17,
-    // 3px radius, hairline border, amber for mute and yellow for solo.
+    // Record/mute/solo, drawn to PTXExtractor's TrackStateIndicator spec.
+    // Audio gets a circular record indicator in the 21x17 slot to the LEFT;
+    // M/S retain their original pixels. MIDI still has M/S only.
     // Drawn rather than composed from ImGui::Button so the active fill can
     // be the state colour instead of the theme's control gradient.
     {
         const ImVec2 msSize(21.0f, 17.0f);
         const float msGap = 3.0f;
         const float msY = y + g.rowPadding;
-        float msX = origin.x + g.gutterWidth - (msSize.x * 2.0f + msGap) - 12.0f;
-        struct Toggle { const char* label; bool on; ImVec4 active; };
-        const Toggle toggles[2] = {
-            {"M", *f.mute, pal.trackMuteActive},
-            {"S", *f.solo, pal.trackSoloActive},
+        const int toggleCount = f.recordArm != nullptr ? 3 : 2;
+        float msX = origin.x + g.gutterWidth -
+            (msSize.x * static_cast<float>(toggleCount) +
+             msGap * static_cast<float>(toggleCount - 1)) - 12.0f;
+        struct Toggle {
+            const char* label;
+            bool* flag;
+            ImVec4 active;
+            const char* tooltip;
         };
+        Toggle toggles[3];
+        int nextToggle = 0;
+        if (f.recordArm != nullptr) {
+            toggles[nextToggle++] =
+                Toggle{"R", f.recordArm, pal.danger, "Record arm"};
+        }
+        toggles[nextToggle++] =
+            Toggle{"M", f.mute, pal.trackMuteActive, "Mute (Shift+M)"};
+        toggles[nextToggle++] =
+            Toggle{"S", f.solo, pal.trackSoloActive, "Solo (Shift+S)"};
         ImGui::PushID(uid + 5000);
-        for (int b = 0; b < 2; ++b) {
+        for (int b = 0; b < toggleCount; ++b) {
             ImGui::PushID(b);
             ImGui::SetCursorScreenPos(ImVec2(msX, msY));
             const bool pressed = ImGui::InvisibleButton("##ms", msSize);
             const bool hovered = ImGui::IsItemHovered();
             if (pressed) {
-                if (b == 0) *f.mute = !*f.mute;
-                else        *f.solo = !*f.solo;
-                edit.notifyChanged();
+                if (b == 0 && f.recordArm != nullptr &&
+                    view.deferRecordArmRequests && f.trackId != nullptr) {
+                    view.requestRecordArmTrackId = *f.trackId;
+                } else {
+                    *toggles[b].flag = !*toggles[b].flag;
+                    edit.notifyChanged();
+                }
             }
             const Toggle& t = toggles[b];
             const ImVec2 bMin(msX, msY);
             const ImVec2 bMax(msX + msSize.x, msY + msSize.y);
-            ImU32 fill = t.on ? C(t.active)
-                              : (hovered ? C(pal.surfaceStrong)
-                                         : C(pal.trackControlInactive));
-            dl->AddRectFilled(bMin, bMax, fill, 3.0f);
-            dl->AddRect(bMin, bMax, t.on ? C(t.active) : C(pal.border), 3.0f);
-            // Dark text on the bright active fills; both amber and yellow
-            // are too light for the normal foreground to stay legible.
-            const ImU32 labelCol =
-                t.on ? IM_COL32(32, 30, 28, 255) : C(pal.textMuted);
-            const ImVec2 ts = ImGui::CalcTextSize(t.label);
-            dl->AddText(ImVec2(msX + (msSize.x - ts.x) * 0.5f,
-                               msY + (msSize.y - ts.y) * 0.5f),
-                        labelCol, t.label);
+            const bool on = *t.flag;
+            const bool isRecordArm = b == 0 && f.recordArm != nullptr;
+            if (isRecordArm) {
+                theme::drawRecordArmIndicator(
+                    dl, ImVec2((bMin.x + bMax.x) * 0.5f,
+                               (bMin.y + bMax.y) * 0.5f),
+                    6.5f, on, hovered);
+            } else {
+                const ImU32 fill = on ? C(t.active)
+                                      : (hovered ? C(pal.surfaceStrong)
+                                                 : C(pal.trackControlInactive));
+                dl->AddRectFilled(bMin, bMax, fill, 3.0f);
+                dl->AddRect(bMin, bMax,
+                            on ? C(t.active) : C(pal.border), 3.0f);
+                // Dark text on the bright active fills; both amber and yellow
+                // are too light for the normal foreground to stay legible.
+                const ImU32 labelCol =
+                    on ? IM_COL32(32, 30, 28, 255) : C(pal.textMuted);
+                theme::drawCenteredControlLabel(
+                    dl,
+                    theme::Rect{ImVec2(msX, msY),
+                                ImVec2(msX + msSize.x, msY + msSize.y)},
+                    labelCol, t.label);
+            }
             if (hovered) {
-                ImGui::SetTooltip("%s", b == 0 ? "Mute (Shift+M)"
-                                               : "Solo (Shift+S)");
+                ImGui::SetTooltip("%s", t.tooltip);
             }
             ImGui::PopID();
             msX += msSize.x + msGap;
@@ -352,7 +426,7 @@ float drawTrackGutter(const GutterLayout& g, TimelineViewState& view,
     // Option-click (Alt-click) resets to default: gain=0 dB, pan=center.
     ImGui::PushID(uid);
     float controlY = y + g.rowPadding + g.headerHeight + g.rowGap;
-    constexpr float controlX = 12.0f;
+    constexpr float controlX = kGutterContentX;
     constexpr float controlLabelW = 64.0f;
     const float sliderW = g.gutterWidth - controlX - 10.0f - controlLabelW - 6.0f;
     {
@@ -370,12 +444,15 @@ float drawTrackGutter(const GutterLayout& g, TimelineViewState& view,
             ImVec2(origin.x + controlX + controlLabelW, controlY));
         ImGui::PushItemWidth(sliderW);
         // The readout lives beside, not on, the grab so centre remains usable.
-        if (ImGui::SliderFloat("##gain", &gainDb, -60.0f, 6.0f, "")) {
-            *f.gain = std::pow(10.0f, gainDb / 20.0f);
-            edit.notifyChanged();
-        }
-        if (ImGui::IsItemClicked() && ImGui::GetIO().KeyAlt) {
-            *f.gain = 1.0;
+        const bool gainDragged =
+            ImGui::SliderFloat("##gain", &gainDb, -60.0f, 6.0f, "");
+        const bool gainReset =
+            ImGui::IsItemClicked(ImGuiMouseButton_Left) &&
+            ImGui::GetIO().KeyAlt;
+        if (gainReset) gainDb = 0.0f;
+        const double nextGain = std::pow(10.0f, gainDb / 20.0f);
+        if ((gainDragged || gainReset) && *f.gain != nextGain) {
+            *f.gain = nextGain;
             edit.notifyChanged();
         }
         ImGui::PopItemWidth();
@@ -393,12 +470,14 @@ float drawTrackGutter(const GutterLayout& g, TimelineViewState& view,
         ImGui::SetCursorScreenPos(
             ImVec2(origin.x + controlX + controlLabelW, controlY));
         ImGui::PushItemWidth(sliderW);
-        if (ImGui::SliderFloat("##pan", &panVal, -1.0f, 1.0f, "")) {
+        const bool panDragged =
+            ImGui::SliderFloat("##pan", &panVal, -1.0f, 1.0f, "");
+        const bool panReset =
+            ImGui::IsItemClicked(ImGuiMouseButton_Left) &&
+            ImGui::GetIO().KeyAlt;
+        if (panReset) panVal = 0.0f;
+        if ((panDragged || panReset) && *f.pan != panVal) {
             *f.pan = panVal;
-            edit.notifyChanged();
-        }
-        if (ImGui::IsItemClicked() && ImGui::GetIO().KeyAlt) {
-            *f.pan = 0.0;
             edit.notifyChanged();
         }
         ImGui::PopItemWidth();
@@ -524,7 +603,8 @@ void drawTimeline(const document::Edit& edit,
     // hold a name plus a full row of per-track controls without truncation.
     const float gutterWidth = 260.0f;
     const float totalWidth = avail.x;
-    // Reported outward so keyboard zoom can re-centre (see zoomAroundSample).
+    // Reported outward so every zoom path can preserve the playhead's lane X
+    // position (see zoomAroundSample).
     view.laneWidthPixels = std::max(0.0f, totalWidth - gutterWidth);
     const float totalHeight = avail.y;
     const auto& pal = theme::palette();
@@ -557,6 +637,7 @@ void drawTimeline(const document::Edit& edit,
     // We account for the cursor advance the marker lane already did.
     const auto& tracks = edit.tracks();
     const auto& midiTracks = edit.midiTracks();
+    const auto& buses = edit.buses();
     // The Edit answers the solo question for every track type at once, so the
     // header dimming below matches exactly what GraphBuilder silences.
     const bool anySoloed = edit.anySoloed();
@@ -568,7 +649,10 @@ void drawTimeline(const document::Edit& edit,
         static_cast<float>(tracks.size()) * trackHeight;
     const float midiRegionHeight =
         static_cast<float>(midiTracks.size()) * midiTrackHeight;
-    const float tracksRegionHeight = audioRegionHeight + midiRegionHeight;
+    const float busRegionHeight =
+        static_cast<float>(buses.size()) * trackHeight;
+    const float tracksRegionHeight =
+        audioRegionHeight + midiRegionHeight + busRegionHeight;
     char areaBtn[32];
     std::snprintf(areaBtn, sizeof(areaBtn), "##timeline_area_%p", &view);
     // The InvisibleButton covers the clip lane (right of the gutter) so it
@@ -652,6 +736,79 @@ void drawTimeline(const document::Edit& edit,
     });
     dl->PopClipRect();
 
+    // The track's colour band, with its disclosure arrow. Drawn per row by
+    // both the audio and MIDI loops so the two bands cannot drift apart.
+    //
+    // The arrow points right when the track is closed and down when it is
+    // open, the direction convention every file browser uses. Nothing is wired
+    // to the open state yet — this lands the affordance and the geometry now,
+    // so whatever it eventually reveals (takes, automation lanes) does not
+    // also have to renegotiate the header layout.
+    auto drawTrackBand = [&](float top, float height,
+                             const ImVec4& fallbackColor,
+                             const std::string& savedColor,
+                             const std::string& trackId, int uid) {
+        const float bandTop = top + 3.0f;
+        const float bandBottom = top + height - 3.0f;
+        if (bandBottom - bandTop < 8.0f) return;
+
+        const ImVec2 bandMin(origin.x + kBandX, bandTop);
+        const ImVec2 bandMax(origin.x + kBandX + kBandW, bandBottom);
+
+        char bandId[32];
+        std::snprintf(bandId, sizeof(bandId), "##trackBand_%d", uid);
+        ImGui::SetCursorScreenPos(bandMin);
+        ImGui::InvisibleButton(bandId, ImVec2(kBandW, bandBottom - bandTop),
+                               ImGuiButtonFlags_MouseButtonLeft |
+                                   ImGuiButtonFlags_MouseButtonRight);
+        const bool hovered = ImGui::IsItemHovered() || ImGui::IsItemActive();
+        const bool expanded = view.expandedTracks.count(trackId) != 0;
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+            if (expanded) {
+                view.expandedTracks.erase(trackId);
+            } else {
+                view.expandedTracks.insert(trackId);
+            }
+        }
+
+        char popupId[40];
+        std::snprintf(popupId, sizeof(popupId), "##trackColor_%d", uid);
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+            ImGui::OpenPopup(popupId);
+        }
+        if (hovered) {
+            ImGui::SetTooltip("Click to expand; right-click for track color");
+        }
+        std::string selectedColor;
+        if (drawTrackColorPopup(popupId, savedColor, selectedColor)) {
+            view.requestTrackColorId = trackId;
+            view.requestTrackColor = std::move(selectedColor);
+        }
+
+        const ImVec4 color = trackColorValue(savedColor, fallbackColor);
+        dl->AddRectFilled(bandMin, bandMax, C(color), 3.0f);
+        if (hovered) {
+            dl->AddRect(bandMin, bandMax, C(pal.text), 3.0f, 0, 1.5f);
+        }
+
+        // The arrow is punched in the darkest surface rather than the text
+        // colour: the band carries saturated identity colours, and a light
+        // glyph on those reads as a smudge.
+        const ImU32 arrowCol = C(pal.trackLaneSurface);
+        const ImVec2 c((bandMin.x + bandMax.x) * 0.5f,
+                       (bandMin.y + bandMax.y) * 0.5f);
+        constexpr float kArm = 4.0f;
+        if (expanded) {
+            dl->AddTriangleFilled(ImVec2(c.x - kArm, c.y - kArm * 0.6f),
+                                  ImVec2(c.x + kArm, c.y - kArm * 0.6f),
+                                  ImVec2(c.x, c.y + kArm * 0.8f), arrowCol);
+        } else {
+            dl->AddTriangleFilled(ImVec2(c.x - kArm * 0.6f, c.y - kArm),
+                                  ImVec2(c.x - kArm * 0.6f, c.y + kArm),
+                                  ImVec2(c.x + kArm * 0.8f, c.y), arrowCol);
+        }
+    };
+
     // The same divisions carried down into a lane. Called per row, after the
     // lane background and before its clips, so clips sit on the grid rather
     // than under it.
@@ -687,6 +844,13 @@ void drawTimeline(const document::Edit& edit,
         ImGui::IsItemHovered() || ImGui::IsItemActive();
     const bool addTrackRequested =
         ImGui::IsItemClicked(ImGuiMouseButton_Left);
+    bool addTrackMenuRequested = false;
+    bool addBusRequested = false;
+    if (ImGui::BeginPopupContextItem("##addChannelMenu")) {
+        if (ImGui::MenuItem("Add Audio Track")) addTrackMenuRequested = true;
+        if (ImGui::MenuItem("Add Bus")) addBusRequested = true;
+        ImGui::EndPopup();
+    }
     if (addTrackHovered) {
         ImGui::SetTooltip("Add track");
     }
@@ -715,6 +879,7 @@ void drawTimeline(const document::Edit& edit,
     // Where the MIDI band starts: immediately below the audio rows, so the two
     // read as one contiguous stack of tracks rather than two separate lists.
     const float midiTop = tracksTop + audioRegionHeight;
+    const float busTop = midiTop + midiRegionHeight;
 
     // Row indices run across both bands — audio 0..n-1, then MIDI — the same
     // numbering selectedTrackIndex already uses, so a selection and a track
@@ -729,6 +894,12 @@ void drawTimeline(const document::Edit& edit,
             const int i = static_cast<int>((y - midiTop) / midiTrackHeight);
             if (i >= 0 && i < static_cast<int>(midiTracks.size())) {
                 return static_cast<int>(tracks.size()) + i;
+            }
+        }
+        if (y >= busTop && y < busTop + busRegionHeight && trackHeight > 0.0f) {
+            const int i = static_cast<int>((y - busTop) / trackHeight);
+            if (i >= 0 && i < static_cast<int>(buses.size())) {
+                return static_cast<int>(tracks.size() + midiTracks.size()) + i;
             }
         }
         return -1;
@@ -746,6 +917,12 @@ void drawTimeline(const document::Edit& edit,
         if (mi < static_cast<int>(midiTracks.size())) {
             outY = midiTop + static_cast<float>(mi) * midiTrackHeight;
             outH = midiTrackHeight;
+            return true;
+        }
+        const int bi = mi - static_cast<int>(midiTracks.size());
+        if (bi >= 0 && bi < static_cast<int>(buses.size())) {
+            outY = busTop + static_cast<float>(bi) * trackHeight;
+            outH = trackHeight;
             return true;
         }
         return false;
@@ -801,33 +978,26 @@ void drawTimeline(const document::Edit& edit,
         dl->AddLine(ImVec2(origin.x, y + trackHeight),
                     ImVec2(origin.x + totalWidth, y + trackHeight),
                     C(pal.border));
-        // Selection gets a dedicated accent edge. The smaller chip remains a
-        // stable per-track identity when selection moves elsewhere.
-        if (selected) {
-            dl->AddRectFilled(ImVec2(origin.x, y),
-                              ImVec2(origin.x + 4, y + trackHeight),
-                              C(pal.accent));
-        }
         const ImVec4 trackColors[] = {
             pal.markerCue, pal.markerSection, pal.markerLoop,
             pal.markerPunch, pal.markerCd, pal.markerCustom
         };
         const ImVec4& trackColor =
             trackColors[ti % (sizeof(trackColors) / sizeof(trackColors[0]))];
-        dl->AddRectFilled(
-            ImVec2(origin.x + 10.0f, y + rowPadding),
-            ImVec2(origin.x + 14.0f, y + rowPadding + headerHeight),
-            C(trackColor), 2.0f);
+        drawTrackBand(y, trackHeight, trackColor, track.color, track.id,
+                      static_cast<int>(ti));
 
         {
             auto& mutableTrack = const_cast<document::Track&>(track);
             drawTrackGutter(gutter, view, const_cast<document::Edit&>(edit), y,
                             static_cast<int>(ti),
-                            TrackGutterFields{&mutableTrack.name,
+                            TrackGutterFields{&mutableTrack.id,
+                                              &mutableTrack.name,
                                               &mutableTrack.gain,
                                               &mutableTrack.pan,
                                               &mutableTrack.mute,
-                                              &mutableTrack.solo},
+                                              &mutableTrack.solo,
+                                              &mutableTrack.recordArm},
                             selected);
         }
 
@@ -839,6 +1009,31 @@ void drawTimeline(const document::Edit& edit,
                 ImVec2(origin.x, y),
                 ImVec2(origin.x + gutterWidth, y + trackHeight),
                 IM_COL32(20, 19, 18, 110));
+        }
+
+
+        if (view.recordingActive && track.recordArm) {
+            const int64_t liveEnd = std::max(
+                view.recordingStartSample, view.recordingEndSample);
+            const float x1 = static_cast<float>(
+                origin.x + gutterWidth +
+                (view.recordingStartSample - view.scrollSamples) /
+                    view.samplesPerPixel);
+            const float x2 = static_cast<float>(
+                origin.x + gutterWidth +
+                (liveEnd - view.scrollSamples) / view.samplesPerPixel);
+            const float laneLeft = origin.x + gutterWidth;
+            const float laneRight = origin.x + totalWidth;
+            if (x2 >= laneLeft && x1 <= laneRight) {
+                const ImVec2 previewMin(std::max(x1, laneLeft), y + 6.0f);
+                const ImVec2 previewMax(
+                    std::min(std::max(x2, x1 + 2.0f), laneRight),
+                    y + trackHeight - 6.0f);
+                dl->AddRectFilled(previewMin, previewMax,
+                                  IM_COL32(196, 48, 54, 70), 2.0f);
+                dl->AddRect(previewMin, previewMax,
+                            IM_COL32(230, 73, 79, 220), 2.0f, 0, 1.5f);
+            }
         }
 
         // Click the gutter to select this track.
@@ -993,26 +1188,23 @@ void drawTimeline(const document::Edit& edit,
                 IM_COL32(static_cast<int>(pal.accent.x * 255),
                          static_cast<int>(pal.accent.y * 255),
                          static_cast<int>(pal.accent.z * 255), 18));
-            dl->AddRectFilled(ImVec2(origin.x, y),
-                              ImVec2(origin.x + 4, y + midiTrackHeight),
-                              C(pal.accent));
         }
         drawLaneGrid(y, midiTrackHeight);
         dl->AddLine(ImVec2(origin.x, y + midiTrackHeight),
                     ImVec2(origin.x + totalWidth, y + midiTrackHeight),
                     C(pal.border));
-        // The identity chip uses the MIDI clip colour, so the band is
-        // recognisable as MIDI at a glance without reading any labels.
-        dl->AddRectFilled(ImVec2(origin.x + 10.0f, y + rowPadding),
-                          ImVec2(origin.x + 14.0f, y + rowPadding + headerHeight),
-                          C(pal.clipMidiBorder), 2.0f);
+        // The band takes the MIDI clip colour, so the row is recognisable as
+        // MIDI at a glance without reading any labels.
+        drawTrackBand(y, midiTrackHeight, pal.clipMidiBorder, track.color,
+                      track.id, uid);
 
         auto& mutableTrack = const_cast<document::MidiTrack&>(track);
         const float instrumentY = drawTrackGutter(
             gutter, view, const_cast<document::Edit&>(edit), y, uid,
-            TrackGutterFields{&mutableTrack.name, &mutableTrack.gain,
+            TrackGutterFields{&mutableTrack.id, &mutableTrack.name,
+                              &mutableTrack.gain,
                               &mutableTrack.pan, &mutableTrack.mute,
-                              &mutableTrack.solo},
+                              &mutableTrack.solo, nullptr},
             selected);
 
         // Instrument row. The whole strip is one button: clicking it opens the
@@ -1171,24 +1363,63 @@ void drawTimeline(const document::Edit& edit,
             }
         }
     }
+
+    // ─── Bus rows ─────────────────────────────────────────────────────────
+    // Buses are channels, not clip lanes. They share the normal strip controls
+    // and selection model but deliberately draw no clip interaction surface.
+    for (size_t bi = 0; bi < buses.size(); ++bi) {
+        const auto& bus = buses[bi];
+        const float y = busTop + static_cast<float>(bi) * trackHeight;
+        if (y > origin.y + totalHeight) break;
+        const int uid = static_cast<int>(tracks.size() + midiTracks.size() + bi);
+        const bool selected = view.selectedTrackIndex == uid;
+        const ImVec4 headerBg = selected ? pal.trackSelected : pal.trackHeaderSurface;
+        const ImVec4 laneBg = uid % 2 == 0 ? pal.trackLaneSurface : pal.trackLaneAlt;
+        dl->AddRectFilled(ImVec2(origin.x, y),
+                          ImVec2(origin.x + gutterWidth, y + trackHeight),
+                          C(headerBg));
+        dl->AddRectFilled(ImVec2(origin.x + gutterWidth, y),
+                          ImVec2(origin.x + totalWidth, y + trackHeight),
+                          C(laneBg));
+        if (selected) {
+            dl->AddRectFilled(ImVec2(origin.x + gutterWidth, y),
+                              ImVec2(origin.x + totalWidth, y + trackHeight),
+                              IM_COL32(static_cast<int>(pal.accent.x * 255),
+                                       static_cast<int>(pal.accent.y * 255),
+                                       static_cast<int>(pal.accent.z * 255), 18));
+        }
+        drawLaneGrid(y, trackHeight);
+        dl->AddLine(ImVec2(origin.x, y + trackHeight),
+                    ImVec2(origin.x + totalWidth, y + trackHeight), C(pal.border));
+        drawTrackBand(y, trackHeight,
+                      bus.isMain ? pal.accentStrong : pal.success,
+                      bus.color, bus.id, uid);
+        auto& mutableBus = const_cast<document::BusTrack&>(bus);
+        drawTrackGutter(gutter, view, const_cast<document::Edit&>(edit), y, uid,
+                        TrackGutterFields{&mutableBus.id, &mutableBus.name,
+                                          &mutableBus.gain, &mutableBus.pan,
+                                          &mutableBus.mute, &mutableBus.solo,
+                                          nullptr}, selected);
+        const char* kind = bus.isMain ? "MAIN BUS" : "BUS";
+        dl->AddText(ImVec2(origin.x + gutterWidth + 8.0f, y + 8.0f),
+                    C(pal.textSubtle), kind);
+        if (!bus.mute && !bus.solo && anySoloed) {
+            dl->AddRectFilled(ImVec2(origin.x, y),
+                              ImVec2(origin.x + gutterWidth, y + trackHeight),
+                              IM_COL32(20, 19, 18, 110));
+        }
+        if (gutterHovered && mouse.y >= y && mouse.y <= y + trackHeight &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            view.selectedTrackIndex = uid;
+        }
+    }
     ImGui::PopStyleVar();
 
     // Picture is an opt-in: a session that never imported video has no lane,
     // so the timeline shows only what the project actually contains.
     const bool hasVideo = !edit.videoTracks().empty();
     const float videoLaneY = tracksTop + tracksRegionHeight;
-    // The spare canvas is deliberately the fastest way to create another
-    // track: the GLFW drop callback imports each WAV into a fresh lane.
     const float videoLaneHeight = hasVideo ? 40.0f : 0.0f;
-    const float canvasTop = videoLaneY + videoLaneHeight;
-    const float canvasHeight = origin.y + totalHeight - canvasTop;
-    if (canvasHeight >= 72.0f) {
-        const char* canvasLabel = "Drop WAV files here to create tracks";
-        const ImVec2 labelSize = ImGui::CalcTextSize(canvasLabel);
-        dl->AddText(ImVec2(origin.x + (totalWidth - labelSize.x) * 0.5f,
-                           canvasTop + (canvasHeight - labelSize.y) * 0.5f),
-                    C(pal.textSubtle), canvasLabel);
-    }
     const bool canvasHovered =
         windowHeldOrHovered &&
         mouse.x >= origin.x + gutterWidth &&
@@ -1243,22 +1474,14 @@ void drawTimeline(const document::Edit& edit,
         ImGui::EndPopup();
     }
 
-    // Snap helper: if snapToMarkers is on, snap a sample position to the
-    // nearest marker within a threshold (8px worth of samples).
+    // One snap policy serves seeks, clip moves and range edges. The active
+    // ruler format defines the valid divisions; turning Snap off preserves
+    // the raw sample position under the pointer.
     auto snapPosition = [&](int64_t pos) -> int64_t {
-        if (!view.snapToMarkers) return pos;
-        int64_t threshold = static_cast<int64_t>(8.0 * view.samplesPerPixel);
-        int64_t best = pos;
-        int64_t bestDist = threshold;
-        for (const auto& mt : edit.markerTracks()) {
-            if (!mt.visible) continue;
-            for (const auto& m : mt.markers) {
-                if (m.posMode != document::MarkerPosMode::Sample) continue;
-                int64_t d = std::abs(m.position - pos);
-                if (d < bestDist) { bestDist = d; best = m.position; }
-            }
-        }
-        return best;
+        pos = std::max<int64_t>(0, pos);
+        return view.snapEnabled
+            ? snapSampleToFormat(pos, view.tcMode, view.samplesPerPixel, sr)
+            : pos;
     };
 
     // Handle drag delta for the active drag (committed on release).
@@ -1359,18 +1582,10 @@ void drawTimeline(const document::Edit& edit,
             view.scrollSamples + std::max(0.0, localX) * view.samplesPerPixel);
     };
 
-    // Selection edges land on the current format's own divisions — whole
-    // frames in timecode, whole beat subdivisions in bars|beats — so a range
-    // is always a span the format can name, and the same one the grid draws.
-    const int64_t snapStep =
-        snapStepFor(view.tcMode, view.samplesPerPixel, sr);
-    auto snapToFormat = [&](int64_t sample) -> int64_t {
-        if (snapStep <= 1) return sample;
-        const int64_t half = snapStep / 2;
-        return ((sample + half) / snapStep) * snapStep;
-    };
+    // Selection edges use the same optional format snap as every other
+    // timeline edit rather than silently snapping while the toggle is off.
     auto selectionSampleAtMouseX = [&]() -> int64_t {
-        return snapToFormat(sampleAtMouseX());
+        return snapPosition(sampleAtMouseX());
     };
 
     // Ruler: the press seeks, and dragging from it selects the range across
@@ -1379,7 +1594,7 @@ void drawTimeline(const document::Edit& edit,
     // can mark a range, not both.)
     if (rulerHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         seekToMouseX();
-        view.selectionPressSample = sampleAtMouseX();
+        view.selectionPressSample = selectionSampleAtMouseX();
         const int64_t s = selectionSampleAtMouseX();
         view.selectionStart = s;
         view.selectionEnd = s;
@@ -1415,7 +1630,7 @@ void drawTimeline(const document::Edit& edit,
             // the press owns it: a range dragged in one lane stays in that
             // lane no matter how far the pointer wanders vertically.
             const int row = rowAtY(mouse.y);
-            view.selectionPressSample = sampleAtMouseX();
+            view.selectionPressSample = selectionSampleAtMouseX();
             const int64_t s = selectionSampleAtMouseX();
             view.selectionStart = s;
             view.selectionEnd = s;
@@ -1440,8 +1655,8 @@ void drawTimeline(const document::Edit& edit,
         // If the selection is tiny (just a click, not a drag), treat as seek + clear selection.
         if (std::abs(view.selectionEnd - view.selectionStart) <
             static_cast<int64_t>(4 * view.samplesPerPixel)) {
-            // Not a drag after all: the cursor goes where the click landed,
-            // not to the division the selection edge would have snapped to.
+            // Not a drag after all: the cursor uses the same snap mode as the
+            // press, so Snap never changes meaning between click and drag.
             transport.seek(view.selectionPressSample);
             view.hasSelection = false;
         } else if (view.hasSelection) {
@@ -1555,10 +1770,22 @@ void drawTimeline(const document::Edit& edit,
 
     // Adding reallocates the track vector, so it happens only after every
     // reference used for drawing and interaction has gone out of scope.
-    if (addTrackRequested) {
+    if (addTrackRequested || addTrackMenuRequested) {
         undo.execute(std::make_unique<editing::AddTrackCommand>("Track"));
         view.selectedTrackIndex =
             static_cast<int>(edit.tracks().size()) - 1;
+    }
+    if (addBusRequested) {
+        undo.execute(std::make_unique<editing::AddBusCommand>("Bus"));
+        view.selectedTrackIndex = static_cast<int>(
+            edit.tracks().size() + edit.midiTracks().size() +
+            edit.buses().size() - 2);
+    }
+    if (!view.requestTrackColorId.empty()) {
+        undo.execute(std::make_unique<editing::SetTrackColorCommand>(
+            view.requestTrackColorId, view.requestTrackColor));
+        view.requestTrackColorId.clear();
+        view.requestTrackColor.clear();
     }
 }
 
@@ -1617,6 +1844,13 @@ float drawMarkerLane(const document::Edit& edit,
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const float laneHeight = 28.0f;
     const auto& pal = theme::palette();
+    auto snapPosition = [&](int64_t sample) -> int64_t {
+        sample = std::max<int64_t>(0, sample);
+        return view.snapEnabled
+            ? snapSampleToFormat(sample, view.tcMode, samplesPerPixel,
+                                 static_cast<double>(edit.sampleRate()))
+            : sample;
+    };
 
     // Background — distinct from the ruler above and tracks below.
     dl->AddRectFilled(origin, ImVec2(origin.x + totalWidth, origin.y + laneHeight),
@@ -1673,7 +1907,7 @@ float drawMarkerLane(const document::Edit& edit,
         if (!edit.markerTracks().empty()) {
             Marker marker;
             marker.name = "Marker";
-            marker.position = transport.position();
+            marker.position = snapPosition(transport.position());
             undo.execute(std::make_unique<editing::AddMarkerCommand>(
                 edit.markerTracks().front().id, marker));
         }
@@ -1728,7 +1962,8 @@ float drawMarkerLane(const document::Edit& edit,
             view.selectedClipId == m->id;
         if (isBeingDragged) {
             double dxPx = mouse.x - view.markerDragStartX;
-            renderPos += static_cast<int64_t>(dxPx * samplesPerPixel);
+            renderPos = snapPosition(
+                renderPos + static_cast<int64_t>(dxPx * samplesPerPixel));
         }
         double mx = origin.x + gutterWidth +
             (renderPos - scrollSamples) / samplesPerPixel;
@@ -1803,8 +2038,9 @@ float drawMarkerLane(const document::Edit& edit,
                 for (const auto& m : mt.markers) {
                     if (m.id == view.selectedClipId) {
                         double localX = mouse.x - (origin.x + gutterWidth);
-                        int64_t newPos = static_cast<int64_t>(
-                            std::max(0.0, scrollSamples + localX * samplesPerPixel));
+                        int64_t newPos = snapPosition(static_cast<int64_t>(
+                            std::max(0.0, scrollSamples +
+                                              localX * samplesPerPixel)));
                         undo.execute(std::make_unique<editing::MoveMarkerCommand>(
                             mt.id, m.id, newPos, m.length));
                         break;
@@ -1829,8 +2065,8 @@ float drawMarkerLane(const document::Edit& edit,
         if (!hitMarker) {
             const auto& target = edit.markerTracks().front();
             double localX = mouse.x - (origin.x + gutterWidth);
-            int64_t pos = static_cast<int64_t>(
-                std::max(0.0, scrollSamples + localX * samplesPerPixel));
+            int64_t pos = snapPosition(static_cast<int64_t>(
+                std::max(0.0, scrollSamples + localX * samplesPerPixel)));
             Marker marker;
             marker.name = "Marker";
             marker.position = pos;
@@ -1842,8 +2078,8 @@ float drawMarkerLane(const document::Edit& edit,
     // region (default 1s), or clear loop.
     if (laneHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
         double localX = mouse.x - (origin.x + gutterWidth);
-        int64_t clickPos = static_cast<int64_t>(
-            std::max(0.0, scrollSamples + localX * samplesPerPixel));
+        int64_t clickPos = snapPosition(static_cast<int64_t>(
+            std::max(0.0, scrollSamples + localX * samplesPerPixel)));
         ImGui::OpenPopup("##marker_ctx");
         // Stash the click position for the menu handlers.
         view.dragClipOriginalStart = clickPos; // reuse as temp scratch
@@ -1915,6 +2151,13 @@ float drawVideoLane(const document::Edit& edit,
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const float laneHeight = 40.0f;
     const auto& pal = theme::palette();
+    auto snapPosition = [&](int64_t sample) -> int64_t {
+        sample = std::max<int64_t>(0, sample);
+        return view.snapEnabled
+            ? snapSampleToFormat(sample, view.tcMode, samplesPerPixel,
+                                 static_cast<double>(edit.sampleRate()))
+            : sample;
+    };
 
     // No picture, no lane. The video panel owns onboarding, so an empty strip
     // here would only be a labelled hole in the arrangement.
@@ -1991,8 +2234,8 @@ float drawVideoLane(const document::Edit& edit,
         if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
             // Find the selected video clip and move it.
             double localX = mouse.x - (origin.x + gutterWidth);
-            int64_t newPos = static_cast<int64_t>(
-                std::max(0.0, scrollSamples + localX * samplesPerPixel));
+            int64_t newPos = snapPosition(static_cast<int64_t>(
+                std::max(0.0, scrollSamples + localX * samplesPerPixel)));
             for (auto& vt : const_cast<std::vector<document::VideoTrack>&>(edit.videoTracks())) {
                 for (auto& c : vt.clips) {
                     if (c.id == view.selectedClipId) {
@@ -2027,8 +2270,8 @@ float drawVideoLane(const document::Edit& edit,
         }
         if (!hitClip) {
             double localX = mouse.x - (origin.x + gutterWidth);
-            int64_t seekTo = static_cast<int64_t>(
-                std::max(0.0, scrollSamples + localX * samplesPerPixel));
+            int64_t seekTo = snapPosition(static_cast<int64_t>(
+                std::max(0.0, scrollSamples + localX * samplesPerPixel)));
             transport.seek(seekTo);
         }
     }

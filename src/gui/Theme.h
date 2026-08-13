@@ -30,6 +30,7 @@ struct Palette {
     ImVec4 accentStrong;
     ImVec4 accentDeep;
     ImVec4 danger;
+    ImVec4 recordArmed;
     ImVec4 success;
     ImVec4 warning;
 
@@ -139,6 +140,7 @@ enum class PanelElevation {
 enum class ButtonVariant {
     Normal,
     Primary,
+    Danger,
 };
 
 // Transport glyphs are geometry rather than a font dependency, so the app can
@@ -161,6 +163,16 @@ bool gradientButton(const char* label, ImVec2 size = ImVec2(0, 0),
 bool iconButton(const char* id, TransportIcon icon, const char* tooltip,
                 ImVec2 size, ButtonVariant variant = ButtonVariant::Normal);
 void panelHeader(const char* label);
+// Shared record-arm glyph: neutral at rest and semantic danger red when armed.
+// Callers keep their own hit targets so compact timeline and mixer layouts can
+// share the same visible control without shifting mute or solo.
+void drawRecordArmIndicator(ImDrawList* drawList, ImVec2 center, float radius,
+                            bool armed, bool hovered);
+// Centre short control labels by their visible glyph bounds rather than the
+// font's advance box. Wide glyphs such as M otherwise look shifted even when
+// their mathematical text box is centred.
+void drawCenteredControlLabel(ImDrawList* drawList, const Rect& rect,
+                              ImU32 color, const char* label);
 
 // Pan as a mixer reads it: "C" dead centre, "L50" / "R100" either side. The
 // underlying value stays -1..+1 — this is display vocabulary, shared so the

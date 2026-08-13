@@ -3,6 +3,7 @@
 
 #include "document/Types.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -24,7 +25,12 @@ namespace dave::document {
 // touches it — the engine reads a derived CompiledGraph instead.
 class Edit {
 public:
-    Edit() = default;
+    struct RoutingValidation {
+        bool ok = true;
+        std::string message;
+    };
+
+    Edit();
 
     // --- Assets -----------------------------------------------------------
     // Import (or re-import) a file as an audio asset. Computes the content
@@ -49,6 +55,10 @@ public:
     // Add a clip to a track. Assigns the clip a stable id and returns it.
     // Returns empty string if the track doesn't exist.
     std::string addClip(const std::string& trackId, AudioClip clip);
+    // Replay/load helper: inserts an already-identified clip and notifies
+    // once. Commands use it on redo so graph caches never observe a temporary
+    // minted id.
+    bool restoreClip_(const std::string& trackId, AudioClip clip);
     AudioClip* clip(const std::string& trackId, const std::string& clipId);
     bool removeClip(const std::string& trackId, const std::string& clipId);
 
@@ -67,6 +77,40 @@ public:
     MidiTrack* midiTrack(const std::string& id);
     const MidiTrack* midiTrack(const std::string& id) const;
     bool removeMidiTrack(const std::string& id);
+
+    // --- Routing and buses -------------------------------------------------
+    const std::vector<BusTrack>& buses() const { return buses_; }
+    std::vector<BusTrack>& busesMut() { return buses_; }
+    BusTrack* bus(const std::string& id);
+    const BusTrack* bus(const std::string& id) const;
+    const BusTrack* mainBus() const { return bus(kMainBusId); }
+    std::string addBus(const std::string& name);
+    bool restoreBus_(BusTrack bus, size_t index);
+    bool removeBus(const std::string& id);
+
+    // A referenced software destination cannot be removed. Main is always
+    // referenced conceptually and is also protected explicitly.
+    bool routeReferences(RouteTarget::Kind kind, const std::string& id) const;
+
+    // Validate the complete immutable topology. Hardware availability is not
+    // part of document validity; only the stored span shape is checked.
+    RoutingValidation validateRouting() const;
+    RoutingValidation validateMainOutput(const std::string& ownerId,
+                                         const RouteTarget& target) const;
+    RoutingValidation validateSendTarget(const std::string& ownerId,
+                                         const RouteTarget& target) const;
+
+    bool setMainOutput(const std::string& ownerId, RouteTarget target);
+    bool setTrackHardwareInput(const std::string& trackId,
+                               HardwareChannelSpan span);
+    bool setInputMonitor(const std::string& trackId, bool enabled);
+    // Applies to audio tracks, MIDI tracks, and buses. Empty restores the
+    // type-specific default; malformed colors are refused.
+    bool setTrackColor(const std::string& ownerId, std::string color);
+    std::string addSend(const std::string& ownerId, AuxSend send);
+    bool restoreSend_(const std::string& ownerId, AuxSend send, size_t index);
+    bool updateSend(const std::string& ownerId, const AuxSend& send);
+    bool removeSend(const std::string& ownerId, const std::string& sendId);
 
     // Add a MIDI clip to a track; returns the clip id (empty if track missing).
     std::string addMidiClip(const std::string& trackId, MidiClip clip);
@@ -160,6 +204,9 @@ public:
     void loadVideoTrack_(VideoTrack vt) { videoTracks_.push_back(std::move(vt)); }
     void clearMidiTracks_() { midiTracks_.clear(); }
     void loadMidiTrack_(MidiTrack mt) { midiTracks_.push_back(std::move(mt)); }
+    void clearBuses_() { buses_.clear(); }
+    void loadBus_(BusTrack bus) { buses_.push_back(std::move(bus)); }
+    void ensureMainBus_();
     std::unordered_map<AssetId, AudioAsset>& assets() { return assets_; }
 
     // --- Change notification ----------------------------------------------
@@ -174,6 +221,7 @@ private:
 
     std::vector<Track> tracks_;
     std::vector<MidiTrack> midiTracks_;
+    std::vector<BusTrack> buses_;
     std::vector<MarkerTrack> markerTracks_;
     std::vector<VideoTrack> videoTracks_;
     std::unordered_map<AssetId, AudioAsset> assets_;

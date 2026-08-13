@@ -4,12 +4,14 @@
 #include "document/Edit.h"
 #include "editing/Command.h"
 #include "engine/transport/Transport.h"
+#include "gui/RoutingViewModel.h"
 
 #include <imgui.h>
 
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <unordered_set>
 #include <unordered_map>
 #include <vector>
 
@@ -71,6 +73,11 @@ struct TimelineViewState {
     double scrollSamples = 0.0;      // leftmost visible sample
     int selectedTrackIndex = -1;
     std::string selectedClipId;
+    // UI-only recording preview. The document does not receive a clip until
+    // the WAV is closed and hashed; armed lanes still show the growing take.
+    bool recordingActive = false;
+    int64_t recordingStartSample = 0;
+    int64_t recordingEndSample = 0;
     // Transient drag state (held only while a drag is active).
     int64_t dragClipOriginalStart = 0;
     // Where a dragged clip is currently being previewed. The document keeps
@@ -109,6 +116,11 @@ struct TimelineViewState {
     PluginPicker requestPicker = PluginPicker::None;
     std::string requestPickerTrackId;
     std::string requestPluginEditorSlotId;       // open a plugin's editor
+    std::string requestTrackColorId;
+    std::string requestTrackColor;               // empty restores default
+    bool deferRecordArmRequests = false;
+    std::string requestRecordArmTrackId;
+    RoutingViewModel routing;
 
     // Marker drag: the screen-X where the drag started, so we can show the
     // marker moving live (offset from dragClipOriginalStart) before commit.
@@ -120,8 +132,10 @@ struct TimelineViewState {
     // next one's delta.
     float dragStartMouseX = 0.0f;
     float dragStartMouseY = 0.0f;
-    // Snap-to-marker: when true, clip drags + seeks snap to nearby markers.
-    bool snapToMarkers = false;
+    // When enabled, timeline edits snap to divisions expressed by the active
+    // ruler format: frames for SMPTE/feet+frames, musical subdivisions for
+    // bars|beats, round time values for min:sec, or round sample counts.
+    bool snapEnabled = false;
     // Selection region (click-drag on empty timeline to create).
     bool hasSelection = false;
     int64_t selectionStart = 0;
@@ -137,6 +151,10 @@ struct TimelineViewState {
     // turns out not to be a drag seeks here: the cursor goes where you
     // clicked, while a selection edge goes to the nearest division.
     int64_t selectionPressSample = 0;
+    // Track ids whose disclosure arrow points down. Nothing reads this yet —
+    // the arrow is the affordance, landed ahead of whatever it will reveal
+    // (takes, automation lanes), so the header geometry settles first.
+    std::unordered_set<std::string> expandedTracks;
     // Inline rename state.
     bool isRenaming = false;
     int renameTrackIndex = -1;
@@ -152,11 +170,10 @@ struct TimelineViewState {
     char positionInput[64] = {};
 };
 
-// Change zoom while keeping `anchorSample` in the middle of the visible lane.
-// Zooming without an anchor pins the left edge, which walks the playhead off
-// the screen after two or three steps — the position you are zooming in on is
-// exactly the one you lose. Clamped to the zoom range, and never scrolls past
-// the start of the timeline.
+// Change zoom while preserving `anchorSample` at its current screen X when it
+// is visible. An off-screen anchor is centred as a recovery affordance. The
+// zoom is clamped to the supported range and scroll never passes sample zero,
+// so the left boundary is the one case where the anchor may have to move.
 void zoomAroundSample(TimelineViewState& view, double newSamplesPerPixel,
                       int64_t anchorSample);
 
@@ -182,14 +199,21 @@ GridStep gridStepFor(TimecodeMode mode, double samplesPerPixel,
                      double sr = 48000.0, double fps = 24.0,
                      double bpm = 120.0);
 
-// The increment a dragged selection lands on, in samples — the finest
-// division of the current format that is still wide enough to aim at. In
-// timecode that is whole frames, in bars|beats whole beat subdivisions, so a
-// selection boundary is always a position the format can name. Zooming out
-// steps it up through the same units rather than abandoning them.
+// The increment timeline edits land on while Snap is enabled, in samples —
+// the finest division of the current format that is still wide enough to aim
+// at. In timecode that is whole frames, in bars|beats whole beat subdivisions.
+// Zooming out steps it up through the same units rather than abandoning them.
 int64_t snapStepFor(TimecodeMode mode, double samplesPerPixel,
                     double sr = 48000.0, double fps = 24.0,
                     double bpm = 120.0);
+
+// Round a non-negative timeline position to the nearest current-format snap
+// division. Kept separate from the widget so every timeline lane can use the
+// same arithmetic and headless tests can cover exact boundary behavior.
+int64_t snapSampleToFormat(int64_t sample, TimecodeMode mode,
+                           double samplesPerPixel,
+                           double sr = 48000.0, double fps = 24.0,
+                           double bpm = 120.0);
 
 // Draw the timeline widget. Caller passes everything in; the widget holds no
 // state itself (immediate-mode). Interactions fire commands on the UndoStack

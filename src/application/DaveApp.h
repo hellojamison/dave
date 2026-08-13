@@ -1,16 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "application/AudioPreferences.h"
 #include "document/Edit.h"
 #include "editing/Command.h"
 #include "engine/GraphBuilder.h"
 #include "engine/midi/SmfReader.h"
 #include "engine/plugins/PluginEditor.h"
 #include "engine/plugins/PluginHost.h"
+#include "engine/record/DiskWriter.h"
+#include "engine/record/RecordController.h"
 #include "engine/transport/Transport.h"
 #include "engine/video/AsyncVideoDecoder.h"
 #include "engine/video/VideoDecoder.h"
 #include "gui/ImGuiLayer.h"
+#include "gui/IoPanel.h"
 #include "gui/Mixer.h"
 #include "gui/Timeline.h"
 #include "platform/AudioEngine.h"
@@ -19,6 +23,7 @@
 #include <imgui.h>  // ImDrawList, ImVec2 for drawVideoThumbnails
 
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -58,6 +63,11 @@ public:
 private:
     void onEditChanged();           // re-derive + recompile + publish
     void applySessionSampleRate();  // reopen the device at the session rate
+    void refreshAudioDevices();
+    void syncIoPanelState();
+    void serviceIoPanelRequests();
+    bool applyAudioPreferences(const AudioPreferences& preferences,
+                               bool saveOnSuccess);
     // Loop transport. The range comes from the timeline selection if there is
     // one, otherwise from the first active Loop marker.
     bool loopRange(int64_t& start, int64_t& end) const;
@@ -77,8 +87,17 @@ private:
     // Targets of the M / S shortcuts; null when nothing is selected.
     document::Track* selectedTrack();
     document::MidiTrack* selectedMidiTrack();
+    document::BusTrack* selectedBus();
     void toggleSelectedTrackMute();
     void toggleSelectedTrackSolo();
+    void toggleSelectedTrackArm();
+    void toggleTrackArm(const std::string& trackId);
+    bool startRecording();
+    void stopRecording();
+    void toggleRecording();
+    bool recordingActive() const { return recordingSession_ != nullptr; }
+    void showStatus(std::string message, bool error = false);
+    bool requestClose();
     bool loadWavIntoNewTrack(const std::string& path);
     void drawUI();
     void drawPluginsPanel();        // legacy wrapper (unused — see drawPluginsPanelContent)
@@ -92,6 +111,22 @@ private:
     platform::Window window_{1280, 800, "Dave"};
     gui::ImGuiLayer imgui_;
     platform::AudioEngine audio_;
+    AudioPreferencesStore audioPreferencesStore_;
+    AudioPreferences audioPreferences_;
+    platform::DeviceLists audioDevices_;
+    gui::IoPanelState ioPanel_;
+
+    struct RecordingSession {
+        engine::DiskWriter writer;
+        engine::RecordController controller;
+        int64_t takeStartSample = 0;
+        int latencyOffsetSamples = 0;
+        std::vector<std::string> armedTrackIds;
+    };
+    std::unique_ptr<RecordingSession> recordingSession_;
+    std::string statusMessage_;
+    bool statusIsError_ = false;
+    double statusUntil_ = 0.0;
 
     document::Edit edit_;
     editing::UndoStack undo_{edit_};
@@ -101,10 +136,15 @@ private:
     gui::PeakCache peaks_;
     gui::TimelineViewState view_;
 
-    // Ratios keep the picture-first sidebar useful as the window grows, while
-    // pixel clamps in drawUI protect the timeline and plugin controls.
+    // Docked utility panes keep explicit pixel sizes. Native window resizing
+    // changes the arrangement editor; only splitter drags change these.
     float sidebarWidth_ = 360.0f;
-    float videoShare_ = 0.62f;
+    float videoHeight_ = 322.0f;
+
+    // Global hardware controls live above the document-specific sidebar.
+    // The selection itself is stored in the per-user preferences file, never
+    // in a .dave project.
+    bool showIoPanel_ = true;
 
     // ─── Mixer ──────────────────────────────────────────────────────────────
     // The mixer sits under the timeline, spanning its full width: strips are
@@ -123,7 +163,7 @@ private:
     // ─── Picture pop-out ────────────────────────────────────────────────────
     // The video preview can leave the sidebar for a real OS window (see
     // drawVideoPopoutWindow) that the user drags wherever picture belongs —
-    // a second display, typically. videoShare_ is left alone while popped out
+    // a second display, typically. videoHeight_ is left alone while popped out
     // so the sidebar split comes back exactly as the user left it.
     bool videoPoppedOut_ = false;
     // Toggles are deferred to the next frame boundary: the request can arrive

@@ -30,6 +30,8 @@
         case 13: if (g_menuQuit) g_menuQuit(); break;
         case 14: if (g_menuToggleVideoWindow) g_menuToggleVideoWindow(); break;
         case 15: if (g_menuImportMidi) g_menuImportMidi(); break;
+        case 16: if (g_menuToggleIoPanel) g_menuToggleIoPanel(); break;
+        case 17: if (g_menuAddTrack) g_menuAddTrack(); break;
     }
 }
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)app {
@@ -51,9 +53,11 @@ std::function<void()> g_menuImportMarkers;
 std::function<void()> g_menuExportMarkers;
 std::function<void()> g_menuUndo;
 std::function<void()> g_menuRedo;
+std::function<void()> g_menuAddTrack;
 std::function<void()> g_menuPlayStop;
 std::function<void()> g_menuReturnToStart;
 std::function<void()> g_menuToggleVideoWindow;
+std::function<void()> g_menuToggleIoPanel;
 std::function<void()> g_menuImportMidi;
 std::function<void()> g_menuQuit;
 
@@ -109,6 +113,8 @@ void setupMacMenuBar() {
     NSMenu* editMenu = [[NSMenu alloc] initWithTitle:@"Edit"];
     [editMenu addItem:makeItem(@"Undo", 9, @"z")];
     [editMenu addItem:makeItem(@"Redo", 10, @"Z")];
+    [editMenu addItem:[NSMenuItem separatorItem]];
+    [editMenu addItem:makeItem(@"Add Track", 17, @"N")];
     [editMenuItem setSubmenu:editMenu];
     [[app mainMenu] addItem:editMenuItem];
 
@@ -126,6 +132,7 @@ void setupMacMenuBar() {
     [winMenu addItemWithTitle:@"Minimize" action:@selector(performMiniaturize:) keyEquivalent:@"m"];
     [winMenu addItemWithTitle:@"Zoom" action:@selector(performZoom:) keyEquivalent:@""];
     [winMenu addItem:[NSMenuItem separatorItem]];
+    [winMenu addItem:makeItem(@"I/O Panel", 16)];
     // Toggles the picture between the sidebar and its own draggable window —
     // the escape hatch if the detached window ends up behind something.
     [winMenu addItem:makeItem(@"Video Window", 14, @"V")];

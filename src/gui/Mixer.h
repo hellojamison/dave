@@ -14,7 +14,7 @@ namespace dave::gui {
 // order as the timeline rows.
 //
 // A strip is the track's signal path top to bottom — instrument (MIDI only),
-// then the insert chain, then mute/solo, pan and the fader. That order is the
+// then the insert chain, then mute/solo, a pan knob and the fader. That order is the
 // order the audio actually travels, which is the whole reason a mixer is laid
 // out vertically.
 //
@@ -29,6 +29,8 @@ namespace dave::gui {
 void drawMixer(document::Edit& edit,
                editing::UndoStack& undo,
                TimelineViewState& view,
-               float stripWidth = 108.0f);
+               float stripWidth = 108.0f,
+               int captureChannels = 0,
+               int playbackChannels = 2);
 
 } // namespace dave::gui

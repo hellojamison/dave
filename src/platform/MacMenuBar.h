@@ -20,9 +20,11 @@ extern std::function<void()> g_menuImportMarkers;
 extern std::function<void()> g_menuExportMarkers;
 extern std::function<void()> g_menuUndo;
 extern std::function<void()> g_menuRedo;
+extern std::function<void()> g_menuAddTrack;
 extern std::function<void()> g_menuPlayStop;
 extern std::function<void()> g_menuReturnToStart;
 extern std::function<void()> g_menuToggleVideoWindow;
+extern std::function<void()> g_menuToggleIoPanel;
 extern std::function<void()> g_menuImportMidi;
 extern std::function<void()> g_menuQuit;
 

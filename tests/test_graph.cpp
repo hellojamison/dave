@@ -177,3 +177,149 @@ TEST_CASE("removing a node drops its edges", "[graph]") {
     CHECK_FALSE(err.has_value());
     CHECK(compiled != nullptr);
 }
+
+// ─── Explicit root ──────────────────────────────────────────────────────────
+
+namespace {
+
+// A sink: consumes audio, emits nothing. Kahn's algorithm can pop it last,
+// which is exactly the hazard setRoot() exists to remove. Meter taps, hardware
+// outputs and the recorder are all this shape.
+class SinkNode : public Node {
+public:
+    SinkNode() : Node("sink") {}
+    int numInputPins() const override { return 1; }
+    int numOutputPins() const override { return 1; }
+    void process(NodeProcessContext& ctx) override {
+        // Deliberately writes a value nobody should ever hear.
+        for (int c = 0; c < ctx.output.numChannels; ++c) {
+            for (int i = 0; i < ctx.numSamples; ++i) {
+                ctx.output.channels[c][i] = -9.0f;
+            }
+        }
+    }
+};
+
+// Copies input to output unchanged. GainNode would do, but its constant-power
+// pan law is -3 dB at centre, which would make these assertions about the pan
+// law rather than about which node reaches the output.
+class PassThroughNode : public Node {
+public:
+    PassThroughNode() : Node("passthrough") {}
+    int numInputPins() const override { return 1; }
+    int numOutputPins() const override { return 1; }
+    void process(NodeProcessContext& ctx) override {
+        for (int c = 0; c < ctx.output.numChannels; ++c) {
+            for (int i = 0; i < ctx.numSamples; ++i) {
+                ctx.output.channels[c][i] = ctx.inputs[0].channels[c][i];
+            }
+        }
+    }
+};
+
+// Run a compiled graph for one block and return the first output sample.
+float renderFirstSample(CompiledGraph& cg, int numSamples = 32) {
+    std::vector<std::vector<float>> storage(2, std::vector<float>(numSamples, 0.0f));
+    std::vector<float*> ptrs{storage[0].data(), storage[1].data()};
+    AudioBus out;
+    out.channels = ptrs.data();
+    out.numChannels = 2;
+    out.numSamples = numSamples;
+    TimeInfo time{};
+    time.sampleRate = 48000.0;
+    cg.process(out, time);
+    return storage[0][0];
+}
+
+} // namespace
+
+TEST_CASE("a sink node added after the root does not steal the output",
+          "[graph]") {
+    // Without an explicit root, process() copies whichever node sorted last.
+    // A sink has no outgoing edge, so it can land there and silence the mix.
+    Graph g;
+    auto srcId = g.addNode(std::make_shared<ConstNode>(0.5f));
+    auto masterId = g.addNode(std::make_shared<PassThroughNode>());
+    g.connect(srcId, 0, masterId, 0);
+    g.setRoot(masterId);
+
+    // Added last and consuming the master, so it sorts after it.
+    auto sinkId = g.addNode(std::make_shared<SinkNode>());
+    g.connect(masterId, 0, sinkId, 0);
+
+    auto [cg, err] = compile(g, 48000.0, 64);
+    REQUIRE_FALSE(err.has_value());
+    REQUIRE(cg != nullptr);
+
+    // The master passes 0.5 through; the sink's -9 must not reach the output.
+    CHECK(renderFirstSample(*cg) == 0.5f);
+}
+
+TEST_CASE("a graph that never names a root keeps the old behaviour",
+          "[graph]") {
+    // Every existing call site predates setRoot(); they must be unaffected.
+    Graph g;
+    auto srcId = g.addNode(std::make_shared<ConstNode>(0.25f));
+    auto masterId = g.addNode(std::make_shared<PassThroughNode>());
+    g.connect(srcId, 0, masterId, 0);
+
+    auto [cg, err] = compile(g, 48000.0, 64);
+    REQUIRE_FALSE(err.has_value());
+    CHECK(renderFirstSample(*cg) == 0.25f);
+}
+
+TEST_CASE("compiling with a root that isn't in the graph is an error",
+          "[graph]") {
+    // Silently falling back would hide a real wiring mistake.
+    Graph g;
+    g.addNode(std::make_shared<ConstNode>(1.0f));
+    g.setRoot(9999);
+
+    auto [cg, err] = compile(g, 48000.0, 64);
+    CHECK(cg == nullptr);
+    REQUIRE(err.has_value());
+}
+
+TEST_CASE("process clamps a block larger than the graph was compiled for",
+          "[graph]") {
+    // The device's block size is a request to the driver, not a promise from
+    // it. Every node buffer is exactly maxBlock long, so an oversized block
+    // used to write past them — a heap overflow that only showed up when the
+    // driver changed its mind. AudioEngine slices to match; this is the net
+    // under that, so a caller that gets it wrong glitches instead of corrupts.
+    Graph g;
+    auto srcId = g.addNode(std::make_shared<ConstNode>(1.0f));
+    auto rootId = g.addNode(std::make_shared<PassThroughNode>());
+    g.connect(srcId, 0, rootId, 0);
+    g.setRoot(rootId);
+
+    constexpr int kCompiledFor = 64;
+    auto [cg, err] = compile(g, 48000.0, kCompiledFor);
+    REQUIRE_FALSE(err.has_value());
+    CHECK(cg->maxBlock() == kCompiledFor);
+
+    // Hand it four times what it was built for, with the tail pre-filled with
+    // a sentinel so we can see exactly how far it wrote.
+    constexpr int kOversized = kCompiledFor * 4;
+    std::vector<std::vector<float>> storage(2, std::vector<float>(kOversized, -1.0f));
+    std::vector<float*> ptrs{storage[0].data(), storage[1].data()};
+    AudioBus out;
+    out.channels = ptrs.data();
+    out.numChannels = 2;
+    out.numSamples = kOversized;
+    TimeInfo time{};
+    time.sampleRate = 48000.0;
+    cg->process(out, time);
+
+    for (int c = 0; c < 2; ++c) {
+        for (int i = 0; i < kCompiledFor; ++i) {
+            INFO("channel " << c << " sample " << i);
+            REQUIRE(storage[c][i] == 1.0f);
+        }
+        // Everything past the compiled size is untouched, not garbage.
+        for (int i = kCompiledFor; i < kOversized; ++i) {
+            INFO("channel " << c << " sample " << i);
+            REQUIRE(storage[c][i] == -1.0f);
+        }
+    }
+}

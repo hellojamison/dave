@@ -21,6 +21,9 @@ struct NodeProcessContext {
     // Per-pin input buses. For a generator (no inputs) this is empty.
     const AudioBus* inputs = nullptr;
     int numInputs = 0;
+    // Read-only native capture channels for hardware-input nodes. This bus is
+    // owned and deinterleaved by AudioEngine before graph processing.
+    const AudioBus* hardwareInput = nullptr;
     // This node's output. Pre-zeroed by the host before process() is called.
     AudioBus output;
 };
@@ -53,6 +56,10 @@ public:
     // Channels per pin. RB-1 fixes this at 2 (stereo); overridable for mono
     // sources / surround later.
     virtual int channelsPerPin() const { return 2; }
+
+    // Algorithmic latency introduced by this node. Graph compilation uses it
+    // to delay faster parallel edges at each summing pin.
+    virtual uint32_t latencySamples() const { return 0; }
 
     // --- RT processing -----------------------------------------------------
     // Called on the RT thread for every block. Read from ctx.inputs, write into

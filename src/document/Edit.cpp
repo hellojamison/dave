@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "audio/AudioImportPolicy.h"
 #include "document/Edit.h"
 #include "document/Sha256.h"
 
@@ -8,8 +9,60 @@
 #include <algorithm>
 
 #include <cstdio>
+#include <filesystem>
+#include <functional>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace dave::document {
+
+namespace {
+
+RouteTarget* mainOutputFor(Edit& edit, const std::string& id) {
+    if (auto* track = edit.track(id)) return &track->mainOutput;
+    if (auto* track = edit.midiTrack(id)) return &track->mainOutput;
+    if (auto* bus = edit.bus(id)) return &bus->mainOutput;
+    return nullptr;
+}
+
+std::vector<AuxSend>* sendsFor(Edit& edit, const std::string& id) {
+    if (auto* track = edit.track(id)) return &track->sends;
+    if (auto* track = edit.midiTrack(id)) return &track->sends;
+    if (auto* bus = edit.bus(id)) return &bus->sends;
+    return nullptr;
+}
+
+const std::vector<AuxSend>* sendsFor(const Edit& edit, const std::string& id) {
+    if (const auto* track = edit.track(id)) return &track->sends;
+    if (const auto* track = edit.midiTrack(id)) return &track->sends;
+    if (const auto* bus = edit.bus(id)) return &bus->sends;
+    return nullptr;
+}
+
+bool validHardwareSpan(const HardwareChannelSpan& span, bool fixedOutputPair) {
+    if (span.firstChannel < 0 || (span.channelCount != 1 && span.channelCount != 2)) {
+        return false;
+    }
+    // Stereo hardware destinations are the fixed pairs 1-2, 3-4, ... .
+    return !fixedOutputPair || span.channelCount != 2 ||
+           (span.firstChannel % 2) == 0;
+}
+
+} // namespace
+
+Edit::Edit() {
+    ensureMainBus_();
+}
+
+void Edit::ensureMainBus_() {
+    if (bus(kMainBusId) != nullptr) return;
+    BusTrack main;
+    main.id = kMainBusId;
+    main.name = "Main";
+    main.isMain = true;
+    main.mainOutput = RouteTarget::hardwareOutput(0, 2);
+    buses_.push_back(std::move(main));
+}
 
 std::string Edit::newId(const char* prefix) const {
     char buf[48];
@@ -19,6 +72,18 @@ std::string Edit::newId(const char* prefix) const {
 }
 
 AssetId Edit::importAsset(const std::string& filePath) {
+    // Reject before hashing: hashing a sparse or genuinely huge file would
+    // still read every byte even though the in-memory decoder cannot open it.
+    std::error_code sizeError;
+    const auto encodedBytes = std::filesystem::file_size(filePath, sizeError);
+    if (!sizeError && !audio::canDecodeFileInMemory(encodedBytes)) {
+        std::fprintf(stderr,
+                     "Dave: WAV import refused: files larger than 4 GiB "
+                     "require streaming playback: %s\n",
+                     filePath.c_str());
+        return {};
+    }
+
     std::string hash = sha256HexOfFile(filePath);
     if (hash.empty()) {
         std::fprintf(stderr, "Dave: importAsset: failed to hash %s\n", filePath.c_str());
@@ -75,6 +140,7 @@ const Track* Edit::track(const std::string& id) const {
 }
 
 bool Edit::removeTrack(const std::string& id) {
+    if (routeReferences(RouteTarget::Kind::AudioTrack, id)) return false;
     for (auto it = tracks_.begin(); it != tracks_.end(); ++it) {
         if (it->id == id) {
             tracks_.erase(it);
@@ -83,6 +149,19 @@ bool Edit::removeTrack(const std::string& id) {
         }
     }
     return false;
+}
+
+bool Edit::setTrackColor(const std::string& ownerId, std::string color) {
+    if (!validTrackColor(color)) return false;
+    std::string* destination = nullptr;
+    if (auto* value = track(ownerId)) destination = &value->color;
+    else if (auto* value = midiTrack(ownerId)) destination = &value->color;
+    else if (auto* value = bus(ownerId)) destination = &value->color;
+    if (destination == nullptr) return false;
+    if (*destination == color) return true;
+    *destination = std::move(color);
+    notifyChanged();
+    return true;
 }
 
 std::string Edit::addClip(const std::string& trackId, AudioClip clip) {
@@ -95,6 +174,18 @@ std::string Edit::addClip(const std::string& trackId, AudioClip clip) {
     t->clips.push_back(std::move(clip));
     notifyChanged();
     return t->clips.back().id;
+}
+
+bool Edit::restoreClip_(const std::string& trackId, AudioClip clip) {
+    Track* t = track(trackId);
+    if (t == nullptr || clip.id.empty()) return false;
+    const auto duplicate = std::find_if(
+        t->clips.begin(), t->clips.end(),
+        [&](const AudioClip& existing) { return existing.id == clip.id; });
+    if (duplicate != t->clips.end()) return false;
+    t->clips.push_back(std::move(clip));
+    notifyChanged();
+    return true;
 }
 
 AudioClip* Edit::clip(const std::string& trackId, const std::string& clipId) {
@@ -118,21 +209,25 @@ bool Edit::removeClip(const std::string& trackId, const std::string& clipId) {
 }
 
 std::string Edit::addPlugin(const std::string& trackId, PluginSlot slot) {
-    Track* t = track(trackId);
-    if (t == nullptr) return "";
+    std::vector<PluginSlot>* plugins = nullptr;
+    if (Track* t = track(trackId)) plugins = &t->plugins;
+    else if (BusTrack* b = bus(trackId)) plugins = &b->plugins;
+    if (plugins == nullptr) return "";
     slot.id = newId("plugin_");
     ++idCounter_;
-    t->plugins.push_back(std::move(slot));
+    plugins->push_back(std::move(slot));
     notifyChanged();
-    return t->plugins.back().id;
+    return plugins->back().id;
 }
 
 bool Edit::removePlugin(const std::string& trackId, const std::string& slotId) {
-    Track* t = track(trackId);
-    if (t == nullptr) return false;
-    for (auto it = t->plugins.begin(); it != t->plugins.end(); ++it) {
+    std::vector<PluginSlot>* plugins = nullptr;
+    if (Track* t = track(trackId)) plugins = &t->plugins;
+    else if (BusTrack* b = bus(trackId)) plugins = &b->plugins;
+    if (plugins == nullptr) return false;
+    for (auto it = plugins->begin(); it != plugins->end(); ++it) {
         if (it->id == slotId) {
-            t->plugins.erase(it);
+            plugins->erase(it);
             notifyChanged();
             return true;
         }
@@ -169,6 +264,320 @@ bool Edit::removeMidiTrack(const std::string& id) {
             notifyChanged();
             return true;
         }
+    }
+    return false;
+}
+
+// ─── Routing and buses ─────────────────────────────────────────────────────
+
+BusTrack* Edit::bus(const std::string& id) {
+    for (auto& candidate : buses_) if (candidate.id == id) return &candidate;
+    return nullptr;
+}
+
+const BusTrack* Edit::bus(const std::string& id) const {
+    for (const auto& candidate : buses_) if (candidate.id == id) return &candidate;
+    return nullptr;
+}
+
+std::string Edit::addBus(const std::string& name) {
+    BusTrack candidate;
+    do {
+        candidate.id = newId("bus_");
+        ++idCounter_;
+    } while (bus(candidate.id) || track(candidate.id) || midiTrack(candidate.id));
+    candidate.name = name.empty() ? "Bus " + std::to_string(idCounter_) : name;
+    candidate.mainOutput = RouteTarget::bus();
+    const std::string id = candidate.id;
+    auto main = std::find_if(buses_.begin(), buses_.end(), [](const BusTrack& bus) {
+        return bus.id == kMainBusId;
+    });
+    buses_.insert(main, std::move(candidate));
+    notifyChanged();
+    return id;
+}
+
+bool Edit::restoreBus_(BusTrack restored, size_t index) {
+    if (restored.id.empty() || restored.id == kMainBusId || bus(restored.id)) {
+        return false;
+    }
+    const size_t mainIndex = buses_.empty() ? 0 : buses_.size() - 1;
+    const size_t at = std::min(index, mainIndex);
+    buses_.insert(buses_.begin() + static_cast<ptrdiff_t>(at),
+                  std::move(restored));
+    const auto validation = validateRouting();
+    if (!validation.ok) {
+        buses_.erase(buses_.begin() + static_cast<ptrdiff_t>(at));
+        return false;
+    }
+    notifyChanged();
+    return true;
+}
+
+bool Edit::removeBus(const std::string& id) {
+    if (id == kMainBusId || routeReferences(RouteTarget::Kind::Bus, id)) {
+        return false;
+    }
+    for (auto it = buses_.begin(); it != buses_.end(); ++it) {
+        if (it->id != id) continue;
+        buses_.erase(it);
+        notifyChanged();
+        return true;
+    }
+    return false;
+}
+
+bool Edit::routeReferences(RouteTarget::Kind kind, const std::string& id) const {
+    const auto references = [&](const RouteTarget& target) {
+        return target.kind == kind && target.targetId == id;
+    };
+    const auto channelReferences = [&](const auto& channel) {
+        if (references(channel.mainOutput)) return true;
+        return std::any_of(channel.sends.begin(), channel.sends.end(),
+                           [&](const AuxSend& send) { return references(send.target); });
+    };
+    for (const auto& track : tracks_) if (channelReferences(track)) return true;
+    for (const auto& track : midiTracks_) if (channelReferences(track)) return true;
+    for (const auto& candidate : buses_) if (channelReferences(candidate)) return true;
+    return false;
+}
+
+Edit::RoutingValidation Edit::validateRouting() const {
+    std::unordered_set<std::string> audioIds;
+    std::unordered_set<std::string> busIds;
+    std::unordered_set<std::string> allOwnerIds;
+    std::vector<std::string> owners;
+    for (const auto& track : tracks_) {
+        if (track.id.empty() || !audioIds.insert(track.id).second) {
+            return {false, "audio track has an empty or duplicate id"};
+        }
+        if (!allOwnerIds.insert(track.id).second) {
+            return {false, "routing owner ids must be globally unique"};
+        }
+        owners.push_back(track.id);
+        if (!validHardwareSpan(track.hardwareInput, false)) {
+            return {false, "audio track has an invalid hardware input span"};
+        }
+    }
+    for (const auto& track : midiTracks_) {
+        if (track.id.empty() || !allOwnerIds.insert(track.id).second) {
+            return {false, "MIDI track has an empty or duplicate id"};
+        }
+        owners.push_back(track.id);
+    }
+    for (const auto& candidate : buses_) {
+        if (candidate.id.empty() || !busIds.insert(candidate.id).second) {
+            return {false, "bus has an empty or duplicate id"};
+        }
+        if (!allOwnerIds.insert(candidate.id).second) {
+            return {false, "routing owner ids must be globally unique"};
+        }
+        owners.push_back(candidate.id);
+    }
+    const auto* main = mainBus();
+    if (!main || !main->isMain) return {false, "permanent Main bus is missing"};
+
+    std::unordered_map<std::string, std::vector<std::string>> adjacency;
+    const auto checkTarget = [&](const std::string& ownerId,
+                                 const RouteTarget& target,
+                                 bool ownerIsMain) -> RoutingValidation {
+        if (ownerIsMain && target.kind != RouteTarget::Kind::HardwareOutput) {
+            return {false, "Main may route or send only to hardware"};
+        }
+        switch (target.kind) {
+            case RouteTarget::Kind::None:
+                return {true, {}};
+            case RouteTarget::Kind::HardwareOutput:
+                return validHardwareSpan(target.hardware, true)
+                    ? RoutingValidation{}
+                    : RoutingValidation{false, "invalid hardware output span"};
+            case RouteTarget::Kind::AudioTrack:
+                if (!audioIds.count(target.targetId)) {
+                    return {false, "route references a missing audio track"};
+                }
+                if (target.targetId == ownerId) return {false, "self-route refused"};
+                adjacency[ownerId].push_back(target.targetId);
+                return {};
+            case RouteTarget::Kind::Bus:
+                if (!busIds.count(target.targetId)) {
+                    return {false, "route references a missing bus"};
+                }
+                if (target.targetId == ownerId) return {false, "self-route refused"};
+                adjacency[ownerId].push_back(target.targetId);
+                return {};
+        }
+        return {false, "unknown route target"};
+    };
+
+    const auto checkChannel = [&](const auto& channel) -> RoutingValidation {
+        const bool isMain = channel.id == kMainBusId;
+        auto result = checkTarget(channel.id, channel.mainOutput, isMain);
+        if (!result.ok) return result;
+        std::unordered_set<std::string> sendIds;
+        for (const auto& send : channel.sends) {
+            if (send.id.empty() || !sendIds.insert(send.id).second) {
+                return {false, "send has an empty or duplicate id"};
+            }
+            if (send.gain < 0.0) return {false, "send gain must be non-negative"};
+            result = checkTarget(channel.id, send.target, isMain);
+            if (!result.ok) return result;
+        }
+        return {};
+    };
+    for (const auto& track : tracks_) {
+        auto result = checkChannel(track); if (!result.ok) return result;
+    }
+    for (const auto& track : midiTracks_) {
+        auto result = checkChannel(track); if (!result.ok) return result;
+    }
+    for (const auto& candidate : buses_) {
+        auto result = checkChannel(candidate); if (!result.ok) return result;
+    }
+
+    enum class Mark { Unseen, Visiting, Done };
+    std::unordered_map<std::string, Mark> marks;
+    std::function<bool(const std::string&)> visitsCycle = [&](const std::string& id) {
+        if (marks[id] == Mark::Visiting) return true;
+        if (marks[id] == Mark::Done) return false;
+        marks[id] = Mark::Visiting;
+        for (const auto& next : adjacency[id]) if (visitsCycle(next)) return true;
+        marks[id] = Mark::Done;
+        return false;
+    };
+    for (const auto& owner : owners) {
+        if (visitsCycle(owner)) return {false, "routing cycle refused"};
+    }
+    return {};
+}
+
+Edit::RoutingValidation Edit::validateMainOutput(
+    const std::string& ownerId, const RouteTarget& target) const {
+    Edit candidate = *this;
+    candidate.setChangeListener({});
+    RouteTarget* output = mainOutputFor(candidate, ownerId);
+    if (!output) return {false, "route owner does not exist"};
+    *output = target;
+    return candidate.validateRouting();
+}
+
+Edit::RoutingValidation Edit::validateSendTarget(
+    const std::string& ownerId, const RouteTarget& target) const {
+    Edit candidate = *this;
+    candidate.setChangeListener({});
+    auto* list = sendsFor(candidate, ownerId);
+    if (!list) return {false, "route owner does not exist"};
+    AuxSend send;
+    send.id = "__validation_send__";
+    send.target = target;
+    list->push_back(std::move(send));
+    return candidate.validateRouting();
+}
+
+bool Edit::setMainOutput(const std::string& ownerId, RouteTarget target) {
+    RouteTarget* output = mainOutputFor(*this, ownerId);
+    if (!output || *output == target) return false;
+    const RouteTarget previous = *output;
+    *output = std::move(target);
+    if (!validateRouting().ok) {
+        *output = previous;
+        return false;
+    }
+    notifyChanged();
+    return true;
+}
+
+bool Edit::setTrackHardwareInput(const std::string& trackId,
+                                 HardwareChannelSpan span) {
+    auto* candidate = track(trackId);
+    if (!candidate || !validHardwareSpan(span, false) ||
+        candidate->hardwareInput == span) {
+        return false;
+    }
+    candidate->hardwareInput = span;
+    // Keep the legacy fields synchronized until v1 callers are retired.
+    candidate->inputChannel = span.firstChannel;
+    candidate->inputChannelCount = span.channelCount;
+    notifyChanged();
+    return true;
+}
+
+bool Edit::setInputMonitor(const std::string& trackId, bool enabled) {
+    auto* candidate = track(trackId);
+    if (!candidate || candidate->inputMonitor == enabled) return false;
+    candidate->inputMonitor = enabled;
+    notifyChanged();
+    return true;
+}
+
+std::string Edit::addSend(const std::string& ownerId, AuxSend send) {
+    auto* list = sendsFor(*this, ownerId);
+    if (!list) return {};
+    const auto sendIdExists = [&](const std::string& id) {
+        const auto has = [&](const auto& channel) {
+            return std::any_of(channel.sends.begin(), channel.sends.end(),
+                               [&](const AuxSend& existing) {
+                                   return existing.id == id;
+                               });
+        };
+        for (const auto& track : tracks_) if (has(track)) return true;
+        for (const auto& track : midiTracks_) if (has(track)) return true;
+        for (const auto& bus : buses_) if (has(bus)) return true;
+        return false;
+    };
+    do {
+        send.id = newId("send_");
+        ++idCounter_;
+    } while (sendIdExists(send.id));
+    list->push_back(std::move(send));
+    if (!validateRouting().ok) {
+        list->pop_back();
+        return {};
+    }
+    notifyChanged();
+    return list->back().id;
+}
+
+bool Edit::restoreSend_(const std::string& ownerId, AuxSend send, size_t index) {
+    auto* list = sendsFor(*this, ownerId);
+    if (!list || send.id.empty()) return false;
+    if (std::any_of(list->begin(), list->end(), [&](const AuxSend& existing) {
+            return existing.id == send.id;
+        })) return false;
+    const size_t at = std::min(index, list->size());
+    list->insert(list->begin() + static_cast<ptrdiff_t>(at), std::move(send));
+    if (!validateRouting().ok) {
+        list->erase(list->begin() + static_cast<ptrdiff_t>(at));
+        return false;
+    }
+    notifyChanged();
+    return true;
+}
+
+bool Edit::updateSend(const std::string& ownerId, const AuxSend& send) {
+    auto* list = sendsFor(*this, ownerId);
+    if (!list) return false;
+    for (auto& existing : *list) {
+        if (existing.id != send.id) continue;
+        const AuxSend previous = existing;
+        existing = send;
+        if (!validateRouting().ok) {
+            existing = previous;
+            return false;
+        }
+        notifyChanged();
+        return true;
+    }
+    return false;
+}
+
+bool Edit::removeSend(const std::string& ownerId, const std::string& sendId) {
+    auto* list = sendsFor(*this, ownerId);
+    if (!list) return false;
+    for (auto it = list->begin(); it != list->end(); ++it) {
+        if (it->id != sendId) continue;
+        list->erase(it);
+        notifyChanged();
+        return true;
     }
     return false;
 }
@@ -244,6 +653,7 @@ bool Edit::removeMidiPlugin(const std::string& trackId, const std::string& slotI
 bool Edit::anySoloed() const {
     for (const auto& t : tracks_) if (t.solo) return true;
     for (const auto& mt : midiTracks_) if (mt.solo) return true;
+    for (const auto& bus : buses_) if (bus.solo) return true;
     return false;
 }
 

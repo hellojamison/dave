@@ -42,6 +42,7 @@ Palette makePalette() {
     p.accentStrong      = hex(0xaac6b7ff);
     p.accentDeep        = hex(0x668173ff);
     p.danger            = hex(0xe49c9cff);
+    p.recordArmed       = hex(0xe34b52ff);
 
     // These roles have no direct Overcue token. Muted botanical green and
     // ochre preserve clear status semantics without leaving the warm register.
@@ -383,7 +384,16 @@ bool gradientButton(const char* label, ImVec2 size, ButtonVariant variant) {
     ImVec4 top;
     ImVec4 bottom;
     ImVec4 textColor;
-    if (variant == ButtonVariant::Primary) {
+    if (variant == ButtonVariant::Danger) {
+        const ImVec4 danger = g_palette.danger;
+        const float lift = hovered ? 0.09f : 0.0f;
+        const float press = active ? -0.08f : 0.0f;
+        top = ImVec4(std::clamp(danger.x + lift + press, 0.0f, 1.0f),
+                     std::clamp(danger.y + lift + press, 0.0f, 1.0f),
+                     std::clamp(danger.z + lift + press, 0.0f, 1.0f), 1.0f);
+        bottom = ImVec4(top.x * 0.72f, top.y * 0.72f, top.z * 0.72f, 1.0f);
+        textColor = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
+    } else if (variant == ButtonVariant::Primary) {
         top = active ? g_palette.primaryActiveTop
                      : hovered ? g_palette.primaryHoverTop : g_palette.primaryTop;
         bottom = active ? g_palette.primaryActiveBottom
@@ -402,7 +412,7 @@ bool gradientButton(const char* label, ImVec2 size, ButtonVariant variant) {
     drawVerticalGradient(drawList, rect, color(top), color(bottom), rounding);
     drawList->AddRect(
         rect.min, rect.max,
-        color(variant == ButtonVariant::Primary
+        color(variant != ButtonVariant::Normal
                   ? ImVec4(1.0f, 1.0f, 1.0f, 0.16f)
                   : ImVec4(1.0f, 1.0f, 1.0f, 0.12f)),
         rounding);
@@ -434,7 +444,16 @@ bool iconButton(const char* id, TransportIcon icon, const char* tooltip,
     ImVec4 top;
     ImVec4 bottom;
     ImVec4 glyphColor;
-    if (variant == ButtonVariant::Primary) {
+    if (variant == ButtonVariant::Danger) {
+        const ImVec4 danger = g_palette.danger;
+        const float lift = hovered ? 0.09f : 0.0f;
+        const float press = active ? -0.08f : 0.0f;
+        top = ImVec4(std::clamp(danger.x + lift + press, 0.0f, 1.0f),
+                     std::clamp(danger.y + lift + press, 0.0f, 1.0f),
+                     std::clamp(danger.z + lift + press, 0.0f, 1.0f), 1.0f);
+        bottom = ImVec4(top.x * 0.72f, top.y * 0.72f, top.z * 0.72f, 1.0f);
+        glyphColor = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
+    } else if (variant == ButtonVariant::Primary) {
         top = active ? g_palette.primaryActiveTop
                      : hovered ? g_palette.primaryHoverTop : g_palette.primaryTop;
         bottom = active ? g_palette.primaryActiveBottom
@@ -453,7 +472,7 @@ bool iconButton(const char* id, TransportIcon icon, const char* tooltip,
     drawVerticalGradient(drawList, rect, color(top), color(bottom), rounding);
     drawList->AddRect(
         rect.min, rect.max,
-        color(variant == ButtonVariant::Primary
+        color(variant != ButtonVariant::Normal
                   ? ImVec4(1.0f, 1.0f, 1.0f, 0.16f)
                   : ImVec4(1.0f, 1.0f, 1.0f, 0.12f)),
         rounding);
@@ -540,6 +559,51 @@ void panelHeader(const char* label) {
         ImGui::PopFont();
     }
     ImGui::Dummy(size);
+}
+
+void drawRecordArmIndicator(ImDrawList* drawList, ImVec2 center, float radius,
+                            bool armed, bool hovered) {
+    const ImU32 fill = armed
+        ? color(g_palette.recordArmed)
+        : color(hovered ? g_palette.surfaceStrong
+                        : g_palette.trackControlInactive);
+    const ImU32 outline = armed
+        ? color(g_palette.danger)
+        : color(hovered ? g_palette.textMuted : g_palette.borderStrong);
+    drawList->AddCircleFilled(center, radius, fill, 20);
+    drawList->AddCircle(center, radius, outline, 20, armed ? 1.5f : 1.0f);
+}
+
+void drawCenteredControlLabel(ImDrawList* drawList, const Rect& rect,
+                              ImU32 textColor, const char* label) {
+    if (drawList == nullptr || label == nullptr || label[0] == '\0') return;
+
+    const ImVec2 textSize = ImGui::CalcTextSize(label);
+    ImVec2 position(
+        rect.min.x + (rect.max.x - rect.min.x - textSize.x) * 0.5f,
+        rect.min.y + (rect.max.y - rect.min.y - textSize.y) * 0.5f);
+
+    // M has slightly unequal side bearings in SF Pro. CalcTextSize centres
+    // its advance width, not the pixels users see, so use the baked glyph's
+    // ink bounds for single-character channel-state labels.
+    if (label[1] == '\0') {
+        if (ImFontBaked* baked = ImGui::GetFontBaked()) {
+            if (const ImFontGlyph* glyph =
+                    baked->FindGlyphNoFallback(static_cast<ImWchar>(label[0]))) {
+                const float scale = ImGui::GetFontSize() / baked->Size;
+                const float visibleWidth = (glyph->X1 - glyph->X0) * scale;
+                const float visibleHeight = (glyph->Y1 - glyph->Y0) * scale;
+                position.x = rect.min.x +
+                    (rect.max.x - rect.min.x - visibleWidth) * 0.5f -
+                    glyph->X0 * scale;
+                position.y = rect.min.y +
+                    (rect.max.y - rect.min.y - visibleHeight) * 0.5f -
+                    glyph->Y0 * scale;
+            }
+        }
+    }
+
+    drawList->AddText(position, textColor, label);
 }
 
 } // namespace dave::gui::theme

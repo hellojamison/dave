@@ -32,6 +32,11 @@
         case 15: if (g_menuImportMidi) g_menuImportMidi(); break;
         case 16: if (g_menuToggleIoPanel) g_menuToggleIoPanel(); break;
         case 17: if (g_menuAddTrack) g_menuAddTrack(); break;
+        case 18: if (g_menuToggleTransientNavigation) g_menuToggleTransientNavigation(); break;
+        case 19: if (g_menuNextLandmark) g_menuNextLandmark(); break;
+        case 20: if (g_menuPreviousLandmark) g_menuPreviousLandmark(); break;
+        case 21: if (g_menuExtendNextLandmark) g_menuExtendNextLandmark(); break;
+        case 22: if (g_menuExtendPreviousLandmark) g_menuExtendPreviousLandmark(); break;
     }
 }
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)app {
@@ -54,6 +59,11 @@ std::function<void()> g_menuExportMarkers;
 std::function<void()> g_menuUndo;
 std::function<void()> g_menuRedo;
 std::function<void()> g_menuAddTrack;
+std::function<void()> g_menuToggleTransientNavigation;
+std::function<void()> g_menuNextLandmark;
+std::function<void()> g_menuPreviousLandmark;
+std::function<void()> g_menuExtendNextLandmark;
+std::function<void()> g_menuExtendPreviousLandmark;
 std::function<void()> g_menuPlayStop;
 std::function<void()> g_menuReturnToStart;
 std::function<void()> g_menuToggleVideoWindow;
@@ -77,6 +87,12 @@ void setupMacMenuBar() {
                                                keyEquivalent:(key ?: @"")];
         item.target = g_target;
         item.tag = tag;
+        return item;
+    };
+    auto makeShortcutItem = [&](NSString* title, NSInteger tag, NSString* key,
+                                NSEventModifierFlags modifiers) {
+        NSMenuItem* item = makeItem(title, tag, key);
+        item.keyEquivalentModifierMask = modifiers;
         return item;
     };
 
@@ -115,6 +131,21 @@ void setupMacMenuBar() {
     [editMenu addItem:makeItem(@"Redo", 10, @"Z")];
     [editMenu addItem:[NSMenuItem separatorItem]];
     [editMenu addItem:makeItem(@"Add Track", 17, @"N")];
+    [editMenu addItem:[NSMenuItem separatorItem]];
+    [editMenu addItem:makeShortcutItem(
+        @"Transient Navigation", 18, @"\t",
+        NSEventModifierFlagCommand | NSEventModifierFlagOption)];
+    [editMenu addItem:makeShortcutItem(
+        @"Next Transient or Boundary", 19, @"\t", 0)];
+    [editMenu addItem:makeShortcutItem(
+        @"Previous Transient or Boundary", 20, @"\t",
+        NSEventModifierFlagOption)];
+    [editMenu addItem:makeShortcutItem(
+        @"Extend Selection to Next", 21, @"\t",
+        NSEventModifierFlagShift)];
+    [editMenu addItem:makeShortcutItem(
+        @"Extend Selection to Previous", 22, @"\t",
+        NSEventModifierFlagOption | NSEventModifierFlagShift)];
     [editMenuItem setSubmenu:editMenu];
     [[app mainMenu] addItem:editMenuItem];
 

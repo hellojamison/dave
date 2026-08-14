@@ -33,6 +33,7 @@ public:
     // its Window member creates the native window during construction.
     static void configureScreenshot(ScreenshotOptions options);
     static bool screenshotSucceeded();
+    static bool screenshotMode();
 
     Window(int width, int height, const std::string& title);
     ~Window();

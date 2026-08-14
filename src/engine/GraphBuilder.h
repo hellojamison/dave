@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "audio/DecodedAudioAsset.h"
 #include "document/Edit.h"
 #include "engine/graph/Graph.h"
 #include "engine/nodes/AudioClipNode.h"
@@ -58,8 +59,12 @@ public:
     instrumentNodes() const {
         return instrumentNodes_;
     }
-    const std::unordered_map<std::string, std::vector<std::vector<float>>>& assetBuffers() const {
+    const std::unordered_map<std::string, audio::DecodedAudioAssetPtr>& assetBuffers() const {
         return assetCache_.buffers;
+    }
+    audio::DecodedAudioAssetPtr decodedAsset(const std::string& assetId) const {
+        const auto found = assetCache_.buffers.find(assetId);
+        return found == assetCache_.buffers.end() ? nullptr : found->second;
     }
 
     // Look up the live PluginInstance for a slot id (or nullptr if not built
@@ -83,9 +88,7 @@ private:
                                                     double sampleRate);
 
     struct AssetCache {
-        std::unordered_map<std::string, std::vector<std::vector<float>>> buffers;
-        std::unordered_map<std::string, double> sampleRates;
-        std::unordered_map<std::string, int> channels;
+        std::unordered_map<std::string, audio::DecodedAudioAssetPtr> buffers;
     };
     AssetCache assetCache_;
 

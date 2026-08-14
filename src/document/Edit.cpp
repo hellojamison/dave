@@ -271,6 +271,39 @@ bool Edit::removeVolumeAutomationPoint(
     return true;
 }
 
+bool Edit::replaceVolumeAutomation(
+    const std::string& ownerId,
+    std::vector<VolumeAutomationPoint> points) {
+    auto* destination = volumeAutomation(ownerId);
+    if (destination == nullptr) return false;
+
+    std::sort(points.begin(), points.end(), [](const auto& a, const auto& b) {
+        return a.sample < b.sample;
+    });
+    std::unordered_set<std::string> ids;
+    int64_t previousSample = -1;
+    for (auto& point : points) {
+        point.sample = std::max<int64_t>(0, point.sample);
+        point.db = clampVolumeAutomationDb(point.db);
+        if (point.sample == previousSample ||
+            (!point.id.empty() && !ids.insert(point.id).second)) {
+            return false;
+        }
+        previousSample = point.sample;
+    }
+    for (auto& point : points) {
+        if (!point.id.empty()) continue;
+        do {
+            point.id = newId("automation_");
+            ++idCounter_;
+        } while (!ids.insert(point.id).second);
+    }
+    if (*destination == points) return true;
+    *destination = std::move(points);
+    notifyChanged();
+    return true;
+}
+
 std::vector<PanAutomationPoint>* Edit::panAutomation(
     const std::string& ownerId) {
     if (auto* value = track(ownerId)) return &value->panAutomation;
@@ -374,6 +407,39 @@ bool Edit::removePanAutomationPoint(
         });
     if (found == points->end()) return false;
     points->erase(found);
+    notifyChanged();
+    return true;
+}
+
+bool Edit::replacePanAutomation(
+    const std::string& ownerId,
+    std::vector<PanAutomationPoint> points) {
+    auto* destination = panAutomation(ownerId);
+    if (destination == nullptr) return false;
+
+    std::sort(points.begin(), points.end(), [](const auto& a, const auto& b) {
+        return a.sample < b.sample;
+    });
+    std::unordered_set<std::string> ids;
+    int64_t previousSample = -1;
+    for (auto& point : points) {
+        point.sample = std::max<int64_t>(0, point.sample);
+        point.pan = clampPanAutomation(point.pan);
+        if (point.sample == previousSample ||
+            (!point.id.empty() && !ids.insert(point.id).second)) {
+            return false;
+        }
+        previousSample = point.sample;
+    }
+    for (auto& point : points) {
+        if (!point.id.empty()) continue;
+        do {
+            point.id = newId("pan_automation_");
+            ++idCounter_;
+        } while (!ids.insert(point.id).second);
+    }
+    if (*destination == points) return true;
+    *destination = std::move(points);
     notifyChanged();
     return true;
 }

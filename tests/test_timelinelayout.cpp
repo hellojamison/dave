@@ -13,6 +13,8 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <cmath>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -27,6 +29,18 @@ constexpr float kGutterWidth = 260.0f;
 constexpr float kRulerHeight = 30.0f;
 constexpr float kMarkerLaneHeight = 28.0f;
 constexpr float kAutomationLaneHeight = 72.0f;
+
+float effectiveTrackHeight() {
+    constexpr float rowPadding = 6.0f;
+    constexpr float rowGap = 3.0f;
+    const float compactControlHeight = ImGui::GetFontSize() + 2.0f;
+    const float headerHeight = std::max(
+        static_cast<float>(gui::theme::typeScale().label),
+        compactControlHeight);
+    return std::max(kTrackHeight,
+                    rowPadding * 2.0f + headerHeight +
+                        compactControlHeight * 2.0f + rowGap * 2.0f);
+}
 
 struct LayoutRig : ImGuiRig {
     LayoutRig() { view.samplesPerPixel = 500.0; }
@@ -90,9 +104,13 @@ struct LayoutRig : ImGuiRig {
     // set back — so this holds Option down across a whole gesture.
     void holdAlt(bool down) { ImGui::GetIO().AddKeyEvent(ImGuiMod_Alt, down); }
 
+    void holdSuper(bool down) {
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Super, down);
+    }
+
     ImVec2 origin{0.0f, 0.0f};
     gui::PeakCache peaks;
-    std::unordered_map<std::string, std::vector<std::vector<float>>> assetBuffers;
+    std::unordered_map<std::string, audio::DecodedAudioAssetPtr> assetBuffers;
 };
 
 document::VideoClip videoClip() {
@@ -108,6 +126,34 @@ document::VideoClip videoClip() {
 }
 
 } // namespace
+
+TEST_CASE("focused timeline routes Tab navigation into its view model",
+          "[timelinelayout][transient]") {
+    LayoutRig rig;
+    rig.edit.addTrack("Dialogue");
+    rig.settle();
+    rig.pressKey(ImGuiKey_Tab);
+    REQUIRE(rig.view.requestTransientNavigation);
+    REQUIRE(rig.view.transientNavigationDirection ==
+            gui::NavigationDirection::Next);
+    REQUIRE_FALSE(rig.view.requestTransientSelectionExtension);
+
+    rig.view.requestTransientNavigation = false;
+#ifdef __APPLE__
+    ImGui::GetIO().AddKeyEvent(ImGuiMod_Alt, true);
+#else
+    ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, true);
+#endif
+    rig.pressKey(ImGuiKey_Tab);
+#ifdef __APPLE__
+    ImGui::GetIO().AddKeyEvent(ImGuiMod_Alt, false);
+#else
+    ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, false);
+#endif
+    REQUIRE(rig.view.requestTransientNavigation);
+    REQUIRE(rig.view.transientNavigationDirection ==
+            gui::NavigationDirection::Previous);
+}
 
 TEST_CASE("the add-track + sits above the topmost track", "[timelinelayout]") {
     LayoutRig rig;
@@ -924,6 +970,279 @@ TEST_CASE("track disclosures open editable volume automation lanes",
     }
 }
 
+TEST_CASE("automation lane toggles between pencil line and curve tools",
+          "[timelinelayout][automation][tools]") {
+    LayoutRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string track = rig.edit.addTrack("Dialog");
+    rig.settle();
+    const float tracksTop =
+        rig.origin.y + kRulerHeight + kMarkerLaneHeight;
+    const float automationTop = tracksTop + effectiveTrackHeight();
+    rig.clickTimelineAt(rig.origin.x + 17.0f,
+                        tracksTop + kTrackHeight * 0.5f);
+    REQUIRE(rig.view.expandedTracks.contains(track));
+    REQUIRE(rig.view.automationTool == gui::AutomationTool::Pencil);
+
+    // Parameter selector occupies x=28..140. The three 24 px tool buttons sit
+    // immediately to its right: Pencil, Line, then Curve.
+    rig.clickTimelineAt(rig.origin.x + 192.0f, automationTop + 16.0f);
+    CHECK(rig.view.automationTool == gui::AutomationTool::Line);
+    rig.clickTimelineAt(rig.origin.x + 216.0f, automationTop + 16.0f);
+    CHECK(rig.view.automationTool == gui::AutomationTool::Curve);
+    rig.clickTimelineAt(rig.origin.x + 160.0f, automationTop + 16.0f);
+    CHECK(rig.view.automationTool == gui::AutomationTool::Pencil);
+    CHECK_FALSE(rig.undo.canUndo());
+}
+
+TEST_CASE("pencil draws a thinned envelope as one undoable gesture",
+          "[timelinelayout][automation][tools]") {
+    LayoutRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string track = rig.edit.addTrack("Dialog");
+    rig.edit.addVolumeAutomationPoint(track, 0, -12.0);
+    rig.edit.addVolumeAutomationPoint(track, 200000, -6.0);
+    const auto before = rig.edit.track(track)->volumeAutomation;
+    rig.settle();
+    const float tracksTop =
+        rig.origin.y + kRulerHeight + kMarkerLaneHeight;
+    const float automationTop = tracksTop + effectiveTrackHeight();
+    rig.clickTimelineAt(rig.origin.x + 17.0f,
+                        tracksTop + kTrackHeight * 0.5f);
+
+    auto volumeY = [&](double db) {
+        return automationTop + 8.0f +
+            static_cast<float>((document::kMaxVolumeAutomationDb - db) /
+                (document::kMaxVolumeAutomationDb -
+                 document::kMinVolumeAutomationDb)) *
+                (kAutomationLaneHeight - 16.0f);
+    };
+    const float x0 = rig.origin.x + kGutterWidth + 100.0f;
+    const float x1 = rig.origin.x + kGutterWidth + 200.0f;
+    const float x2 = rig.origin.x + kGutterWidth + 300.0f;
+    rig.tick(x0, volumeY(-36.0), false);
+    rig.tick(x0, volumeY(-36.0), true);
+    rig.tick(x1, volumeY(0.0), true);
+    rig.tick(x2, volumeY(-18.0), true);
+    rig.tick(x2, volumeY(-18.0), false);
+
+    const auto& drawn = rig.edit.track(track)->volumeAutomation;
+    REQUIRE(drawn.size() > 6);
+    CHECK(rig.undo.undoDepth() == 1);
+    CHECK(drawn.front() == before.front());
+    CHECK(drawn.back() == before.back());
+    CHECK(std::adjacent_find(
+              drawn.begin(), drawn.end(), [](const auto& a, const auto& b) {
+                  return a.sample >= b.sample;
+              }) == drawn.end());
+    const auto start = std::find_if(drawn.begin(), drawn.end(),
+                                    [](const auto& point) {
+                                        return point.sample == 50000;
+                                    });
+    const auto end = std::find_if(drawn.begin(), drawn.end(),
+                                  [](const auto& point) {
+                                      return point.sample == 150000;
+                                  });
+    REQUIRE(start != drawn.end());
+    REQUIRE(end != drawn.end());
+    // ImGui rounds row origins to display pixels, so permit one pixel of
+    // vertical quantization (about 1.2 dB at this lane height).
+    CHECK(start->db == Catch::Approx(-36.0).margin(1.2));
+    CHECK(end->db == Catch::Approx(-18.0).margin(1.2));
+
+    rig.undo.undo();
+    CHECK(rig.edit.track(track)->volumeAutomation == before);
+}
+
+TEST_CASE("line tool replaces its range with one straight ramp",
+          "[timelinelayout][automation][tools]") {
+    LayoutRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string track = rig.edit.addTrack("Dialog");
+    rig.edit.addVolumeAutomationPoint(track, 0, -12.0);
+    rig.edit.addVolumeAutomationPoint(track, 100000, -48.0);
+    rig.edit.addVolumeAutomationPoint(track, 200000, -6.0);
+    const auto before = rig.edit.track(track)->volumeAutomation;
+    rig.settle();
+    const float tracksTop =
+        rig.origin.y + kRulerHeight + kMarkerLaneHeight;
+    const float automationTop = tracksTop + effectiveTrackHeight();
+    rig.clickTimelineAt(rig.origin.x + 17.0f,
+                        tracksTop + kTrackHeight * 0.5f);
+    rig.clickTimelineAt(rig.origin.x + 192.0f, automationTop + 16.0f);
+    REQUIRE(rig.view.automationTool == gui::AutomationTool::Line);
+
+    auto volumeY = [&](double db) {
+        return automationTop + 8.0f +
+            static_cast<float>((document::kMaxVolumeAutomationDb - db) /
+                (document::kMaxVolumeAutomationDb -
+                 document::kMinVolumeAutomationDb)) *
+                (kAutomationLaneHeight - 16.0f);
+    };
+    const float x0 = rig.origin.x + kGutterWidth + 100.0f;
+    const float x1 = rig.origin.x + kGutterWidth + 300.0f;
+    rig.tick(x0, volumeY(-24.0), false);
+    rig.tick(x0, volumeY(-24.0), true);
+    rig.tick(x1, volumeY(0.0), true);
+    rig.tick(x1, volumeY(0.0), false);
+
+    const auto& ramp = rig.edit.track(track)->volumeAutomation;
+    REQUIRE(ramp.size() == 4);
+    CHECK(rig.undo.undoDepth() == 1);
+    CHECK(ramp[0] == before[0]);
+    CHECK(ramp[1].sample == 50000);
+    CHECK(ramp[1].db == Catch::Approx(-24.0).margin(1.2));
+    CHECK(ramp[2].sample == 150000);
+    CHECK(ramp[2].db == Catch::Approx(0.0).margin(1.2));
+    CHECK(ramp[3] == before[2]);
+    const std::string firstRampId = ramp[1].id;
+    const std::string lastRampId = ramp[2].id;
+    CHECK_FALSE(firstRampId.empty());
+    CHECK_FALSE(lastRampId.empty());
+
+    rig.undo.undo();
+    CHECK(rig.edit.track(track)->volumeAutomation == before);
+    rig.undo.redo();
+    CHECK(rig.edit.track(track)->volumeAutomation[1].id == firstRampId);
+    CHECK(rig.edit.track(track)->volumeAutomation[2].id == lastRampId);
+}
+
+TEST_CASE("line tool draws pan automation with normalized values",
+          "[timelinelayout][automation][tools][pan]") {
+    LayoutRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string track = rig.edit.addTrack("Dialog");
+    rig.view.automationParameters[track] = gui::AutomationParameter::Pan;
+    rig.settle();
+    const float tracksTop =
+        rig.origin.y + kRulerHeight + kMarkerLaneHeight;
+    const float automationTop = tracksTop + effectiveTrackHeight();
+    rig.clickTimelineAt(rig.origin.x + 17.0f,
+                        tracksTop + kTrackHeight * 0.5f);
+    rig.clickTimelineAt(rig.origin.x + 192.0f, automationTop + 16.0f);
+    REQUIRE(rig.view.automationTool == gui::AutomationTool::Line);
+
+    auto panY = [&](double pan) {
+        return automationTop + 8.0f +
+            static_cast<float>((1.0 - pan) / 2.0) *
+                (kAutomationLaneHeight - 16.0f);
+    };
+    const float x0 = rig.origin.x + kGutterWidth + 100.0f;
+    const float x1 = rig.origin.x + kGutterWidth + 300.0f;
+    rig.tick(x0, panY(-0.75), false);
+    rig.tick(x0, panY(-0.75), true);
+    rig.tick(x1, panY(0.5), true);
+    rig.tick(x1, panY(0.5), false);
+
+    const auto& ramp = rig.edit.track(track)->panAutomation;
+    REQUIRE(ramp.size() == 2);
+    CHECK(ramp[0].sample == 50000);
+    CHECK(ramp[0].pan == Catch::Approx(-0.75).margin(0.04));
+    CHECK(ramp[1].sample == 150000);
+    CHECK(ramp[1].pan == Catch::Approx(0.5).margin(0.04));
+    CHECK(rig.undo.undoDepth() == 1);
+    rig.undo.undo();
+    CHECK(rig.edit.track(track)->panAutomation.empty());
+}
+
+TEST_CASE("curve tool draws a parabolic ramp as one undoable gesture",
+          "[timelinelayout][automation][tools][curve]") {
+    LayoutRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string track = rig.edit.addTrack("Dialog");
+    rig.settle();
+    const float tracksTop =
+        rig.origin.y + kRulerHeight + kMarkerLaneHeight;
+    const float automationTop = tracksTop + effectiveTrackHeight();
+    rig.clickTimelineAt(rig.origin.x + 17.0f,
+                        tracksTop + kTrackHeight * 0.5f);
+    rig.clickTimelineAt(rig.origin.x + 216.0f, automationTop + 16.0f);
+    REQUIRE(rig.view.automationTool == gui::AutomationTool::Curve);
+
+    auto volumeY = [&](double db) {
+        return automationTop + 8.0f +
+            static_cast<float>((document::kMaxVolumeAutomationDb - db) /
+                (document::kMaxVolumeAutomationDb -
+                 document::kMinVolumeAutomationDb)) *
+                (kAutomationLaneHeight - 16.0f);
+    };
+    const float x0 = rig.origin.x + kGutterWidth + 100.0f;
+    const float x1 = rig.origin.x + kGutterWidth + 300.0f;
+    rig.tick(x0, volumeY(-48.0), false);
+    rig.tick(x0, volumeY(-48.0), true);
+    rig.tick(x1, volumeY(0.0), true);
+    rig.tick(x1, volumeY(0.0), false);
+
+    const auto& curve = rig.edit.track(track)->volumeAutomation;
+    REQUIRE(curve.size() > 10);
+    CHECK(rig.undo.undoDepth() == 1);
+    CHECK(std::adjacent_find(
+              curve.begin(), curve.end(), [](const auto& a, const auto& b) {
+                  return a.sample >= b.sample;
+              }) == curve.end());
+    const auto midpoint = std::find_if(
+        curve.begin(), curve.end(), [](const auto& point) {
+            return point.sample == 100000;
+        });
+    REQUIRE(midpoint != curve.end());
+    // t^2 at the halfway point is 0.25: -48 + (48 * 0.25) = -36 dB.
+    CHECK(midpoint->db == Catch::Approx(-36.0).margin(1.5));
+    CHECK(curve.front().db == Catch::Approx(-48.0).margin(1.5));
+    CHECK(curve.back().db == Catch::Approx(0.0).margin(1.5));
+
+    rig.undo.undo();
+    CHECK(rig.edit.track(track)->volumeAutomation.empty());
+}
+
+TEST_CASE("Command changes the curve tool to logarithmic pan automation",
+          "[timelinelayout][automation][tools][curve][pan]") {
+    LayoutRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string track = rig.edit.addTrack("Dialog");
+    rig.view.automationParameters[track] = gui::AutomationParameter::Pan;
+    rig.settle();
+    const float tracksTop =
+        rig.origin.y + kRulerHeight + kMarkerLaneHeight;
+    const float automationTop = tracksTop + effectiveTrackHeight();
+    rig.clickTimelineAt(rig.origin.x + 17.0f,
+                        tracksTop + kTrackHeight * 0.5f);
+    rig.clickTimelineAt(rig.origin.x + 216.0f, automationTop + 16.0f);
+    REQUIRE(rig.view.automationTool == gui::AutomationTool::Curve);
+
+    auto panY = [&](double pan) {
+        return automationTop + 8.0f +
+            static_cast<float>((1.0 - pan) / 2.0) *
+                (kAutomationLaneHeight - 16.0f);
+    };
+    const float x0 = rig.origin.x + kGutterWidth + 100.0f;
+    const float x1 = rig.origin.x + kGutterWidth + 300.0f;
+    rig.holdSuper(true);
+    rig.tick(x0, panY(-1.0), false);
+    rig.tick(x0, panY(-1.0), true);
+    CHECK(rig.view.automationDrawLogarithmic);
+    rig.tick(x1, panY(1.0), true);
+    rig.tick(x1, panY(1.0), false);
+    rig.holdSuper(false);
+    rig.settle();
+
+    const auto& curve = rig.edit.track(track)->panAutomation;
+    REQUIRE(curve.size() > 10);
+    CHECK(rig.undo.undoDepth() == 1);
+    const auto midpoint = std::find_if(
+        curve.begin(), curve.end(), [](const auto& point) {
+            return point.sample == 100000;
+        });
+    REQUIRE(midpoint != curve.end());
+    const double expected = -1.0 + 2.0 * std::log10(5.5);
+    CHECK(midpoint->pan == Catch::Approx(expected).margin(0.05));
+    // The same endpoints with the default parabola would be at -0.5 here.
+    CHECK(midpoint->pan > 0.4);
+    CHECK_FALSE(rig.view.automationDrawLogarithmic);
+
+    rig.undo.undo();
+    CHECK(rig.edit.track(track)->panAutomation.empty());
+}
+
 TEST_CASE("double-clicking an automation point opens an undoable dB editor",
           "[timelinelayout][automation]") {
     LayoutRig rig;
@@ -941,7 +1260,7 @@ TEST_CASE("double-clicking an automation point opens an undoable dB editor",
     // 90,000 samples at 500 samples/pixel is 180 px into the lane. The
     // envelope spans +6 to -60 dB between its 8 px vertical insets.
     const float pointX = rig.origin.x + kGutterWidth + 180.0f;
-    const float automationTop = tracksTop + kTrackHeight;
+    const float automationTop = tracksTop + effectiveTrackHeight();
     const float graphHeight = kAutomationLaneHeight - 16.0f;
     const float pointY = automationTop + 8.0f +
         static_cast<float>((document::kMaxVolumeAutomationDb - 0.0) /
@@ -994,7 +1313,7 @@ TEST_CASE("pan automation lane edits normalized pan with percent entry",
     // 90,000 samples at 500 samples/pixel is 180 px into the lane. Pan -0.5
     // sits three quarters of the way down the -1..+1 graph.
     const float pointX = rig.origin.x + kGutterWidth + 180.0f;
-    const float automationTop = tracksTop + kTrackHeight;
+    const float automationTop = tracksTop + effectiveTrackHeight();
     const float graphHeight = kAutomationLaneHeight - 16.0f;
     const float pointY = automationTop + 8.0f + graphHeight * 0.75f;
     rig.doubleClickTimelineAt(pointX, pointY);

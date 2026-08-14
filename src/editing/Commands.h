@@ -900,6 +900,36 @@ private:
     size_t index_ = 0;
 };
 
+class ReplaceVolumeAutomationCommand : public Command {
+public:
+    ReplaceVolumeAutomationCommand(
+        std::string ownerId,
+        std::vector<document::VolumeAutomationPoint> points)
+        : ownerId_(std::move(ownerId)), after_(std::move(points)) {}
+    void perform(document::Edit& edit) override {
+        if (!initialized_) {
+            if (const auto* points = edit.volumeAutomation(ownerId_)) {
+                before_ = *points;
+            }
+            initialized_ = true;
+        }
+        if (edit.replaceVolumeAutomation(ownerId_, after_)) {
+            if (const auto* points = edit.volumeAutomation(ownerId_)) {
+                after_ = *points;
+            }
+        }
+    }
+    void undo(document::Edit& edit) override {
+        edit.replaceVolumeAutomation(ownerId_, before_);
+    }
+    std::string name() const override { return "Draw Volume Automation"; }
+private:
+    std::string ownerId_;
+    std::vector<document::VolumeAutomationPoint> before_;
+    std::vector<document::VolumeAutomationPoint> after_;
+    bool initialized_ = false;
+};
+
 class AddPanAutomationPointCommand : public Command {
 public:
     AddPanAutomationPointCommand(std::string ownerId, int64_t sample,
@@ -991,6 +1021,36 @@ private:
     std::string pointId_;
     document::PanAutomationPoint point_;
     size_t index_ = 0;
+};
+
+class ReplacePanAutomationCommand : public Command {
+public:
+    ReplacePanAutomationCommand(
+        std::string ownerId,
+        std::vector<document::PanAutomationPoint> points)
+        : ownerId_(std::move(ownerId)), after_(std::move(points)) {}
+    void perform(document::Edit& edit) override {
+        if (!initialized_) {
+            if (const auto* points = edit.panAutomation(ownerId_)) {
+                before_ = *points;
+            }
+            initialized_ = true;
+        }
+        if (edit.replacePanAutomation(ownerId_, after_)) {
+            if (const auto* points = edit.panAutomation(ownerId_)) {
+                after_ = *points;
+            }
+        }
+    }
+    void undo(document::Edit& edit) override {
+        edit.replacePanAutomation(ownerId_, before_);
+    }
+    std::string name() const override { return "Draw Pan Automation"; }
+private:
+    std::string ownerId_;
+    std::vector<document::PanAutomationPoint> before_;
+    std::vector<document::PanAutomationPoint> after_;
+    bool initialized_ = false;
 };
 
 class SetMainRouteCommand : public Command {

@@ -32,6 +32,7 @@ bool AudioClipNode::loadFromFile(const std::string& path) {
     // Decode as interleaved float first, then deinterleave.
     const drwav_uint64 totalFrames = wav.totalPCMFrameCount;
     const drwav_uint32 channels = wav.channels;
+    const double sampleRate = static_cast<double>(wav.sampleRate);
     std::vector<float> interleaved(static_cast<size_t>(totalFrames) * channels);
     const drwav_uint64 decoded = drwav_read_pcm_frames_f32(
         &wav, totalFrames, interleaved.data());
@@ -43,19 +44,20 @@ bool AudioClipNode::loadFromFile(const std::string& path) {
     }
 
     // Deinterleave into per-channel vectors.
-    std::vector<std::vector<float>> deinterleaved(channels);
-    for (auto& ch : deinterleaved) {
+    auto decodedAsset = std::make_shared<audio::DecodedAudioAsset>();
+    decodedAsset->sampleRate = sampleRate;
+    decodedAsset->channels.resize(channels);
+    for (auto& ch : decodedAsset->channels) {
         ch.resize(static_cast<size_t>(decoded));
     }
     for (drwav_uint64 i = 0; i < decoded; ++i) {
         for (drwav_uint32 c = 0; c < channels; ++c) {
-            deinterleaved[c][i] = interleaved[static_cast<size_t>(i) * channels + c];
+            decodedAsset->channels[c][i] =
+                interleaved[static_cast<size_t>(i) * channels + c];
         }
     }
 
-    ownedBuffer_ = std::move(deinterleaved);
-    buffer_ = &ownedBuffer_;
-    sourceSampleRate_ = static_cast<double>(wav.sampleRate);
+    setBuffer(std::move(decodedAsset));
     return true;
 }
 

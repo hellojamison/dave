@@ -589,14 +589,45 @@ void drawTimeline(const document::Edit& edit,
                   PeakCache& peaks,
                   TimelineViewState& view,
                   const std::unordered_map<std::string,
-                      std::vector<std::vector<float>>>& assetBuffers,
+                      audio::DecodedAudioAssetPtr>& assetBuffers,
                   float trackHeight,
-                  float timelineHeight) {
+                  float timelineHeight,
+                  const TransientSnapshotMap& transientAnalyses) {
     // Draw directly into the host window's draw list (no child windows — they
     // introduce scrolling/sizing bugs that hid the clips in RB-2's first cut).
     // The gutter width follows the controls it contains; the remaining canvas
     // stays dedicated to clips, waveforms, and timeline interaction.
     ImDrawList* dl = ImGui::GetWindowDrawList();
+    view.timelineKeyboardFocus = ImGui::IsWindowFocused(
+        ImGuiFocusedFlags_RootAndChildWindows);
+    if (view.timelineKeyboardFocus && !ImGui::GetIO().WantTextInput) {
+#ifdef __APPLE__
+        constexpr bool macOS = true;
+#else
+        constexpr bool macOS = false;
+#endif
+        if (ImGui::Shortcut(transientNavigationShortcut(
+                macOS, NavigationDirection::Previous, true))) {
+            view.requestTransientNavigation = true;
+            view.transientNavigationDirection = NavigationDirection::Previous;
+            view.requestTransientSelectionExtension = true;
+        } else if (ImGui::Shortcut(transientNavigationShortcut(
+                       macOS, NavigationDirection::Next, true))) {
+            view.requestTransientNavigation = true;
+            view.transientNavigationDirection = NavigationDirection::Next;
+            view.requestTransientSelectionExtension = true;
+        } else if (ImGui::Shortcut(transientNavigationShortcut(
+                       macOS, NavigationDirection::Previous, false))) {
+            view.requestTransientNavigation = true;
+            view.transientNavigationDirection = NavigationDirection::Previous;
+            view.requestTransientSelectionExtension = false;
+        } else if (ImGui::Shortcut(transientNavigationShortcut(
+                       macOS, NavigationDirection::Next, false))) {
+            view.requestTransientNavigation = true;
+            view.transientNavigationDirection = NavigationDirection::Next;
+            view.requestTransientSelectionExtension = false;
+        }
+    }
     ImVec2 origin = ImGui::GetCursorScreenPos();
     ImVec2 avail = ImGui::GetContentRegionAvail();
     // 260 matches PTXExtractor's default track-header width, which is sized to
@@ -977,6 +1008,14 @@ void drawTimeline(const document::Edit& edit,
         view.automationEditOwnerId.clear();
         view.automationEditPointId.clear();
     }
+    if (view.drawingAutomation &&
+        !view.expandedTracks.contains(view.drawingAutomationOwnerId)) {
+        view.drawingAutomation = false;
+        view.drawingAutomationOwnerId.clear();
+        view.automationDrawOriginal.clear();
+        view.automationDrawStroke.clear();
+        view.automationDrawLogarithmic = false;
+    }
     const bool automationEditorOpenAtFrameStart =
         view.editingAutomationValue;
     auto drawAutomationLane = [&](
@@ -1024,16 +1063,159 @@ void drawTimeline(const document::Edit& edit,
                         view.automationEditOwnerId.clear();
                         view.automationEditPointId.clear();
                     }
+                    if (view.drawingAutomationOwnerId == ownerId) {
+                        view.drawingAutomation = false;
+                        view.drawingAutomationOwnerId.clear();
+                        view.automationDrawOriginal.clear();
+                        view.automationDrawStroke.clear();
+                        view.automationDrawLogarithmic = false;
+                    }
                     automationConsumedClick = true;
                 }
                 if (selected) ImGui::SetItemDefaultFocus();
             }
             ImGui::EndCombo();
         }
-        automationMouseOver = automationMouseOver || ImGui::IsItemHovered();
-        if (ImGui::IsItemHovered()) {
+        const bool parameterHovered = ImGui::IsItemHovered();
+        automationMouseOver = automationMouseOver || parameterHovered;
+        if (parameterHovered) {
             ImGui::SetTooltip("Automation parameter");
         }
+
+        const ImVec2 toolSize(24.0f, 22.0f);
+        constexpr float toolGap = 4.0f;
+        const float toolsLeft = origin.x + 148.0f;
+        auto drawToolButton = [&](const char* id, AutomationTool tool,
+                                  float left, const char* tooltip) {
+            const ImVec2 buttonMin(left, top + 5.0f);
+            const ImVec2 buttonMax(buttonMin.x + toolSize.x,
+                                   buttonMin.y + toolSize.y);
+            ImGui::SetCursorScreenPos(buttonMin);
+            ImGui::InvisibleButton(id, toolSize);
+            const bool hovered = ImGui::IsItemHovered();
+            const bool selected = view.automationTool == tool;
+            if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+                view.automationTool = tool;
+                view.draggingAutomation = false;
+                view.automationOwnerId.clear();
+                view.automationPointId.clear();
+                view.drawingAutomation = false;
+                view.drawingAutomationOwnerId.clear();
+                view.automationDrawOriginal.clear();
+                view.automationDrawStroke.clear();
+                view.automationDrawLogarithmic = false;
+                automationConsumedClick = true;
+            }
+            const ImU32 buttonFill = C(selected ? pal.surfaceStrong
+                                                : pal.trackControlInactive);
+            dl->AddRectFilled(buttonMin, buttonMax, buttonFill, 3.0f);
+            dl->AddRect(buttonMin, buttonMax,
+                        C(selected ? pal.accentStrong
+                                   : hovered ? pal.borderStrong : pal.border),
+                        3.0f, 0, selected ? 1.5f : 1.0f);
+            const ImU32 iconColor = C(selected ? pal.primaryText
+                                               : pal.textMuted);
+            if (tool == AutomationTool::Pencil) {
+                // A conventional edit-pencil silhouette: graphite at the
+                // lower-left, a broad yellow body, metal ferrule, then eraser.
+                // Keeping each physical part visible is what prevents a 24 px
+                // tool icon from collapsing back into an abstract slash.
+                const ImU32 outline = IM_COL32(36, 33, 30, 255);
+                const ImU32 yellow = IM_COL32(244, 190, 54, 255);
+                const ImU32 highlight = IM_COL32(255, 226, 116, 255);
+                const ImU32 eraserColor = IM_COL32(224, 126, 143, 255);
+                const ImU32 ferruleColor = IM_COL32(172, 181, 181, 255);
+                const ImU32 wood = IM_COL32(226, 187, 132, 255);
+                const ImU32 graphite = IM_COL32(32, 31, 29, 255);
+
+                const ImVec2 tip(buttonMin.x + 3.2f, buttonMin.y + 20.6f);
+                const ImVec2 bodyUpper(buttonMin.x + 5.4f,
+                                       buttonMin.y + 14.2f);
+                const ImVec2 bodyLower(buttonMin.x + 9.8f,
+                                       buttonMin.y + 18.6f);
+                const ImVec2 ferruleUpper(buttonMin.x + 12.6f,
+                                          buttonMin.y + 7.0f);
+                const ImVec2 ferruleLower(buttonMin.x + 17.0f,
+                                          buttonMin.y + 11.4f);
+                const ImVec2 eraserUpper(buttonMin.x + 16.1f,
+                                         buttonMin.y + 3.5f);
+                const ImVec2 eraserLower(buttonMin.x + 20.5f,
+                                         buttonMin.y + 7.9f);
+
+                const ImVec2 body[4] = {
+                    bodyUpper, ferruleUpper, ferruleLower, bodyLower,
+                };
+                dl->AddConvexPolyFilled(body, 4, yellow);
+                dl->AddTriangleFilled(tip, bodyUpper, bodyLower, wood);
+
+                const ImVec2 ferrule[4] = {
+                    ferruleUpper,
+                    ImVec2(buttonMin.x + 14.7f, buttonMin.y + 4.9f),
+                    ImVec2(buttonMin.x + 19.1f, buttonMin.y + 9.3f),
+                    ferruleLower,
+                };
+                dl->AddConvexPolyFilled(ferrule, 4, ferruleColor);
+
+                const ImVec2 eraser[4] = {
+                    eraserUpper,
+                    ImVec2(buttonMin.x + 18.2f, buttonMin.y + 1.4f),
+                    ImVec2(buttonMin.x + 22.6f, buttonMin.y + 5.8f),
+                    eraserLower,
+                };
+                dl->AddConvexPolyFilled(eraser, 4, eraserColor);
+
+                const ImVec2 leadUpper(buttonMin.x + 3.9f,
+                                       buttonMin.y + 18.5f);
+                const ImVec2 leadLower(buttonMin.x + 5.3f,
+                                       buttonMin.y + 19.9f);
+                dl->AddTriangleFilled(tip, leadUpper, leadLower, graphite);
+                dl->AddLine(ImVec2(buttonMin.x + 8.0f,
+                                   buttonMin.y + 14.4f),
+                            ImVec2(buttonMin.x + 14.0f,
+                                   buttonMin.y + 8.4f),
+                            highlight, 1.2f);
+
+                const ImVec2 silhouette[7] = {
+                    tip, bodyUpper, ferruleUpper, eraserUpper,
+                    ImVec2(buttonMin.x + 22.6f, buttonMin.y + 5.8f),
+                    eraserLower, bodyLower,
+                };
+                dl->AddPolyline(silhouette, 7, outline,
+                                ImDrawFlags_Closed, 1.4f);
+            } else if (tool == AutomationTool::Curve) {
+                constexpr int curveSegments = 10;
+                ImVec2 curve[curveSegments + 1];
+                for (int segment = 0; segment <= curveSegments; ++segment) {
+                    const float t = static_cast<float>(segment) /
+                                    static_cast<float>(curveSegments);
+                    curve[segment] = ImVec2(
+                        buttonMin.x + 5.0f + 14.0f * t,
+                        buttonMin.y + 16.0f - 10.0f * t * t);
+                }
+                dl->AddPolyline(curve, curveSegments + 1, iconColor,
+                                ImDrawFlags_None, 1.8f);
+                dl->AddCircleFilled(curve[0], 1.8f, iconColor);
+                dl->AddCircleFilled(curve[curveSegments], 1.8f, iconColor);
+            } else {
+                const ImVec2 a(buttonMin.x + 6.0f, buttonMin.y + 16.0f);
+                const ImVec2 b(buttonMin.x + 18.0f, buttonMin.y + 6.0f);
+                dl->AddLine(a, b, iconColor, 1.8f);
+                dl->AddCircleFilled(a, 2.0f, iconColor);
+                dl->AddCircleFilled(b, 2.0f, iconColor);
+            }
+            automationMouseOver = automationMouseOver || hovered;
+            if (hovered) ImGui::SetTooltip("%s", tooltip);
+        };
+        ImGui::PushID("automationTools");
+        drawToolButton("##pencil", AutomationTool::Pencil, toolsLeft,
+                       "Pencil: drag to draw automation");
+        drawToolButton("##line", AutomationTool::Line,
+                       toolsLeft + toolSize.x + toolGap,
+                       "Line: drag a straight automation ramp");
+        drawToolButton("##curve", AutomationTool::Curve,
+                       toolsLeft + 2.0f * (toolSize.x + toolGap),
+                       "Curve: drag a parabolic ramp; hold Command (Ctrl on Windows) for logarithmic");
+        ImGui::PopID();
         ImGui::PopID();
         ImGui::SetCursorScreenPos(savedParameterCursor);
 
@@ -1081,6 +1263,125 @@ void drawTimeline(const document::Edit& edit,
             return static_cast<float>(laneLeft +
                 (sample - view.scrollSamples) / view.samplesPerPixel);
         };
+        auto clearDrawingGesture = [&] {
+            view.drawingAutomation = false;
+            view.drawingAutomationOwnerId.clear();
+            view.automationDrawOriginal.clear();
+            view.automationDrawStroke.clear();
+            view.automationDrawLogarithmic = false;
+        };
+        auto upsertStrokePoint = [&](int64_t sample, double value) {
+            auto& stroke = view.automationDrawStroke;
+            const auto at = std::lower_bound(
+                stroke.begin(), stroke.end(), sample,
+                [](const auto& point, int64_t position) {
+                    return point.sample < position;
+                });
+            if (at != stroke.end() && at->sample == sample) {
+                at->db = clampLaneValue(value);
+                return;
+            }
+            stroke.insert(at, document::VolumeAutomationPoint{
+                                  {}, sample, clampLaneValue(value)});
+        };
+        auto updateDrawingGesture = [&] {
+            if (!view.drawingAutomation ||
+                view.drawingAutomationOwnerId != ownerId ||
+                view.drawingAutomationParameter != parameter) {
+                return;
+            }
+            if (view.drawingAutomationTool == AutomationTool::Line) {
+                view.automationDrawStroke.clear();
+                upsertStrokePoint(view.automationDrawAnchor.sample,
+                                  view.automationDrawAnchor.db);
+                upsertStrokePoint(xToSample(mouse.x), yToValue(mouse.y));
+            } else if (view.drawingAutomationTool == AutomationTool::Curve) {
+                view.automationDrawStroke.clear();
+                const float anchorX = sampleToX(
+                    view.automationDrawAnchor.sample);
+                const float dx = mouse.x - anchorX;
+                constexpr float pointSpacing = 6.0f;
+                const int steps = std::max(
+                    1, static_cast<int>(std::ceil(
+                           std::fabs(dx) / pointSpacing)));
+                const double startValue = view.automationDrawAnchor.db;
+                const double endValue = yToValue(mouse.y);
+                for (int step = 0; step <= steps; ++step) {
+                    const double t = static_cast<double>(step) /
+                                     static_cast<double>(steps);
+                    // A finite, endpoint-preserving logarithmic mapping makes
+                    // Command useful for both volume and bipolar pan lanes.
+                    const double shaped = view.automationDrawLogarithmic
+                        ? std::log10(1.0 + 9.0 * t)
+                        : t * t;
+                    const float x = anchorX + dx * static_cast<float>(t);
+                    const double value = startValue +
+                        (endValue - startValue) * shaped;
+                    upsertStrokePoint(xToSample(x), value);
+                }
+            } else {
+                const float dx = mouse.x - view.automationDrawLastX;
+                const float dy = mouse.y - view.automationDrawLastY;
+                constexpr float pointSpacing = 6.0f;
+                const int steps = std::max(
+                    1, static_cast<int>(std::ceil(
+                           std::hypot(dx, dy) / pointSpacing)));
+                for (int step = 1; step <= steps; ++step) {
+                    const float amount = static_cast<float>(step) /
+                                         static_cast<float>(steps);
+                    const float x = view.automationDrawLastX + dx * amount;
+                    const float y = view.automationDrawLastY + dy * amount;
+                    upsertStrokePoint(xToSample(x), yToValue(y));
+                }
+            }
+            view.automationDrawLastX = mouse.x;
+            view.automationDrawLastY = mouse.y;
+        };
+        auto envelopeWithStroke = [&] {
+            auto result = view.automationDrawOriginal;
+            if (view.automationDrawStroke.empty()) return result;
+            const int64_t first = view.automationDrawStroke.front().sample;
+            const int64_t last = view.automationDrawStroke.back().sample;
+            result.erase(std::remove_if(result.begin(), result.end(),
+                                        [&](const auto& point) {
+                                            return point.sample >= first &&
+                                                   point.sample <= last;
+                                        }),
+                         result.end());
+            for (auto point : view.automationDrawStroke) {
+                const auto existing = std::find_if(
+                    view.automationDrawOriginal.begin(),
+                    view.automationDrawOriginal.end(), [&](const auto& before) {
+                        return before.sample == point.sample;
+                    });
+                if (existing != view.automationDrawOriginal.end()) {
+                    point.id = existing->id;
+                }
+                result.push_back(std::move(point));
+            }
+            std::sort(result.begin(), result.end(), [](const auto& a,
+                                                       const auto& b) {
+                return a.sample < b.sample;
+            });
+            return result;
+        };
+        auto replaceEnvelope = [&](
+            const std::vector<document::VolumeAutomationPoint>& points) {
+            if (isPan) {
+                std::vector<document::PanAutomationPoint> panPoints;
+                panPoints.reserve(points.size());
+                for (const auto& point : points) {
+                    panPoints.push_back(
+                        {point.id, point.sample, point.db});
+                }
+                undo.execute(std::make_unique<
+                    editing::ReplacePanAutomationCommand>(
+                    ownerId, std::move(panPoints)));
+            } else {
+                undo.execute(std::make_unique<
+                    editing::ReplaceVolumeAutomationCommand>(ownerId, points));
+            }
+        };
         auto movePoint = [&](const document::VolumeAutomationPoint& point) {
             if (isPan) {
                 document::PanAutomationPoint panPoint;
@@ -1094,17 +1395,6 @@ void drawTimeline(const document::Edit& edit,
                 undo.execute(std::make_unique<
                     editing::MoveVolumeAutomationPointCommand>(
                     ownerId, point));
-            }
-        };
-        auto addPoint = [&](int64_t sample, double value) {
-            if (isPan) {
-                undo.execute(std::make_unique<
-                    editing::AddPanAutomationPointCommand>(
-                    ownerId, sample, value));
-            } else {
-                undo.execute(std::make_unique<
-                    editing::AddVolumeAutomationPointCommand>(
-                    ownerId, sample, value));
             }
         };
         auto removePoint = [&](const std::string& pointId) {
@@ -1137,6 +1427,13 @@ void drawTimeline(const document::Edit& edit,
             }
         }
 
+        if (view.drawingAutomation &&
+            view.drawingAutomationOwnerId == ownerId &&
+            view.drawingAutomationParameter == parameter &&
+            ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            updateDrawingGesture();
+        }
+
         std::vector<document::VolumeAutomationPoint> previewPoints;
         const auto* drawPoints = &storedPoints;
         if (view.draggingAutomation &&
@@ -1155,6 +1452,11 @@ void drawTimeline(const document::Edit& edit,
                           });
                 drawPoints = &previewPoints;
             }
+        } else if (view.drawingAutomation &&
+                   view.drawingAutomationOwnerId == ownerId &&
+                   view.drawingAutomationParameter == parameter) {
+            previewPoints = envelopeWithStroke();
+            drawPoints = &previewPoints;
         }
 
         const int64_t visibleStart = std::max<int64_t>(
@@ -1213,13 +1515,31 @@ void drawTimeline(const document::Edit& edit,
             mouse.y >= top && mouse.y <= bottom;
         automationMouseOver = automationMouseOver || laneHovered;
         if (laneHovered && !hoveredPointId.empty()) {
-            ImGui::SetTooltip(isPan
-                ? "Drag to move; double-click to enter pan; right-click to delete"
-                : "Drag to move; double-click to enter dB; right-click to delete");
+            if (view.automationTool == AutomationTool::Line) {
+                ImGui::SetTooltip(
+                    "Drag a straight ramp; double-click to enter a value; "
+                    "right-click to delete");
+            } else if (view.automationTool == AutomationTool::Curve) {
+                ImGui::SetTooltip(
+                    "Drag a parabolic ramp; hold Command (Ctrl on Windows) "
+                    "for logarithmic; "
+                    "double-click to enter a value; right-click to delete");
+            } else {
+                ImGui::SetTooltip(isPan
+                    ? "Drag to move; double-click to enter pan; right-click to delete"
+                    : "Drag to move; double-click to enter dB; right-click to delete");
+            }
         } else if (laneHovered) {
-            ImGui::SetTooltip(isPan
-                ? "Click to add a pan automation point"
-                : "Click to add a volume automation point");
+            if (view.automationTool == AutomationTool::Line) {
+                ImGui::SetTooltip("Drag a straight automation ramp");
+            } else if (view.automationTool == AutomationTool::Curve) {
+                ImGui::SetTooltip(
+                    "Drag a parabolic automation ramp; hold Command "
+                    "(Ctrl on Windows) for logarithmic");
+            } else {
+                ImGui::SetTooltip(
+                    "Drag to draw automation; click to add one point");
+            }
         }
 
         const bool opensValueEditor =
@@ -1326,6 +1646,18 @@ void drawTimeline(const document::Edit& edit,
             editingValueAtFrameStart || opensValueEditor) {
             automationConsumedClick = true;
         } else if (!automationConsumedClick &&
+                   view.drawingAutomation &&
+                   view.drawingAutomationOwnerId == ownerId &&
+                   view.drawingAutomationParameter == parameter) {
+            if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+                const auto replacement = envelopeWithStroke();
+                if (replacement != view.automationDrawOriginal) {
+                    replaceEnvelope(replacement);
+                }
+                clearDrawingGesture();
+            }
+            automationConsumedClick = true;
+        } else if (!automationConsumedClick &&
                    view.draggingAutomation &&
                    view.automationOwnerId == ownerId &&
                    view.activeAutomationParameter == parameter) {
@@ -1359,7 +1691,8 @@ void drawTimeline(const document::Edit& edit,
                 storedPoints.begin(), storedPoints.end(), [&](const auto& point) {
                     return point.id == hoveredPointId;
                 });
-            if (found != storedPoints.end()) {
+            if (view.automationTool == AutomationTool::Pencil &&
+                found != storedPoints.end()) {
                 view.draggingAutomation = true;
                 view.activeAutomationParameter = parameter;
                 view.automationOwnerId = ownerId;
@@ -1367,20 +1700,25 @@ void drawTimeline(const document::Edit& edit,
                 view.automationOriginal = *found;
                 view.automationPreview = *found;
             } else {
-                const int64_t sample = xToSample(mouse.x);
-                const double value = clampLaneValue(yToValue(mouse.y));
-                const auto sameSample = std::find_if(
-                    storedPoints.begin(), storedPoints.end(),
-                    [sample](const auto& point) {
-                        return point.sample == sample;
-                    });
-                if (sameSample != storedPoints.end()) {
-                    auto moved = *sameSample;
-                    moved.db = value;
-                    movePoint(moved);
-                } else {
-                    addPoint(sample, value);
-                }
+                view.draggingAutomation = false;
+                view.automationOwnerId.clear();
+                view.automationPointId.clear();
+                view.drawingAutomation = true;
+                view.drawingAutomationParameter = parameter;
+                view.drawingAutomationTool = view.automationTool;
+                view.automationDrawLogarithmic =
+                    view.automationTool == AutomationTool::Curve &&
+                    ImGui::GetIO().KeyCtrl;
+                view.drawingAutomationOwnerId = ownerId;
+                view.automationDrawOriginal = storedPoints;
+                view.automationDrawStroke.clear();
+                view.automationDrawAnchor = {
+                    {}, xToSample(mouse.x),
+                    clampLaneValue(yToValue(mouse.y))};
+                view.automationDrawLastX = mouse.x;
+                view.automationDrawLastY = mouse.y;
+                upsertStrokePoint(view.automationDrawAnchor.sample,
+                                  view.automationDrawAnchor.db);
             }
             automationConsumedClick = true;
         }
@@ -1578,9 +1916,10 @@ void drawTimeline(const document::Edit& edit,
 
             // Waveform (lighter than the body so it reads).
             auto bufIt = assetBuffers.find(clip.asset.sha256);
-            if (bufIt != assetBuffers.end()) {
+            if (bufIt != assetBuffers.end() && bufIt->second) {
                 const int spp = std::max(1, static_cast<int>(view.samplesPerPixel));
-                const auto& level = peaks.get(clip.asset.sha256, bufIt->second, spp);
+                const auto& level = peaks.get(
+                    clip.asset.sha256, bufIt->second->channels, spp);
                 const float waveformTop = headerBottom + 4.0f;
                 const float waveformBottom = clipRect.max.y - 4.0f;
                 const float waveformMidY = (waveformTop + waveformBottom) * 0.5f;
@@ -1630,6 +1969,57 @@ void drawTimeline(const document::Edit& edit,
                 view.selectedClipId = clip.id;
                 view.selectedTrackIndex = static_cast<int>(ti);
                 ImGui::OpenPopup("##clip_ctx");
+            }
+        }
+
+        if (selected && view.showTransientTicks) {
+            std::vector<TransientTickPosition> ticks;
+            const float threshold = audio::TransientDetector::
+                thresholdForSensitivity(view.transientSensitivity);
+            for (const auto& clip : track.clips) {
+                const auto analysis = transientAnalyses.find(clip.asset.sha256);
+                if (analysis == transientAnalyses.end() ||
+                    analysis->second.status !=
+                        audio::TransientAnalysisCache::Status::Ready ||
+                    !analysis->second.candidates || clip.length <= 0) {
+                    continue;
+                }
+                const int64_t sourceBegin = std::max<int64_t>(0, clip.sourceOffset);
+                const int64_t sourceEnd = sourceBegin <=
+                        std::numeric_limits<int64_t>::max() - clip.length
+                    ? sourceBegin + clip.length
+                    : std::numeric_limits<int64_t>::max();
+                for (const auto& candidate : *analysis->second.candidates) {
+                    if (candidate.strength < threshold ||
+                        candidate.sourceSample < sourceBegin ||
+                        candidate.sourceSample >= sourceEnd) {
+                        continue;
+                    }
+                    const int64_t candidateOffset =
+                        candidate.sourceSample - sourceBegin;
+                    if (clip.timelineStart >
+                        std::numeric_limits<int64_t>::max() - candidateOffset) {
+                        continue;
+                    }
+                    const int64_t timelineSample =
+                        clip.timelineStart + candidateOffset;
+                    const float x = static_cast<float>(origin.x + gutterWidth +
+                        (timelineSample - view.scrollSamples) /
+                            view.samplesPerPixel);
+                    if (x >= origin.x + gutterWidth && x <= origin.x + totalWidth) {
+                        ticks.push_back({x, candidate.strength});
+                    }
+                }
+            }
+            const auto culled = cullTransientTicks(std::move(ticks));
+            const ImU32 tickColor = IM_COL32(
+                static_cast<int>(pal.accent.x * 255.0f),
+                static_cast<int>(pal.accent.y * 255.0f),
+                static_cast<int>(pal.accent.z * 255.0f), 190);
+            for (const auto& tick : culled) {
+                dl->AddLine(ImVec2(tick.x, y + 5.0f),
+                            ImVec2(tick.x, y + trackHeight - 5.0f),
+                            tickColor, 1.0f);
             }
         }
     }
@@ -2063,6 +2453,8 @@ void drawTimeline(const document::Edit& edit,
         const int64_t s = selectionSampleAtMouseX();
         view.selectionStart = s;
         view.selectionEnd = s;
+        view.selectionAnchor = s;
+        view.selectionFocus = s;
         view.selectionRow = -1;          // -1 = all tracks
         view.isSelecting = true;
         view.hasSelection = true;
@@ -2100,6 +2492,8 @@ void drawTimeline(const document::Edit& edit,
             const int64_t s = selectionSampleAtMouseX();
             view.selectionStart = s;
             view.selectionEnd = s;
+            view.selectionAnchor = s;
+            view.selectionFocus = s;
             view.selectionRow = row;
             view.isSelecting = true;
             // Below the last track there is no lane to select in, so the press
@@ -2114,6 +2508,7 @@ void drawTimeline(const document::Edit& edit,
     // edge — should keep extending rather than freeze where it left.
     if (view.isSelecting && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
         view.selectionEnd = selectionSampleAtMouseX();
+        view.selectionFocus = view.selectionEnd;
     }
     // End selection on mouse release.
     if (view.isSelecting && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {

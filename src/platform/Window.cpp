@@ -58,6 +58,10 @@ bool Window::screenshotSucceeded() {
     return g_screenshotSucceeded;
 }
 
+bool Window::screenshotMode() {
+    return g_screenshotOptions.has_value();
+}
+
 Window::Window(int width, int height, const std::string& title) {
     if (g_screenshotOptions.has_value()) {
         std::fprintf(stderr, "Dave: screenshot window initializing\n");

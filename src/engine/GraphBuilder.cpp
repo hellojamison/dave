@@ -226,29 +226,30 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit,
                     }
                     drwav wav;
                     if (!drwav_init_file(&wav, asset->path.c_str(), nullptr)) continue;
-                    std::vector<std::vector<float>> planar(wav.channels);
-                    for (auto& channel : planar) channel.resize(wav.totalPCMFrameCount);
+                    auto decodedAsset = std::make_shared<audio::DecodedAudioAsset>();
+                    decodedAsset->sampleRate = static_cast<double>(wav.sampleRate);
+                    decodedAsset->channels.resize(wav.channels);
+                    for (auto& channel : decodedAsset->channels) {
+                        channel.resize(wav.totalPCMFrameCount);
+                    }
                     std::vector<float> interleaved(
                         static_cast<size_t>(wav.totalPCMFrameCount) * wav.channels);
                     const drwav_uint64 decoded = drwav_read_pcm_frames_f32(
                         &wav, wav.totalPCMFrameCount, interleaved.data());
                     for (drwav_uint64 frame = 0; frame < decoded; ++frame) {
                         for (drwav_uint32 channel = 0; channel < wav.channels; ++channel) {
-                            planar[channel][frame] = interleaved[
+                            decodedAsset->channels[channel][frame] = interleaved[
                                 static_cast<size_t>(frame) * wav.channels + channel];
                         }
                     }
-                    assetCache_.sampleRates[asset->id.sha256] = wav.sampleRate;
-                    assetCache_.channels[asset->id.sha256] = wav.channels;
                     bool inserted = false;
                     std::tie(cache, inserted) = assetCache_.buffers.emplace(
-                        asset->id.sha256, std::move(planar));
+                        asset->id.sha256, std::move(decodedAsset));
                     (void)inserted;
                     drwav_uninit(&wav);
                 }
                 auto node = std::make_shared<AudioClipNode>();
-                node->setBuffer(cache->second,
-                                assetCache_.sampleRates[asset->id.sha256]);
+                node->setBuffer(cache->second);
                 node->setStart(clip.timelineStart);
                 node->setSourceOffset(clip.sourceOffset);
                 node->setLength(clip.length);

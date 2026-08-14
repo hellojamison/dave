@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "audio/DecodedAudioAsset.h"
 #include "engine/graph/Node.h"
 
 #include <algorithm>
@@ -38,9 +39,10 @@ public:
     // Set the decoded buffer directly (used by GraphBuilder, which caches
     // decoded assets). Copies the buffer reference (no decode). The caller
     // must keep `buffer` alive for the node's lifetime.
-    void setBuffer(const std::vector<std::vector<float>>& buffer, double sampleRate) {
-        buffer_ = &buffer;
-        sourceSampleRate_ = sampleRate;
+    void setBuffer(audio::DecodedAudioAssetPtr buffer) {
+        decodedAsset_ = std::move(buffer);
+        buffer_ = decodedAsset_ ? &decodedAsset_->channels : nullptr;
+        sourceSampleRate_ = decodedAsset_ ? decodedAsset_->sampleRate : 48000.0;
     }
 
     // Clip placement on the timeline (samples).
@@ -106,10 +108,10 @@ public:
     }
 
 private:
-    // Borrowed pointer to a decoded asset buffer (GraphBuilder owns the cache).
-    // For the loadFromFile() path we own `ownedBuffer_` and point buffer_ at it.
+    // Retained off-thread when the node is built; callbacks only dereference
+    // the raw channel pointer and never touch shared ownership.
+    audio::DecodedAudioAssetPtr decodedAsset_;
     const std::vector<std::vector<float>>* buffer_ = nullptr;
-    std::vector<std::vector<float>> ownedBuffer_;
     double sourceSampleRate_ = 48000.0;
     std::atomic<int64_t> clipStart_{0};
     int64_t sourceOffset_ = 0;

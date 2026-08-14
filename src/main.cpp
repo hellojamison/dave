@@ -22,6 +22,7 @@ void printUsage(const char* executable) {
         " [--screenshot <out.png> [--frames N]"
         " [--width W] [--height H] [--demo-audio <file.wav>]"
         " [--demo-midi <file.mid>] [--automation-demo]"
+        " [--transient-demo]"
         " [--samples-per-pixel N]]\n",
         executable);
 }
@@ -62,6 +63,7 @@ int main(int argc, char** argv) {
     std::string demoMidiPath;
     double screenshotSamplesPerPixel = 0.0;
     bool automationDemo = false;
+    bool transientDemo = false;
     bool startVideoPoppedOut = false;
     bool noAudio = false;
 
@@ -128,6 +130,9 @@ int main(int argc, char** argv) {
         } else if (arg == "--automation-demo") {
             screenshotOnlyOptionProvided = true;
             automationDemo = true;
+        } else if (arg == "--transient-demo") {
+            screenshotOnlyOptionProvided = true;
+            transientDemo = true;
         } else if (arg == "--samples-per-pixel") {
             screenshotOnlyOptionProvided = true;
             if (++i >= argc || !parseSamplesPerPixel(argv[i], screenshotSamplesPerPixel)) {
@@ -181,6 +186,9 @@ int main(int argc, char** argv) {
         if (!app.loadWavIntoEdit(demoAudioPath)) {
             return 1;
         }
+    }
+    if (transientDemo) {
+        app.configureTransientScreenshot();
     }
     app.run();
     if (screenshotRequested && !dave::platform::Window::screenshotSucceeded()) {

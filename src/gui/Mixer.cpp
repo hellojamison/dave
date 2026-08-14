@@ -24,14 +24,54 @@ ImU32 C(const ImVec4& v) {
     return IM_COL32(int(v.x * 255), int(v.y * 255), int(v.z * 255), int(v.w * 255));
 }
 
-constexpr float kInsertRowHeight = 17.0f;
-constexpr float kRowGap = 2.0f;
-constexpr float kSectionGap = 6.0f;
+// Mixer spacing follows a compact 4-point scale. Controls keep their existing
+// optical heights, while the space between related rows (4) and distinct
+// signal-path sections (8) creates a consistent vertical rhythm.
+constexpr float kSpaceXs = 2.0f;
+constexpr float kSpaceSm = 4.0f;
+constexpr float kSpaceMd = 8.0f;
+constexpr float kControlHeight = 18.0f;
+constexpr float kInsertRowHeight = kControlHeight;
 constexpr float kPanKnobDiameter = 34.0f;
 // Enough of the strip is fixed-height that the fader is what absorbs a resize.
 // Below this the fader stops being usable as a fader, so the strip clips
 // instead of shrinking it further.
 constexpr float kMinFaderHeight = 60.0f;
+
+void verticalSpace(float height) {
+    ImGui::Dummy(ImVec2(0.0f, height));
+}
+
+void drawSummaryRow(const char* id, const std::string& text, float width,
+                    const char* tooltip = nullptr) {
+    const auto& pal = theme::palette();
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton(id, ImVec2(width, kControlHeight));
+    const ImVec2 size = ImGui::CalcTextSize(text.c_str());
+    ImGui::GetWindowDrawList()->AddText(
+        ImVec2(pos.x, pos.y + std::max(0.0f, (kControlHeight - size.y) * 0.5f)),
+        C(pal.textMuted), text.c_str());
+    if (tooltip != nullptr && ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("%s", tooltip);
+    }
+}
+
+std::string compactRouteLabel(const document::Edit& edit,
+                              const document::RouteTarget& target,
+                              int playbackChannels) {
+    if (target.kind != document::RouteTarget::Kind::HardwareOutput) {
+        return "OUT " + routeTargetLabel(edit, target, playbackChannels);
+    }
+
+    const int first = target.hardware.firstChannel;
+    const int count = target.hardware.channelCount;
+    std::string label = "OUT " + std::to_string(first + 1);
+    if (count == 2) label += "-" + std::to_string(first + 2);
+    if (first < 0 || count < 1 || first + count > playbackChannels) {
+        label += " !";
+    }
+    return label;
+}
 
 // One track's mixer-visible state. Pointers rather than a copy because a strip
 // edits in place, and a reference-holding struct is what lets audio and MIDI
@@ -373,14 +413,16 @@ StripAction drawStrip(const StripModel& m, document::Edit& edit,
     StripAction action;
     ImGui::PushID(uid);
 
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f, 8.0f));
     ImGui::BeginChild("##strip", ImVec2(stripWidth, stripHeight), true,
                       ImGuiWindowFlags_NoScrollbar |
                       ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::PopStyleVar();
     // A strip stacks a dozen items, and the theme's default vertical item
     // spacing adds up to more than the fader's whole height budget — which is
     // what pushed the fader off the bottom of the strip. Sections are spaced
     // deliberately below instead.
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.0f, 2.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(kSpaceSm, 0.0f));
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 stripMin = ImGui::GetWindowPos();
@@ -432,22 +474,28 @@ StripAction drawStrip(const StripModel& m, document::Edit& edit,
         dl->PopClipRect();
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", m.name->c_str());
     }
-    ImGui::Dummy(ImVec2(inner, kSectionGap * 0.5f));
+    verticalSpace(kSpaceSm);
 
     // ─── Compact routing ───────────────────────────────────────────────────
+    // Every strip owns the same three-row routing zone. Audio uses row one for
+    // hardware input, MIDI for its instrument, and buses label their mix input.
+    // That keeps output, sends, inserts, pan and faders on shared baselines.
     if (m.hardwareInput != nullptr) {
         const std::string inputLabel = m.hardwareInput->channelCount == 2
             ? "IN " + std::to_string(m.hardwareInput->firstChannel + 1) + "-" +
                   std::to_string(m.hardwareInput->firstChannel + 2)
             : "IN " + std::to_string(m.hardwareInput->firstChannel + 1);
         const float monitorWidth = 22.0f;
-        if (ImGui::Button(inputLabel.c_str(), ImVec2(inner - monitorWidth - 4.0f, 18.0f))) {
+        if (ImGui::Button(inputLabel.c_str(),
+                          ImVec2(inner - monitorWidth - kSpaceSm,
+                                 kControlHeight))) {
             ImGui::OpenPopup("##inputRoute");
         }
-        ImGui::SameLine(0.0f, 4.0f);
+        ImGui::SameLine(0.0f, kSpaceSm);
         const bool monitoring = m.inputMonitor && *m.inputMonitor;
         if (monitoring) ImGui::PushStyleColor(ImGuiCol_Button, pal.success);
-        if (ImGui::Button("I", ImVec2(monitorWidth, 18.0f)) && m.inputMonitor) {
+        if (ImGui::Button("I", ImVec2(monitorWidth, kControlHeight)) &&
+            m.inputMonitor) {
             RoutingRequest request;
             request.kind = RoutingRequest::Kind::SetInputMonitor;
             request.ownerId = m.trackId;
@@ -480,37 +528,8 @@ StripAction drawStrip(const StripModel& m, document::Edit& edit,
             if (captureChannels == 0) ImGui::TextDisabled("No capture channels");
             ImGui::EndPopup();
         }
-    }
-    if (m.mainOutput != nullptr) {
-        const std::string route = routeTargetLabel(edit, *m.mainOutput,
-                                                   playbackChannels);
-        if (ImGui::Button(("OUT " + route).c_str(), ImVec2(inner, 18.0f))) {
-            ImGui::OpenPopup("##mainRoute");
-        }
-        if (ImGui::BeginPopup("##mainRoute")) {
-            drawRouteChoices(m, edit, view, playbackChannels);
-            ImGui::EndPopup();
-        }
-    }
-    if (m.sends != nullptr) {
-        int active = 0;
-        for (const auto& send : *m.sends) if (!send.muted && send.gain > 0.0) ++active;
-        const std::string summary = "SENDS " + std::to_string(active) + "/" +
-            std::to_string(m.sends->size());
-        ImGui::TextDisabled("%s", summary.c_str());
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Edit sends in the selected channel's Routing inspector");
-        }
-    }
-    ImGui::Dummy(ImVec2(inner, kSectionGap * 0.5f));
-
-    // ─── Instrument (MIDI only) ─────────────────────────────────────────────
-    // Ids below only need to be unique WITHIN the strip: PushID(uid) above
-    // already scopes the whole thing to this track.
-    if (m.instrument != nullptr) {
-        ImGui::TextDisabled("INST");
+    } else if (m.instrument != nullptr) {
         if (m.instrument->uidString.empty()) {
-            // An empty instrument slot picks an instrument, not an effect.
             if (drawAddInsertRow(1, inner)) {
                 view.requestPicker =
                     TimelineViewState::PluginPicker::MidiInstrument;
@@ -521,11 +540,45 @@ StripAction drawStrip(const StripModel& m, document::Edit& edit,
             action = StripAction{StripAction::Kind::ClearInstrument, m.trackId,
                                  m.instrument->id, true};
         }
-        ImGui::Dummy(ImVec2(inner, kSectionGap * 0.5f));
+    } else {
+        drawSummaryRow("##mixInput", "IN MIX", inner,
+                       "Incoming track and bus routes");
     }
+    verticalSpace(kSpaceXs);
+
+    if (m.mainOutput != nullptr) {
+        const std::string route = routeTargetLabel(edit, *m.mainOutput,
+                                                   playbackChannels);
+        const std::string compact = compactRouteLabel(
+            edit, *m.mainOutput, playbackChannels);
+        if (ImGui::Button(compact.c_str(), ImVec2(inner, kControlHeight))) {
+            ImGui::OpenPopup("##mainRoute");
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Output: %s", route.c_str());
+        if (ImGui::BeginPopup("##mainRoute")) {
+            drawRouteChoices(m, edit, view, playbackChannels);
+            ImGui::EndPopup();
+        }
+    } else {
+        ImGui::Dummy(ImVec2(inner, kControlHeight));
+    }
+    verticalSpace(kSpaceXs);
+
+    if (m.sends != nullptr) {
+        int active = 0;
+        for (const auto& send : *m.sends) if (!send.muted && send.gain > 0.0) ++active;
+        const std::string summary = "SENDS " + std::to_string(active) + "/" +
+            std::to_string(m.sends->size());
+        drawSummaryRow("##sendSummary", summary, inner,
+                       "Edit sends in the selected channel's Routing inspector");
+    } else {
+        ImGui::Dummy(ImVec2(inner, kControlHeight));
+    }
+    verticalSpace(kSpaceMd);
 
     // ─── Inserts ────────────────────────────────────────────────────────────
     ImGui::TextDisabled("INSERTS");
+    verticalSpace(kSpaceXs);
     int insertIdx = 0;
     for (auto& slot : *m.inserts) {
         char label[16];
@@ -534,7 +587,7 @@ StripAction drawStrip(const StripModel& m, document::Edit& edit,
             action = StripAction{StripAction::Kind::RemoveInsert, m.trackId,
                                  slot.id, m.isMidi};
         }
-        ImGui::Dummy(ImVec2(inner, kRowGap));
+        verticalSpace(kSpaceXs);
         ++insertIdx;
     }
     if (drawAddInsertRow(3, inner)) {
@@ -543,11 +596,11 @@ StripAction drawStrip(const StripModel& m, document::Edit& edit,
     }
 
     // ─── Record arm / mute / solo ───────────────────────────────────────────
-    ImGui::Dummy(ImVec2(inner, kSectionGap));
+    verticalSpace(kSpaceMd);
     {
         const int toggleCount = m.recordArm != nullptr ? 3 : 2;
         const float buttonWidth =
-            (inner - 4.0f * static_cast<float>(toggleCount - 1)) /
+            (inner - kSpaceSm * static_cast<float>(toggleCount - 1)) /
             static_cast<float>(toggleCount);
         struct Toggle {
             const char* label;
@@ -568,7 +621,8 @@ StripAction drawStrip(const StripModel& m, document::Edit& edit,
         for (int b = 0; b < toggleCount; ++b) {
             ImGui::PushID(b);
             const ImVec2 pos = ImGui::GetCursorScreenPos();
-            if (ImGui::InvisibleButton("##rms", ImVec2(buttonWidth, 18.0f))) {
+            if (ImGui::InvisibleButton(
+                    "##rms", ImVec2(buttonWidth, kControlHeight))) {
                 if (b == 0 && m.recordArm != nullptr &&
                     view.deferRecordArmRequests) {
                     view.requestRecordArmTrackId = m.trackId;
@@ -579,7 +633,8 @@ StripAction drawStrip(const StripModel& m, document::Edit& edit,
             }
             const bool hovered = ImGui::IsItemHovered();
             const ImVec2 bMin = pos;
-            const ImVec2 bMax(pos.x + buttonWidth, pos.y + 18.0f);
+            const ImVec2 bMax(pos.x + buttonWidth,
+                              pos.y + kControlHeight);
             const bool on = *toggles[b].flag;
             const bool isRecordArm = b == 0 && m.recordArm != nullptr;
             if (isRecordArm) {
@@ -603,7 +658,7 @@ StripAction drawStrip(const StripModel& m, document::Edit& edit,
             }
             if (hovered) ImGui::SetTooltip("%s", toggles[b].tooltip);
             ImGui::PopID();
-            if (b + 1 < toggleCount) ImGui::SameLine(0.0f, 4.0f);
+            if (b + 1 < toggleCount) ImGui::SameLine(0.0f, kSpaceSm);
         }
     }
 
@@ -615,7 +670,7 @@ StripAction drawStrip(const StripModel& m, document::Edit& edit,
     }
 
     // ─── Pan ────────────────────────────────────────────────────────────────
-    ImGui::Dummy(ImVec2(inner, kRowGap));
+    verticalSpace(kSpaceSm);
     {
         float panVal = static_cast<float>(*m.pan);
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
@@ -630,6 +685,7 @@ StripAction drawStrip(const StripModel& m, document::Edit& edit,
                              std::max(0.0f, (inner - textSize.x) * 0.5f));
         ImGui::TextUnformatted(panText.c_str());
     }
+    verticalSpace(kSpaceSm);
 
     // ─── Fader ──────────────────────────────────────────────────────────────
     // Vertical, because that is what a fader is, and it is what absorbs the
@@ -647,7 +703,7 @@ StripAction drawStrip(const StripModel& m, document::Edit& edit,
             20.0f * std::log10(std::max(0.0001f, static_cast<float>(*m.gain)));
         constexpr float faderW = 24.0f;
         constexpr float meterW = 17.0f;
-        constexpr float faderMeterGap = 9.0f;
+        constexpr float faderMeterGap = 8.0f;
         const float groupW = faderW + faderMeterGap + meterW;
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
                              std::max(0.0f, (inner - groupW) * 0.5f));
@@ -746,7 +802,7 @@ void drawMixer(document::Edit& edit, editing::UndoStack& undo,
                                         anySoloed, stripWidth, stripHeight,
                                         captureChannels, playbackChannels);
         if (a.kind != StripAction::Kind::None) action = a;
-        ImGui::SameLine(0.0f, 3.0f);
+        ImGui::SameLine(0.0f, kSpaceSm);
         ++uid;
     }
     for (auto& t : edit.midiTracksMut()) {
@@ -769,7 +825,7 @@ void drawMixer(document::Edit& edit, editing::UndoStack& undo,
                                         anySoloed, stripWidth, stripHeight,
                                         captureChannels, playbackChannels);
         if (a.kind != StripAction::Kind::None) action = a;
-        ImGui::SameLine(0.0f, 3.0f);
+        ImGui::SameLine(0.0f, kSpaceSm);
         ++uid;
     }
     for (auto& bus : edit.busesMut()) {
@@ -792,7 +848,7 @@ void drawMixer(document::Edit& edit, editing::UndoStack& undo,
                                         anySoloed, stripWidth, stripHeight,
                                         captureChannels, playbackChannels);
         if (a.kind != StripAction::Kind::None) action = a;
-        ImGui::SameLine(0.0f, 3.0f);
+        ImGui::SameLine(0.0f, kSpaceSm);
         ++uid;
     }
     ImGui::EndChild();

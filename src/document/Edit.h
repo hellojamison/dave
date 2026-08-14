@@ -119,6 +119,12 @@ public:
         const std::string& ownerId, VolumeAutomationPoint point);
     bool removeVolumeAutomationPoint(
         const std::string& ownerId, const std::string& pointId);
+    // Replaces one complete envelope and notifies once. Gesture tools use
+    // this instead of rebuilding the graph for every sampled mouse position.
+    // Empty point ids are assigned here and retained by the undo command.
+    bool replaceVolumeAutomation(
+        const std::string& ownerId,
+        std::vector<VolumeAutomationPoint> points);
     std::vector<PanAutomationPoint>* panAutomation(
         const std::string& ownerId);
     const std::vector<PanAutomationPoint>* panAutomation(
@@ -131,6 +137,9 @@ public:
         const std::string& ownerId, PanAutomationPoint point);
     bool removePanAutomationPoint(
         const std::string& ownerId, const std::string& pointId);
+    bool replacePanAutomation(
+        const std::string& ownerId,
+        std::vector<PanAutomationPoint> points);
     std::string addSend(const std::string& ownerId, AuxSend send);
     bool restoreSend_(const std::string& ownerId, AuxSend send, size_t index);
     bool updateSend(const std::string& ownerId, const AuxSend& send);

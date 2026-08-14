@@ -151,6 +151,7 @@ enum class TransportIcon {
     ReturnToStart,
     Record,
     Loop,
+    Transient,
 };
 
 void drawVerticalGradient(ImDrawList* drawList, const Rect& rect,

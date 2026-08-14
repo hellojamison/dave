@@ -104,6 +104,65 @@ TEST_CASE("pan automation points are ordered, bounded, and undoable",
     CHECK(edit.panAutomation(track)->back().id == movedId);
 }
 
+TEST_CASE("draw commands replace an envelope in one stable undo step",
+          "[automation][document]") {
+    SECTION("volume") {
+        dave::document::Edit edit;
+        const std::string track = edit.addTrack("Dialog");
+        edit.addVolumeAutomationPoint(track, 0, -12.0);
+        edit.addVolumeAutomationPoint(track, 48000, 0.0);
+        const auto before = *edit.volumeAutomation(track);
+        auto after = before;
+        after.insert(after.begin() + 1, {{}, 24000, -6.0});
+        int notifications = 0;
+        edit.setChangeListener([&] { ++notifications; });
+        dave::editing::UndoStack undo(edit);
+
+        undo.execute(std::make_unique<
+            dave::editing::ReplaceVolumeAutomationCommand>(track, after));
+        REQUIRE(undo.undoDepth() == 1);
+        CHECK(notifications == 1);
+        REQUIRE(edit.volumeAutomation(track)->size() == 3);
+        const std::string drawnId = (*edit.volumeAutomation(track))[1].id;
+        CHECK_FALSE(drawnId.empty());
+
+        undo.undo();
+        CHECK(notifications == 2);
+        CHECK(*edit.volumeAutomation(track) == before);
+        undo.redo();
+        CHECK(notifications == 3);
+        CHECK((*edit.volumeAutomation(track))[1].id == drawnId);
+    }
+
+    SECTION("pan") {
+        dave::document::Edit edit;
+        const std::string bus = edit.addBus("Stem");
+        edit.addPanAutomationPoint(bus, 0, -1.0);
+        edit.addPanAutomationPoint(bus, 48000, 1.0);
+        const auto before = *edit.panAutomation(bus);
+        auto after = before;
+        after.insert(after.begin() + 1, {{}, 24000, 0.0});
+        int notifications = 0;
+        edit.setChangeListener([&] { ++notifications; });
+        dave::editing::UndoStack undo(edit);
+
+        undo.execute(std::make_unique<
+            dave::editing::ReplacePanAutomationCommand>(bus, after));
+        REQUIRE(undo.undoDepth() == 1);
+        CHECK(notifications == 1);
+        REQUIRE(edit.panAutomation(bus)->size() == 3);
+        const std::string drawnId = (*edit.panAutomation(bus))[1].id;
+        CHECK_FALSE(drawnId.empty());
+
+        undo.undo();
+        CHECK(notifications == 2);
+        CHECK(*edit.panAutomation(bus) == before);
+        undo.redo();
+        CHECK(notifications == 3);
+        CHECK((*edit.panAutomation(bus))[1].id == drawnId);
+    }
+}
+
 TEST_CASE("volume and pan automation round-trip on every channel type",
           "[automation][document][persistence]") {
     dave::document::Edit edit;

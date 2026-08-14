@@ -2,6 +2,8 @@
 #pragma once
 
 #include "application/AudioPreferences.h"
+#include "application/EditorPreferences.h"
+#include "audio/TransientAnalysisCache.h"
 #include "document/Edit.h"
 #include "editing/Command.h"
 #include "engine/GraphBuilder.h"
@@ -59,6 +61,7 @@ public:
     bool importMidiIntoEdit(const std::string& path) { return importMidiFile(path); }
     void setTimelineSamplesPerPixel(double samplesPerPixel);
     void configureAutomationScreenshot();
+    void configureTransientScreenshot();
     void setVideoPoppedOut(bool poppedOut);
 
 private:
@@ -85,6 +88,13 @@ private:
     void openProjectDialog();
     void saveProject(bool saveAs);
     void handleShortcuts();
+    void prefetchSelectedTrackTransients();
+    gui::TransientSnapshotMap selectedTrackTransientSnapshots();
+    void navigateTimeline(gui::NavigationDirection direction, bool extend,
+                          bool allowPending = true);
+    void servicePendingTransientNavigation();
+    void toggleTransientNavigation();
+    void saveEditorPreferences();
     // Targets of the M / S shortcuts; null when nothing is selected.
     document::Track* selectedTrack();
     document::MidiTrack* selectedMidiTrack();
@@ -114,6 +124,8 @@ private:
     platform::AudioEngine audio_;
     AudioPreferencesStore audioPreferencesStore_;
     AudioPreferences audioPreferences_;
+    EditorPreferencesStore editorPreferencesStore_;
+    EditorPreferences editorPreferences_;
     platform::DeviceLists audioDevices_;
     gui::IoPanelState ioPanel_;
 
@@ -132,10 +144,22 @@ private:
     document::Edit edit_;
     editing::UndoStack undo_{edit_};
     engine::GraphBuilder builder_;
+    audio::TransientAnalysisCache transientAnalyses_;
     engine::PluginHost pluginHost_;
 
     gui::PeakCache peaks_;
     gui::TimelineViewState view_;
+
+    struct PendingTransientNavigation {
+        gui::NavigationDirection direction = gui::NavigationDirection::Next;
+        bool extend = false;
+        int selectedTrackIndex = -1;
+        int64_t transportSample = 0;
+        bool hadSelection = false;
+        int64_t selectionAnchor = 0;
+        int64_t selectionFocus = 0;
+    };
+    std::unique_ptr<PendingTransientNavigation> pendingTransientNavigation_;
 
     // Docked utility panes keep explicit pixel sizes. Native window resizing
     // changes the arrangement editor; only splitter drags change these.
@@ -146,6 +170,7 @@ private:
     // The selection itself is stored in the per-user preferences file, never
     // in a .dave project.
     bool showIoPanel_ = true;
+    bool openTransientOptions_ = false;
 
     // ─── Mixer ──────────────────────────────────────────────────────────────
     // The mixer sits under the timeline, spanning its full width: strips are

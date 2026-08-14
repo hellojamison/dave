@@ -238,6 +238,21 @@ bool DaveApp::init(bool startAudio) {
     platform::g_menuAddTrack     = [this](){
         undo_.execute(std::make_unique<editing::AddTrackCommand>("Track"));
     };
+    platform::g_menuToggleTransientNavigation = [this](){
+        toggleTransientNavigation();
+    };
+    platform::g_menuNextLandmark = [this](){
+        navigateTimeline(gui::NavigationDirection::Next, false);
+    };
+    platform::g_menuPreviousLandmark = [this](){
+        navigateTimeline(gui::NavigationDirection::Previous, false);
+    };
+    platform::g_menuExtendNextLandmark = [this](){
+        navigateTimeline(gui::NavigationDirection::Next, true);
+    };
+    platform::g_menuExtendPreviousLandmark = [this](){
+        navigateTimeline(gui::NavigationDirection::Previous, true);
+    };
     platform::g_menuPlayStop     = [this](){
         if (recordingActive()) stopRecording();
         else audio_.transport().toggle();
@@ -254,6 +269,11 @@ bool DaveApp::init(bool startAudio) {
     platform::setupMacMenuBar();
 #endif
     audioPreferences_ = audioPreferencesStore_.load();
+    editorPreferences_ = editorPreferencesStore_.load();
+    view_.transientNavigationEnabled =
+        editorPreferences_.transientNavigationEnabled;
+    view_.showTransientTicks = editorPreferences_.showTransientTicks;
+    view_.transientSensitivity = editorPreferences_.transientSensitivity;
     if (startAudio) {
         refreshAudioDevices();
         if (!applyAudioPreferences(audioPreferences_, false)) {
@@ -304,9 +324,21 @@ void DaveApp::handleShortcuts() {
     const bool primaryModifier = io.KeyCtrl;
 #endif
     const bool shift = io.KeyShift;
+    const bool alt = io.KeyAlt;
 
     // repeat=false: these are edge-triggered actions — ignore key auto-repeat
     // so a single Space press doesn't toggle play on then off again.
+#ifdef __APPLE__
+    if (primaryModifier && alt &&
+        ImGui::IsKeyPressed(ImGuiKey_Tab, false)) {
+        toggleTransientNavigation();
+    } else
+#else
+    if (primaryModifier && alt &&
+        ImGui::IsKeyPressed(ImGuiKey_T, false)) {
+        toggleTransientNavigation();
+    } else
+#endif
     if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
         if (recordingActive()) stopRecording();
         else transport.toggle();
@@ -380,6 +412,151 @@ void DaveApp::handleShortcuts() {
         if (!edit_.videoTracks().empty()) {
             setVideoPoppedOut(!videoPoppedOut_);
         }
+    }
+}
+
+void DaveApp::prefetchSelectedTrackTransients() {
+    const int selected = view_.selectedTrackIndex;
+    if (selected < 0 || selected >= static_cast<int>(edit_.tracks().size())) return;
+    const auto& track = edit_.tracks()[static_cast<size_t>(selected)];
+    std::unordered_set<std::string> requested;
+    for (const auto& clip : track.clips) {
+        if (clip.asset.sha256.empty() || !requested.insert(clip.asset.sha256).second) {
+            continue;
+        }
+        transientAnalyses_.request(
+            clip.asset.sha256, builder_.decodedAsset(clip.asset.sha256));
+    }
+}
+
+gui::TransientSnapshotMap DaveApp::selectedTrackTransientSnapshots() {
+    gui::TransientSnapshotMap snapshots;
+    const int selected = view_.selectedTrackIndex;
+    if (selected < 0 || selected >= static_cast<int>(edit_.tracks().size())) {
+        return snapshots;
+    }
+    for (const auto& clip : edit_.tracks()[static_cast<size_t>(selected)].clips) {
+        if (!clip.asset.sha256.empty() && !snapshots.contains(clip.asset.sha256)) {
+            snapshots.emplace(
+                clip.asset.sha256,
+                transientAnalyses_.snapshot(clip.asset.sha256));
+        }
+    }
+    return snapshots;
+}
+
+void DaveApp::navigateTimeline(gui::NavigationDirection direction,
+                               bool extend, bool allowPending) {
+    if (recordingActive()) {
+        showStatus("Transient navigation is unavailable while recording", true);
+        return;
+    }
+    const int selected = view_.selectedTrackIndex;
+    if (selected < 0 || selected >= static_cast<int>(edit_.tracks().size())) {
+        showStatus("Select an audio track to navigate", true);
+        return;
+    }
+    const auto& track = edit_.tracks()[static_cast<size_t>(selected)];
+    if (track.clips.empty()) {
+        showStatus("The selected audio track has no clips", true);
+        return;
+    }
+
+    const auto mode = view_.transientNavigationEnabled
+        ? gui::TimelineLandmarkMode::Transients
+        : gui::TimelineLandmarkMode::ClipBoundaries;
+    if (mode == gui::TimelineLandmarkMode::Transients) {
+        prefetchSelectedTrackTransients();
+    }
+    const auto snapshots = selectedTrackTransientSnapshots();
+    const auto landmarks = gui::collectTrackLandmarks(
+        track, mode, snapshots, view_.transientSensitivity);
+    if (mode == gui::TimelineLandmarkMode::Transients &&
+        landmarks.analysisPending) {
+        if (allowPending) {
+            pendingTransientNavigation_ =
+                std::make_unique<PendingTransientNavigation>(
+                    PendingTransientNavigation{
+                        direction, extend, selected,
+                        audio_.transport().position(), view_.hasSelection,
+                        view_.selectionAnchor, view_.selectionFocus});
+            showStatus("Analyzing transients…");
+        }
+        return;
+    }
+
+    const int64_t current = extend && view_.hasSelection
+        ? view_.selectionFocus : audio_.transport().position();
+    int64_t destination = 0;
+    if (!gui::findTimelineLandmark(
+            landmarks.samples, current, direction, destination)) {
+        if (landmarks.analysisFailed && landmarks.samples.empty()) {
+            showStatus("Transient analysis failed for the selected track", true);
+        } else {
+            const char* which = direction == gui::NavigationDirection::Next
+                ? "next" : "previous";
+            const char* kind = mode == gui::TimelineLandmarkMode::Transients
+                ? "transient" : "clip boundary";
+            showStatus(std::string("No ") + which + " " + kind);
+        }
+        pendingTransientNavigation_.reset();
+        return;
+    }
+
+    gui::NavigationSelection selection{
+        view_.hasSelection, view_.selectionAnchor, view_.selectionFocus,
+        view_.selectionStart, view_.selectionEnd};
+    selection = gui::applyTimelineNavigation(
+        selection, current, destination, extend);
+    if (!extend) {
+        view_.hasSelection = false;
+        view_.selectionAnchor = destination;
+        view_.selectionFocus = destination;
+        view_.selectionStart = destination;
+        view_.selectionEnd = destination;
+        audio_.transport().seek(destination);
+    } else {
+        view_.hasSelection = selection.active;
+        view_.selectionAnchor = selection.anchor;
+        view_.selectionFocus = selection.focus;
+        view_.selectionStart = selection.start;
+        view_.selectionEnd = selection.end;
+        view_.selectionRow = selected;
+        audio_.transport().seek(selection.start);
+    }
+    pendingTransientNavigation_.reset();
+}
+
+void DaveApp::servicePendingTransientNavigation() {
+    if (!pendingTransientNavigation_) return;
+    const auto pending = *pendingTransientNavigation_;
+    if (view_.selectedTrackIndex != pending.selectedTrackIndex ||
+        audio_.transport().position() != pending.transportSample ||
+        view_.hasSelection != pending.hadSelection ||
+        view_.selectionAnchor != pending.selectionAnchor ||
+        view_.selectionFocus != pending.selectionFocus) {
+        pendingTransientNavigation_.reset();
+        return;
+    }
+    navigateTimeline(pending.direction, pending.extend, false);
+}
+
+void DaveApp::toggleTransientNavigation() {
+    view_.transientNavigationEnabled = !view_.transientNavigationEnabled;
+    saveEditorPreferences();
+    showStatus(view_.transientNavigationEnabled
+                   ? "Transient navigation enabled"
+                   : "Clip-boundary navigation enabled");
+}
+
+void DaveApp::saveEditorPreferences() {
+    editorPreferences_.transientNavigationEnabled =
+        view_.transientNavigationEnabled;
+    editorPreferences_.showTransientTicks = view_.showTransientTicks;
+    editorPreferences_.transientSensitivity =
+        std::clamp(view_.transientSensitivity, 0, 100);
+    if (!editorPreferencesStore_.save(editorPreferences_)) {
+        showStatus("Could not save editor preferences", true);
     }
 }
 
@@ -743,6 +920,14 @@ void DaveApp::configureAutomationScreenshot() {
     view_.automationEditValue = 0.0;
 }
 
+void DaveApp::configureTransientScreenshot() {
+    view_.transientNavigationEnabled = true;
+    view_.showTransientTicks = true;
+    view_.transientSensitivity = 70;
+    openTransientOptions_ = true;
+    prefetchSelectedTrackTransients();
+}
+
 void DaveApp::onEditChanged() {
     bool armRefused = false;
     if (recordingSession_) {
@@ -1063,6 +1248,24 @@ void DaveApp::drawUI() {
                 undo_.execute(std::make_unique<editing::AddTrackCommand>("Track"));
             if (ImGui::MenuItem("Add Bus", "Ctrl+Shift+B"))
                 undo_.execute(std::make_unique<editing::AddBusCommand>("Bus"));
+            ImGui::Separator();
+            if (ImGui::MenuItem("Transient Navigation", "Ctrl+Alt+T",
+                                view_.transientNavigationEnabled)) {
+                toggleTransientNavigation();
+            }
+            if (ImGui::MenuItem("Next Transient or Boundary", "Tab")) {
+                navigateTimeline(gui::NavigationDirection::Next, false);
+            }
+            if (ImGui::MenuItem("Previous Transient or Boundary", "Ctrl+Tab")) {
+                navigateTimeline(gui::NavigationDirection::Previous, false);
+            }
+            if (ImGui::MenuItem("Extend Selection to Next", "Shift+Tab")) {
+                navigateTimeline(gui::NavigationDirection::Next, true);
+            }
+            if (ImGui::MenuItem("Extend Selection to Previous",
+                                "Ctrl+Shift+Tab")) {
+                navigateTimeline(gui::NavigationDirection::Previous, true);
+            }
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Transport")) {
@@ -1317,6 +1520,61 @@ void DaveApp::drawUI() {
             ImGui::SetTooltip("Snap timeline edits to the current %s grid",
                               tcModes[tcIdx]);
         }
+
+        ImGui::SameLine(0.0f, kGap);
+        if (gui::theme::iconButton(
+                "##transientNavigation",
+                gui::theme::TransportIcon::Transient,
+#ifdef __APPLE__
+                "Transient navigation (Cmd+Option+Tab)\n"
+                "Tab: next  Option+Tab: previous\n"
+                "Add Shift to extend the selection",
+#else
+                "Transient navigation (Ctrl+Alt+T)\n"
+                "Tab: next  Ctrl+Tab: previous\n"
+                "Add Shift to extend the selection",
+#endif
+                ImVec2(controlH, controlH),
+                view_.transientNavigationEnabled
+                    ? gui::theme::ButtonVariant::Primary
+                    : gui::theme::ButtonVariant::Normal)) {
+            toggleTransientNavigation();
+        }
+        ImGui::SameLine(0.0f, 2.0f);
+        if (ImGui::Button("...##transientOptions",
+                          ImVec2(controlH, controlH))) {
+            ImGui::OpenPopup("Transient options");
+        }
+        if (openTransientOptions_) {
+            ImGui::OpenPopup("Transient options");
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Transient display and sensitivity");
+        }
+        if (ImGui::BeginPopup("Transient options")) {
+            openTransientOptions_ = false;
+            ImGui::TextUnformatted("Transient Navigation");
+            ImGui::Separator();
+            bool showTicks = view_.showTransientTicks;
+            if (ImGui::Checkbox("Show transient ticks", &showTicks)) {
+                view_.showTransientTicks = showTicks;
+                saveEditorPreferences();
+            }
+            ImGui::SetNextItemWidth(190.0f);
+            ImGui::SliderInt("Sensitivity", &view_.transientSensitivity,
+                             0, 100, "%d");
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                saveEditorPreferences();
+            }
+            ImGui::TextDisabled("Higher values include softer attacks.");
+            const size_t pendingAnalyses = transientAnalyses_.pendingCount();
+            if (pendingAnalyses > 0) {
+                ImGui::TextColored(pal.warning, "Analyzing transients...");
+            } else {
+                ImGui::TextDisabled("Analysis ready when audio is selected.");
+            }
+            ImGui::EndPopup();
+        }
         groupSeparator();
 
         // ─── Session format ──────────────────────────────────────────────
@@ -1391,9 +1649,22 @@ void DaveApp::drawUI() {
     // Dave's are draggable — so the result is PTX's density wherever the
     // controls allow it, rather than a fixed height picked per window size.
     const float trackRowHeight = 58.0f;
+    if (view_.transientNavigationEnabled || view_.showTransientTicks ||
+        pendingTransientNavigation_) {
+        prefetchSelectedTrackTransients();
+    }
+    servicePendingTransientNavigation();
+    const auto transientSnapshots = selectedTrackTransientSnapshots();
     gui::drawTimeline(
         edit_, undo_, transport, peaks_, view_, builder_.assetBuffers(),
-        trackRowHeight);
+        trackRowHeight, 30.0f, transientSnapshots);
+    if (view_.requestTransientNavigation) {
+        const auto direction = view_.transientNavigationDirection;
+        const bool extend = view_.requestTransientSelectionExtension;
+        view_.requestTransientNavigation = false;
+        view_.requestTransientSelectionExtension = false;
+        navigateTimeline(direction, extend);
+    }
     ImGui::End();
 
     // ─── Mixer (bottom of the timeline column) ───────────────────────────
@@ -1886,6 +2157,8 @@ void DaveApp::newProject() {
     }
     edit_.clearMarkerTracks_();
     edit_.clearVideoTracks_();
+    transientAnalyses_.cancelAll();
+    pendingTransientNavigation_.reset();
     builder_ = {};
     videoDecoder_.close();
     lastRequestedFrameIndex_ = -1;
@@ -2127,6 +2400,8 @@ void DaveApp::openProjectDialog() {
             std::fprintf(stderr, "Dave: open failed: %s\n", r.message.c_str());
             return;
         }
+        transientAnalyses_.cancelAll();
+        pendingTransientNavigation_.reset();
         builder_ = {};  // force re-derive with fresh plugin instances
         videoDecoder_.close();
         lastRequestedFrameIndex_ = -1;

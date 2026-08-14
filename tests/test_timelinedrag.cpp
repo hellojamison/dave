@@ -74,7 +74,7 @@ struct TimelineRig : ImGuiRig {
     }
 
     gui::PeakCache peaks;
-    std::unordered_map<std::string, std::vector<std::vector<float>>> assetBuffers;
+    std::unordered_map<std::string, audio::DecodedAudioAssetPtr> assetBuffers;
 };
 
 document::MidiClip midiClip(int64_t start, int64_t length) {

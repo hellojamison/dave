@@ -36,7 +36,12 @@ bool ImGuiLayer::init(platform::Window& window) {
     // predictable anyway — every docked panel is repositioned with
     // ImGuiCond_Always and carries NoMove | NoDocking, so the popped-out
     // picture window is the only thing that can leave the main window.
-    io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+    // The framebuffer screenshot harness captures one GLFW context. Detached
+    // ImGui viewports (including popovers promoted to platform windows) live
+    // in other contexts and would disappear from visual acceptance images.
+    if (!platform::Window::screenshotMode()) {
+        io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+    }
     // Keep ImGui's own title bar on detached windows rather than the OS one:
     // this build of ImGui draws both when the platform window is decorated.
     io.ConfigViewportsNoDecoration = true;

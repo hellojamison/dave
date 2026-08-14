@@ -5,6 +5,7 @@
 #include "editing/Command.h"
 #include "engine/transport/Transport.h"
 #include "gui/RoutingViewModel.h"
+#include "gui/TransientNavigation.h"
 
 #include <imgui.h>
 
@@ -59,6 +60,7 @@ enum class TimecodeMode {
 };
 
 enum class AutomationParameter { Volume, Pan };
+enum class AutomationTool { Pencil, Line, Curve };
 
 // TimelineViewState holds the user's view: horizontal scroll + zoom level.
 // Timeline itself is a pure function of (Edit, viewState) and reports any
@@ -138,10 +140,24 @@ struct TimelineViewState {
     // ruler format: frames for SMPTE/feet+frames, musical subdivisions for
     // bars|beats, round time values for min:sec, or round sample counts.
     bool snapEnabled = false;
+    // Timeline keyboard ownership is remembered from the previous frame so
+    // the application can route Tab before the immediate-mode widget draws.
+    bool timelineKeyboardFocus = true;
+    bool transientNavigationEnabled = false;
+    bool showTransientTicks = false;
+    int transientSensitivity = 50;
+    bool requestTransientNavigation = false;
+    NavigationDirection transientNavigationDirection =
+        NavigationDirection::Next;
+    bool requestTransientSelectionExtension = false;
     // Selection region (click-drag on empty timeline to create).
     bool hasSelection = false;
     int64_t selectionStart = 0;
     int64_t selectionEnd = 0;
+    // Normalized start/end alone cannot express which edge Shift+Tab should
+    // move after the focus crosses the anchor.
+    int64_t selectionAnchor = 0;
+    int64_t selectionFocus = 0;
     bool isSelecting = false;
     // Which lane the selection belongs to, as a row index across both bands
     // (audio 0..n-1, then MIDI). -1 means every track: that is what a drag on
@@ -157,6 +173,9 @@ struct TimelineViewState {
     // channel reveals one parameter-selectable automation lane below its row.
     std::unordered_set<std::string> expandedTracks;
     std::unordered_map<std::string, AutomationParameter> automationParameters;
+    // Automation editing tools are global like the pointer tools in a DAW,
+    // even though their compact toggle is repeated inside each open lane.
+    AutomationTool automationTool = AutomationTool::Pencil;
     std::string revealAutomationOwnerId;
     bool draggingAutomation = false;
     AutomationParameter activeAutomationParameter =
@@ -168,6 +187,22 @@ struct TimelineViewState {
     // the parameter-specific undo command converts it on commit.
     document::VolumeAutomationPoint automationOriginal;
     document::VolumeAutomationPoint automationPreview;
+    // Pencil, Line and Curve gestures are preview-only until mouse-up. The
+    // generic `db` value is dB for Volume and normalized -1..+1 for Pan,
+    // matching the point-drag preview above. One bulk command commits the
+    // completed stroke. Curve captures the Command modifier at mouse-down so
+    // the entire gesture is consistently parabolic or logarithmic.
+    bool drawingAutomation = false;
+    AutomationParameter drawingAutomationParameter =
+        AutomationParameter::Volume;
+    AutomationTool drawingAutomationTool = AutomationTool::Pencil;
+    std::string drawingAutomationOwnerId;
+    document::VolumeAutomationPoint automationDrawAnchor;
+    std::vector<document::VolumeAutomationPoint> automationDrawOriginal;
+    std::vector<document::VolumeAutomationPoint> automationDrawStroke;
+    float automationDrawLastX = 0.0f;
+    float automationDrawLastY = 0.0f;
+    bool automationDrawLogarithmic = false;
     // Double-clicking an envelope point opens a compact numeric editor beside
     // it. This stays view-only; committing still goes through the undo stack.
     bool editingAutomationValue = false;
@@ -244,12 +279,13 @@ void drawTimeline(const document::Edit& edit,
                   PeakCache& peaks,
                   TimelineViewState& view,
                   const std::unordered_map<std::string,
-                      std::vector<std::vector<float>>>& assetBuffers,
+                      audio::DecodedAudioAssetPtr>& assetBuffers,
                   // 58 and 30 match PTXExtractor's playlist lane and ruler.
                   // drawTimeline clamps trackHeight up if the gutter controls
                   // need more room, so this is a floor, not a guarantee.
                   float trackHeight = 58.0f,
-                  float timelineHeight = 30.0f);
+                  float timelineHeight = 30.0f,
+                  const TransientSnapshotMap& transientAnalyses = {});
 
 // Draw the marker lane (a strip above the track rows showing markers as flags
 // and regions). Returns the height it consumed (caller reserves that much

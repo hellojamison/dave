@@ -3,6 +3,7 @@
 
 #include "editing/Command.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <string>
 #include <utility>
@@ -802,6 +803,194 @@ private:
     std::string ownerId_;
     std::string color_;
     std::string previous_;
+};
+
+class AddVolumeAutomationPointCommand : public Command {
+public:
+    AddVolumeAutomationPointCommand(std::string ownerId, int64_t sample,
+                                    double db)
+        : ownerId_(std::move(ownerId)) {
+        point_.sample = sample;
+        point_.db = db;
+    }
+    void perform(document::Edit& edit) override {
+        if (point_.id.empty()) {
+            point_.id = edit.addVolumeAutomationPoint(
+                ownerId_, point_.sample, point_.db);
+        } else {
+            edit.restoreVolumeAutomationPoint_(ownerId_, point_, index_);
+        }
+    }
+    void undo(document::Edit& edit) override {
+        const auto* points = edit.volumeAutomation(ownerId_);
+        if (points != nullptr) {
+            const auto found = std::find_if(
+                points->begin(), points->end(), [&](const auto& point) {
+                    return point.id == point_.id;
+                });
+            if (found != points->end()) {
+                index_ = static_cast<size_t>(found - points->begin());
+                point_ = *found;
+            }
+        }
+        edit.removeVolumeAutomationPoint(ownerId_, point_.id);
+    }
+    std::string name() const override { return "Add Volume Automation Point"; }
+private:
+    std::string ownerId_;
+    document::VolumeAutomationPoint point_;
+    size_t index_ = 0;
+};
+
+class MoveVolumeAutomationPointCommand : public Command {
+public:
+    MoveVolumeAutomationPointCommand(
+        std::string ownerId, document::VolumeAutomationPoint point)
+        : ownerId_(std::move(ownerId)), point_(std::move(point)) {}
+    void perform(document::Edit& edit) override {
+        const auto* points = edit.volumeAutomation(ownerId_);
+        if (points != nullptr) {
+            const auto found = std::find_if(
+                points->begin(), points->end(), [&](const auto& existing) {
+                    return existing.id == point_.id;
+                });
+            if (found != points->end()) previous_ = *found;
+        }
+        edit.updateVolumeAutomationPoint(ownerId_, point_);
+    }
+    void undo(document::Edit& edit) override {
+        edit.updateVolumeAutomationPoint(ownerId_, previous_);
+    }
+    std::string name() const override { return "Move Volume Automation Point"; }
+private:
+    std::string ownerId_;
+    document::VolumeAutomationPoint point_;
+    document::VolumeAutomationPoint previous_;
+};
+
+class RemoveVolumeAutomationPointCommand : public Command {
+public:
+    RemoveVolumeAutomationPointCommand(std::string ownerId,
+                                       std::string pointId)
+        : ownerId_(std::move(ownerId)), pointId_(std::move(pointId)) {}
+    void perform(document::Edit& edit) override {
+        const auto* points = edit.volumeAutomation(ownerId_);
+        if (points != nullptr) {
+            const auto found = std::find_if(
+                points->begin(), points->end(), [&](const auto& point) {
+                    return point.id == pointId_;
+                });
+            if (found != points->end()) {
+                index_ = static_cast<size_t>(found - points->begin());
+                point_ = *found;
+            }
+        }
+        edit.removeVolumeAutomationPoint(ownerId_, pointId_);
+    }
+    void undo(document::Edit& edit) override {
+        edit.restoreVolumeAutomationPoint_(ownerId_, point_, index_);
+    }
+    std::string name() const override {
+        return "Remove Volume Automation Point";
+    }
+private:
+    std::string ownerId_;
+    std::string pointId_;
+    document::VolumeAutomationPoint point_;
+    size_t index_ = 0;
+};
+
+class AddPanAutomationPointCommand : public Command {
+public:
+    AddPanAutomationPointCommand(std::string ownerId, int64_t sample,
+                                 double pan)
+        : ownerId_(std::move(ownerId)) {
+        point_.sample = sample;
+        point_.pan = pan;
+    }
+    void perform(document::Edit& edit) override {
+        if (point_.id.empty()) {
+            point_.id = edit.addPanAutomationPoint(
+                ownerId_, point_.sample, point_.pan);
+        } else {
+            edit.restorePanAutomationPoint_(ownerId_, point_, index_);
+        }
+    }
+    void undo(document::Edit& edit) override {
+        const auto* points = edit.panAutomation(ownerId_);
+        if (points != nullptr) {
+            const auto found = std::find_if(
+                points->begin(), points->end(), [&](const auto& point) {
+                    return point.id == point_.id;
+                });
+            if (found != points->end()) {
+                index_ = static_cast<size_t>(found - points->begin());
+                point_ = *found;
+            }
+        }
+        edit.removePanAutomationPoint(ownerId_, point_.id);
+    }
+    std::string name() const override { return "Add Pan Automation Point"; }
+private:
+    std::string ownerId_;
+    document::PanAutomationPoint point_;
+    size_t index_ = 0;
+};
+
+class MovePanAutomationPointCommand : public Command {
+public:
+    MovePanAutomationPointCommand(
+        std::string ownerId, document::PanAutomationPoint point)
+        : ownerId_(std::move(ownerId)), point_(std::move(point)) {}
+    void perform(document::Edit& edit) override {
+        const auto* points = edit.panAutomation(ownerId_);
+        if (points != nullptr) {
+            const auto found = std::find_if(
+                points->begin(), points->end(), [&](const auto& existing) {
+                    return existing.id == point_.id;
+                });
+            if (found != points->end()) previous_ = *found;
+        }
+        edit.updatePanAutomationPoint(ownerId_, point_);
+    }
+    void undo(document::Edit& edit) override {
+        edit.updatePanAutomationPoint(ownerId_, previous_);
+    }
+    std::string name() const override { return "Move Pan Automation Point"; }
+private:
+    std::string ownerId_;
+    document::PanAutomationPoint point_;
+    document::PanAutomationPoint previous_;
+};
+
+class RemovePanAutomationPointCommand : public Command {
+public:
+    RemovePanAutomationPointCommand(std::string ownerId,
+                                    std::string pointId)
+        : ownerId_(std::move(ownerId)), pointId_(std::move(pointId)) {}
+    void perform(document::Edit& edit) override {
+        const auto* points = edit.panAutomation(ownerId_);
+        if (points != nullptr) {
+            const auto found = std::find_if(
+                points->begin(), points->end(), [&](const auto& point) {
+                    return point.id == pointId_;
+                });
+            if (found != points->end()) {
+                index_ = static_cast<size_t>(found - points->begin());
+                point_ = *found;
+            }
+        }
+        edit.removePanAutomationPoint(ownerId_, pointId_);
+    }
+    void undo(document::Edit& edit) override {
+        edit.restorePanAutomationPoint_(ownerId_, point_, index_);
+    }
+    std::string name() const override { return "Remove Pan Automation Point"; }
+private:
+    std::string ownerId_;
+    std::string pointId_;
+    document::PanAutomationPoint point_;
+    size_t index_ = 0;
 };
 
 class SetMainRouteCommand : public Command {

@@ -18,9 +18,11 @@ namespace {
 void printUsage(const char* executable) {
     std::fprintf(
         stderr,
-        "Usage: %s [--video-popped-out] [--screenshot <out.png> [--frames N]"
+        "Usage: %s [--no-audio] [--video-popped-out]"
+        " [--screenshot <out.png> [--frames N]"
         " [--width W] [--height H] [--demo-audio <file.wav>]"
-        " [--demo-midi <file.mid>] [--samples-per-pixel N]]\n",
+        " [--demo-midi <file.mid>] [--automation-demo]"
+        " [--samples-per-pixel N]]\n",
         executable);
 }
 
@@ -59,7 +61,9 @@ int main(int argc, char** argv) {
     std::string demoAudioPath;
     std::string demoMidiPath;
     double screenshotSamplesPerPixel = 0.0;
+    bool automationDemo = false;
     bool startVideoPoppedOut = false;
+    bool noAudio = false;
 
 #ifdef NDEBUG
     if (argc > 1) {
@@ -69,7 +73,9 @@ int main(int argc, char** argv) {
 #else
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
-        if (arg == "--screenshot") {
+        if (arg == "--no-audio") {
+            noAudio = true;
+        } else if (arg == "--screenshot") {
             if (++i >= argc || isOptionToken(argv[i])) {
                 std::fprintf(stderr, "Dave: --screenshot requires an output path\n");
                 printUsage(argv[0]);
@@ -119,6 +125,9 @@ int main(int argc, char** argv) {
             // for the detached-picture sidebar, and a way to exercise the
             // popped-out path without clicking through the UI.
             startVideoPoppedOut = true;
+        } else if (arg == "--automation-demo") {
+            screenshotOnlyOptionProvided = true;
+            automationDemo = true;
         } else if (arg == "--samples-per-pixel") {
             screenshotOnlyOptionProvided = true;
             if (++i >= argc || !parseSamplesPerPixel(argv[i], screenshotSamplesPerPixel)) {
@@ -147,12 +156,18 @@ int main(int argc, char** argv) {
     }
 
     dave::application::DaveApp app;
-    if (!app.init()) {
+    // Screenshot fixtures exercise the document and GUI without opening real
+    // hardware. This keeps visual tests deterministic and prevents a saved
+    // capture device from prompting for microphone access.
+    if (!app.init(!screenshotRequested && !noAudio)) {
         std::fprintf(stderr, "Dave: initialization failed\n");
         return 1;
     }
     if (screenshotSamplesPerPixel > 0.0) {
         app.setTimelineSamplesPerPixel(screenshotSamplesPerPixel);
+    }
+    if (automationDemo) {
+        app.configureAutomationScreenshot();
     }
     if (startVideoPoppedOut) {
         app.setVideoPoppedOut(true);

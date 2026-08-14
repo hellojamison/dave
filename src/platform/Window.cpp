@@ -36,6 +36,14 @@ void Window::glfwFileDropCallback(GLFWwindow* window, int count, const char** pa
     found->second->fileDropCallback_(droppedPaths);
 }
 
+void Window::glfwWindowRefreshCallback(GLFWwindow* window) {
+    const auto found = g_windows.find(window);
+    if (found == g_windows.end()) {
+        return;
+    }
+    found->second->renderFrame();
+}
+
 namespace detail {
 bool writePng(const std::string& path, int width, int height,
               const unsigned char* pixels, int strideBytes);
@@ -90,6 +98,7 @@ Window::Window(int width, int height, const std::string& title) {
     // this optional callback rather than competing with the input backend.
     g_windows.emplace(window_, this);
     glfwSetDropCallback(window_, Window::glfwFileDropCallback);
+    glfwSetWindowRefreshCallback(window_, Window::glfwWindowRefreshCallback);
 
     glfwMakeContextCurrent(window_);
     // A hidden screenshot window has nothing to present. Waiting for its
@@ -125,6 +134,22 @@ void Window::close() {
     if (!closeGuard_ || closeGuard_()) shouldClose_ = true;
 }
 
+void Window::renderFrame() {
+    // Refresh callbacks can be delivered from GLFW calls made while rendering
+    // ImGui platform windows. Ignore those nested requests; the active frame
+    // will present the same or newer geometry when it completes.
+    if (renderingFrame_ || !frameCallback_) {
+        return;
+    }
+
+    renderingFrame_ = true;
+    frameCallback_();
+    if (!g_screenshotOptions.has_value()) {
+        glfwSwapBuffers(window_);
+    }
+    renderingFrame_ = false;
+}
+
 void Window::run() {
     if (window_ == nullptr) {
         return;
@@ -141,9 +166,7 @@ void Window::run() {
         if (glfwWindowShouldClose(window_) && closeGuard_ && !closeGuard_()) {
             glfwSetWindowShouldClose(window_, GLFW_FALSE);
         }
-        if (frameCallback_) {
-            frameCallback_();
-        }
+        renderFrame();
 
         ++completedFrames;
         if (g_screenshotOptions.has_value() &&
@@ -221,9 +244,6 @@ void Window::run() {
             }
             shouldClose_ = true;
             continue;
-        }
-        if (!g_screenshotOptions.has_value()) {
-            glfwSwapBuffers(window_);
         }
     }
 }

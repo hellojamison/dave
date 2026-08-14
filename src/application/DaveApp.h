@@ -50,7 +50,7 @@ public:
     DaveApp() = default;
     ~DaveApp();
 
-    bool init();
+    bool init(bool startAudio = true);
     void run();
 
     // Developer screenshot fixtures use the same import path as the UI so the
@@ -58,6 +58,7 @@ public:
     bool loadWavIntoEdit(const std::string& path);
     bool importMidiIntoEdit(const std::string& path) { return importMidiFile(path); }
     void setTimelineSamplesPerPixel(double samplesPerPixel);
+    void configureAutomationScreenshot();
     void setVideoPoppedOut(bool poppedOut);
 
 private:

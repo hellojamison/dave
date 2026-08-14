@@ -164,6 +164,220 @@ bool Edit::setTrackColor(const std::string& ownerId, std::string color) {
     return true;
 }
 
+std::vector<VolumeAutomationPoint>* Edit::volumeAutomation(
+    const std::string& ownerId) {
+    if (auto* value = track(ownerId)) return &value->volumeAutomation;
+    if (auto* value = midiTrack(ownerId)) return &value->volumeAutomation;
+    if (auto* value = bus(ownerId)) return &value->volumeAutomation;
+    return nullptr;
+}
+
+const std::vector<VolumeAutomationPoint>* Edit::volumeAutomation(
+    const std::string& ownerId) const {
+    if (const auto* value = track(ownerId)) return &value->volumeAutomation;
+    if (const auto* value = midiTrack(ownerId)) return &value->volumeAutomation;
+    if (const auto* value = bus(ownerId)) return &value->volumeAutomation;
+    return nullptr;
+}
+
+std::string Edit::addVolumeAutomationPoint(
+    const std::string& ownerId, int64_t sample, double db) {
+    auto* points = volumeAutomation(ownerId);
+    if (points == nullptr) return {};
+    sample = std::max<int64_t>(0, sample);
+    if (std::any_of(points->begin(), points->end(),
+                    [sample](const auto& point) {
+                        return point.sample == sample;
+                    })) {
+        return {};
+    }
+    VolumeAutomationPoint point;
+    do {
+        point.id = newId("automation_");
+        ++idCounter_;
+    } while (std::any_of(points->begin(), points->end(),
+                         [&](const auto& existing) {
+                             return existing.id == point.id;
+                         }));
+    point.sample = sample;
+    point.db = clampVolumeAutomationDb(db);
+    points->push_back(point);
+    std::sort(points->begin(), points->end(),
+              [](const auto& a, const auto& b) {
+                  return a.sample < b.sample;
+              });
+    notifyChanged();
+    return point.id;
+}
+
+bool Edit::restoreVolumeAutomationPoint_(
+    const std::string& ownerId, VolumeAutomationPoint point, size_t index) {
+    auto* points = volumeAutomation(ownerId);
+    if (points == nullptr || point.id.empty()) return false;
+    point.sample = std::max<int64_t>(0, point.sample);
+    point.db = clampVolumeAutomationDb(point.db);
+    if (std::any_of(points->begin(), points->end(), [&](const auto& existing) {
+            return existing.id == point.id || existing.sample == point.sample;
+        })) {
+        return false;
+    }
+    points->insert(points->begin() +
+                       static_cast<ptrdiff_t>(std::min(index, points->size())),
+                   std::move(point));
+    std::sort(points->begin(), points->end(),
+              [](const auto& a, const auto& b) {
+                  return a.sample < b.sample;
+              });
+    notifyChanged();
+    return true;
+}
+
+bool Edit::updateVolumeAutomationPoint(
+    const std::string& ownerId, VolumeAutomationPoint point) {
+    auto* points = volumeAutomation(ownerId);
+    if (points == nullptr || point.id.empty()) return false;
+    point.sample = std::max<int64_t>(0, point.sample);
+    point.db = clampVolumeAutomationDb(point.db);
+    if (std::any_of(points->begin(), points->end(), [&](const auto& existing) {
+            return existing.id != point.id && existing.sample == point.sample;
+        })) {
+        return false;
+    }
+    const auto found = std::find_if(
+        points->begin(), points->end(), [&](const auto& existing) {
+            return existing.id == point.id;
+        });
+    if (found == points->end()) return false;
+    *found = std::move(point);
+    std::sort(points->begin(), points->end(),
+              [](const auto& a, const auto& b) {
+                  return a.sample < b.sample;
+              });
+    notifyChanged();
+    return true;
+}
+
+bool Edit::removeVolumeAutomationPoint(
+    const std::string& ownerId, const std::string& pointId) {
+    auto* points = volumeAutomation(ownerId);
+    if (points == nullptr) return false;
+    const auto found = std::find_if(
+        points->begin(), points->end(), [&](const auto& point) {
+            return point.id == pointId;
+        });
+    if (found == points->end()) return false;
+    points->erase(found);
+    notifyChanged();
+    return true;
+}
+
+std::vector<PanAutomationPoint>* Edit::panAutomation(
+    const std::string& ownerId) {
+    if (auto* value = track(ownerId)) return &value->panAutomation;
+    if (auto* value = midiTrack(ownerId)) return &value->panAutomation;
+    if (auto* value = bus(ownerId)) return &value->panAutomation;
+    return nullptr;
+}
+
+const std::vector<PanAutomationPoint>* Edit::panAutomation(
+    const std::string& ownerId) const {
+    if (const auto* value = track(ownerId)) return &value->panAutomation;
+    if (const auto* value = midiTrack(ownerId)) return &value->panAutomation;
+    if (const auto* value = bus(ownerId)) return &value->panAutomation;
+    return nullptr;
+}
+
+std::string Edit::addPanAutomationPoint(
+    const std::string& ownerId, int64_t sample, double pan) {
+    auto* points = panAutomation(ownerId);
+    if (points == nullptr) return {};
+    sample = std::max<int64_t>(0, sample);
+    if (std::any_of(points->begin(), points->end(),
+                    [sample](const auto& point) {
+                        return point.sample == sample;
+                    })) {
+        return {};
+    }
+    PanAutomationPoint point;
+    do {
+        point.id = newId("pan_automation_");
+        ++idCounter_;
+    } while (std::any_of(points->begin(), points->end(),
+                         [&](const auto& existing) {
+                             return existing.id == point.id;
+                         }));
+    point.sample = sample;
+    point.pan = clampPanAutomation(pan);
+    points->push_back(point);
+    std::sort(points->begin(), points->end(),
+              [](const auto& a, const auto& b) {
+                  return a.sample < b.sample;
+              });
+    notifyChanged();
+    return point.id;
+}
+
+bool Edit::restorePanAutomationPoint_(
+    const std::string& ownerId, PanAutomationPoint point, size_t index) {
+    auto* points = panAutomation(ownerId);
+    if (points == nullptr || point.id.empty()) return false;
+    point.sample = std::max<int64_t>(0, point.sample);
+    point.pan = clampPanAutomation(point.pan);
+    if (std::any_of(points->begin(), points->end(), [&](const auto& existing) {
+            return existing.id == point.id || existing.sample == point.sample;
+        })) {
+        return false;
+    }
+    points->insert(points->begin() +
+                       static_cast<ptrdiff_t>(std::min(index, points->size())),
+                   std::move(point));
+    std::sort(points->begin(), points->end(),
+              [](const auto& a, const auto& b) {
+                  return a.sample < b.sample;
+              });
+    notifyChanged();
+    return true;
+}
+
+bool Edit::updatePanAutomationPoint(
+    const std::string& ownerId, PanAutomationPoint point) {
+    auto* points = panAutomation(ownerId);
+    if (points == nullptr || point.id.empty()) return false;
+    point.sample = std::max<int64_t>(0, point.sample);
+    point.pan = clampPanAutomation(point.pan);
+    if (std::any_of(points->begin(), points->end(), [&](const auto& existing) {
+            return existing.id != point.id && existing.sample == point.sample;
+        })) {
+        return false;
+    }
+    const auto found = std::find_if(
+        points->begin(), points->end(), [&](const auto& existing) {
+            return existing.id == point.id;
+        });
+    if (found == points->end()) return false;
+    *found = std::move(point);
+    std::sort(points->begin(), points->end(),
+              [](const auto& a, const auto& b) {
+                  return a.sample < b.sample;
+              });
+    notifyChanged();
+    return true;
+}
+
+bool Edit::removePanAutomationPoint(
+    const std::string& ownerId, const std::string& pointId) {
+    auto* points = panAutomation(ownerId);
+    if (points == nullptr) return false;
+    const auto found = std::find_if(
+        points->begin(), points->end(), [&](const auto& point) {
+            return point.id == pointId;
+        });
+    if (found == points->end()) return false;
+    points->erase(found);
+    notifyChanged();
+    return true;
+}
+
 std::string Edit::addClip(const std::string& trackId, AudioClip clip) {
     Track* t = track(trackId);
     if (t == nullptr) {

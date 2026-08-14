@@ -9,6 +9,7 @@
 #include <imgui.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <memory>
@@ -57,6 +58,7 @@ struct StripModel {
     bool isMidi = false;
     bool isBus = false;
     bool isMain = false;
+    engine::GainNode* meter = nullptr;
 };
 
 // What a strip decided to do, applied by the caller once the loop over strips
@@ -153,6 +155,91 @@ bool drawPanKnob(const char* id, float& value) {
                           theme::formatPan(value).c_str());
     }
     return changed;
+}
+
+float amplitudeToMeterY(float amplitude, float top, float bottom) {
+    const float db = 20.0f * std::log10(std::max(amplitude, 0.001f));
+    const float normalized = std::clamp((db + 60.0f) / 66.0f, 0.0f, 1.0f);
+    return bottom - normalized * (bottom - top);
+}
+
+void drawStereoMeter(engine::GainNode* node, ImVec2 pos, float height) {
+    constexpr float channelWidth = 7.0f;
+    constexpr float channelGap = 3.0f;
+    constexpr float meterWidth = channelWidth * 2.0f + channelGap;
+    const auto& pal = theme::palette();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 afterFader = ImGui::GetCursorScreenPos();
+
+    ImGui::SetCursorScreenPos(pos);
+    ImGui::InvisibleButton("##trackMeter", ImVec2(meterWidth, height));
+    const bool hovered = ImGui::IsItemHovered();
+    if (node != nullptr && ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+        node->clearMeterClips();
+    }
+
+    const float top = pos.y;
+    const float bottom = pos.y + height;
+    const float warningY = amplitudeToMeterY(
+        std::pow(10.0f, -12.0f / 20.0f), top, bottom);
+    const float dangerY = amplitudeToMeterY(
+        std::pow(10.0f, -3.0f / 20.0f), top, bottom);
+    std::array<engine::GainNode::MeterSnapshot, 2> snapshots{};
+    if (node != nullptr) {
+        snapshots[0] = node->meter(0);
+        snapshots[1] = node->meter(1);
+    }
+
+    for (size_t channel = 0; channel < snapshots.size(); ++channel) {
+        const float left = pos.x + static_cast<float>(channel) *
+            (channelWidth + channelGap);
+        const float right = left + channelWidth;
+        dl->AddRectFilled(ImVec2(left, top), ImVec2(right, bottom),
+                          C(pal.surfaceBase), 1.5f);
+        dl->AddRect(ImVec2(left, top), ImVec2(right, bottom),
+                    C(pal.border), 1.5f);
+
+        const float rmsY = amplitudeToMeterY(
+            std::clamp(snapshots[channel].rms, 0.0f, 2.0f), top, bottom);
+        if (rmsY < bottom) {
+            dl->AddRectFilled(ImVec2(left + 1.0f, std::max(rmsY, warningY)),
+                              ImVec2(right - 1.0f, bottom - 1.0f),
+                              C(pal.success), 1.0f);
+            if (rmsY < warningY) {
+                dl->AddRectFilled(
+                    ImVec2(left + 1.0f, std::max(rmsY, dangerY)),
+                    ImVec2(right - 1.0f, warningY), C(pal.warning));
+            }
+            if (rmsY < dangerY) {
+                dl->AddRectFilled(ImVec2(left + 1.0f, rmsY),
+                                  ImVec2(right - 1.0f, dangerY), C(pal.danger));
+            }
+        }
+
+        const float peakY = amplitudeToMeterY(
+            std::clamp(snapshots[channel].peak, 0.0f, 2.0f), top, bottom);
+        const ImU32 peakColor = snapshots[channel].peak >= 1.0f
+            ? C(pal.danger)
+            : (snapshots[channel].peak >= 0.25f
+                   ? C(pal.warning) : C(pal.accentStrong));
+        dl->AddLine(ImVec2(left + 1.0f, peakY),
+                    ImVec2(right - 1.0f, peakY), peakColor, 1.0f);
+        if (snapshots[channel].clipped) {
+            dl->AddRectFilled(ImVec2(left, top),
+                              ImVec2(right, top + 3.0f), C(pal.danger), 1.0f);
+        }
+    }
+
+    if (hovered) {
+        const auto db = [](float value) {
+            return value > 0.0f
+                ? 20.0f * std::log10(value)
+                : -60.0f;
+        };
+        ImGui::SetTooltip("Post-fader meter\nL %+.1f dB  R %+.1f dB\nClick to clear clips",
+                          db(snapshots[0].peak), db(snapshots[1].peak));
+    }
+    ImGui::SetCursorScreenPos(afterFader);
 }
 
 // A compact slot button: bypass dot on the left, name filling the rest.
@@ -559,7 +646,12 @@ StripAction drawStrip(const StripModel& m, document::Edit& edit,
         float gainDb =
             20.0f * std::log10(std::max(0.0001f, static_cast<float>(*m.gain)));
         constexpr float faderW = 24.0f;
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (inner - faderW) * 0.5f);
+        constexpr float meterW = 17.0f;
+        constexpr float faderMeterGap = 9.0f;
+        const float groupW = faderW + faderMeterGap + meterW;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                             std::max(0.0f, (inner - groupW) * 0.5f));
+        const ImVec2 faderPos = ImGui::GetCursorScreenPos();
         const bool faderDragged = ImGui::VSliderFloat(
             "##fader", ImVec2(faderW, faderH), &gainDb,
             -60.0f, 6.0f, "");
@@ -575,6 +667,10 @@ StripAction drawStrip(const StripModel& m, document::Edit& edit,
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Fader (Option/Alt-click for 0 dB)");
         }
+        drawStereoMeter(m.meter,
+                        ImVec2(faderPos.x + faderW + faderMeterGap,
+                               faderPos.y),
+                        faderH);
         char dbText[16];
         std::snprintf(dbText, sizeof(dbText), "%+.1f", gainDb);
         const ImVec2 ts = ImGui::CalcTextSize(dbText);
@@ -592,7 +688,8 @@ StripAction drawStrip(const StripModel& m, document::Edit& edit,
 
 void drawMixer(document::Edit& edit, editing::UndoStack& undo,
                TimelineViewState& view, float stripWidth,
-               int captureChannels, int playbackChannels) {
+               int captureChannels, int playbackChannels,
+               const TrackGainNodes* gainNodes) {
     const bool anySoloed = edit.anySoloed();
 
     if (edit.tracks().empty() && edit.midiTracks().empty() &&
@@ -619,6 +716,11 @@ void drawMixer(document::Edit& edit, editing::UndoStack& undo,
 
     StripAction action;
     int uid = 0;
+    const auto meterFor = [&](const std::string& id) -> engine::GainNode* {
+        if (gainNodes == nullptr) return nullptr;
+        const auto found = gainNodes->find(id);
+        return found == gainNodes->end() ? nullptr : found->second.get();
+    };
 
     // Audio strips, then MIDI, matching the timeline's row order — the mixer
     // and the timeline have to agree on what "the third track" means, since
@@ -638,6 +740,7 @@ void drawMixer(document::Edit& edit, editing::UndoStack& undo,
         m.mainOutput = &t.mainOutput;
         m.sends = &t.sends;
         m.inserts = &t.plugins;
+        m.meter = meterFor(t.id);
         const StripAction a = drawStrip(m, edit, view, uid,
                                         view.selectedTrackIndex == uid,
                                         anySoloed, stripWidth, stripHeight,
@@ -660,6 +763,7 @@ void drawMixer(document::Edit& edit, editing::UndoStack& undo,
         m.inserts = &t.plugins;
         m.instrument = &t.instrument;
         m.isMidi = true;
+        m.meter = meterFor(t.id);
         const StripAction a = drawStrip(m, edit, view, uid,
                                         view.selectedTrackIndex == uid,
                                         anySoloed, stripWidth, stripHeight,
@@ -682,6 +786,7 @@ void drawMixer(document::Edit& edit, editing::UndoStack& undo,
         m.inserts = &bus.plugins;
         m.isBus = true;
         m.isMain = bus.isMain;
+        m.meter = meterFor(bus.id);
         const StripAction a = drawStrip(m, edit, view, uid,
                                         view.selectedTrackIndex == uid,
                                         anySoloed, stripWidth, stripHeight,

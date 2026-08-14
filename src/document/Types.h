@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <algorithm>
+#include <cmath>
 #include <functional>
 #include <string>
 #include <unordered_map>
@@ -116,6 +117,80 @@ struct AuxSend {
     bool muted = true;
 };
 
+// One breakpoint in a channel's volume envelope. Values are stored in dB so
+// a straight line in the lane is also a perceptually straight level change.
+// The channel fader remains the trim/base gain; automation multiplies it.
+struct VolumeAutomationPoint {
+    std::string id;
+    int64_t sample = 0;
+    double db = 0.0;
+
+    bool operator==(const VolumeAutomationPoint&) const = default;
+};
+
+inline constexpr double kMinVolumeAutomationDb = -60.0;
+inline constexpr double kMaxVolumeAutomationDb = 6.0;
+
+inline double clampVolumeAutomationDb(double db) noexcept {
+    if (!std::isfinite(db)) return 0.0;
+    return std::clamp(db, kMinVolumeAutomationDb, kMaxVolumeAutomationDb);
+}
+
+// Points are kept sorted by Edit. Before/after the written envelope, the
+// nearest point is held. An empty envelope is unity (0 dB).
+inline double volumeAutomationDbAt(
+    const std::vector<VolumeAutomationPoint>& points,
+    int64_t sample) noexcept {
+    if (points.empty()) return 0.0;
+    if (sample <= points.front().sample) return points.front().db;
+    if (sample >= points.back().sample) return points.back().db;
+    const auto next = std::upper_bound(
+        points.begin(), points.end(), sample,
+        [](int64_t position, const VolumeAutomationPoint& point) {
+            return position < point.sample;
+        });
+    const auto previous = next - 1;
+    const int64_t span = next->sample - previous->sample;
+    if (span <= 0) return next->db;
+    const double amount = static_cast<double>(sample - previous->sample) /
+                          static_cast<double>(span);
+    return previous->db + (next->db - previous->db) * amount;
+}
+
+// Pan automation owns the pan position whenever its envelope is non-empty.
+// Stored values use the same normalized scale as the channel pan control:
+// -1 = full left, 0 = centre, +1 = full right.
+struct PanAutomationPoint {
+    std::string id;
+    int64_t sample = 0;
+    double pan = 0.0;
+
+    bool operator==(const PanAutomationPoint&) const = default;
+};
+
+inline double clampPanAutomation(double pan) noexcept {
+    if (!std::isfinite(pan)) return 0.0;
+    return std::clamp(pan, -1.0, 1.0);
+}
+
+inline double panAutomationAt(const std::vector<PanAutomationPoint>& points,
+                              int64_t sample) noexcept {
+    if (points.empty()) return 0.0;
+    if (sample <= points.front().sample) return points.front().pan;
+    if (sample >= points.back().sample) return points.back().pan;
+    const auto next = std::upper_bound(
+        points.begin(), points.end(), sample,
+        [](int64_t position, const PanAutomationPoint& point) {
+            return position < point.sample;
+        });
+    const auto previous = next - 1;
+    const int64_t span = next->sample - previous->sample;
+    if (span <= 0) return next->pan;
+    const double amount = static_cast<double>(sample - previous->sample) /
+                          static_cast<double>(span);
+    return previous->pan + (next->pan - previous->pan) * amount;
+}
+
 // Channel identity colors are stored as CSS-style #RRGGBB strings so project
 // JSON stays readable. Empty means "use the type's default color".
 inline bool validTrackColor(const std::string& color) noexcept {
@@ -138,7 +213,9 @@ struct Track {
     std::string name;
     std::string color;           // #RRGGBB; empty = default audio color
     double gain = 1.0;
+    std::vector<VolumeAutomationPoint> volumeAutomation;
     double pan = 0.0;            // -1 (L) .. +1 (R)
+    std::vector<PanAutomationPoint> panAutomation;
     // Mute and solo are stored per track, but solo is only meaningful relative
     // to the other tracks: any track soloed silences every non-soloed track.
     // That comparison lives in GraphBuilder, which is the only place that sees
@@ -252,7 +329,9 @@ struct MidiTrack {
     std::string name;
     std::string color;           // #RRGGBB; empty = default MIDI color
     double gain = 1.0;
+    std::vector<VolumeAutomationPoint> volumeAutomation;
     double pan = 0.0;
+    std::vector<PanAutomationPoint> panAutomation;
     bool mute = false;
     bool solo = false;
     RouteTarget mainOutput = RouteTarget::bus();
@@ -274,7 +353,9 @@ struct BusTrack {
     std::string name;
     std::string color;           // #RRGGBB; empty = default bus/Main color
     double gain = 1.0;
+    std::vector<VolumeAutomationPoint> volumeAutomation;
     double pan = 0.0;
+    std::vector<PanAutomationPoint> panAutomation;
     bool mute = false;
     bool solo = false;
     bool isMain = false;

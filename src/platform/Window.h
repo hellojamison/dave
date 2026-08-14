@@ -58,12 +58,19 @@ public:
 
 private:
     static void glfwFileDropCallback(GLFWwindow* window, int count, const char** paths);
+    static void glfwWindowRefreshCallback(GLFWwindow* window);
+
+    // Draw and present one frame. GLFW can keep glfwPollEvents() inside the
+    // native macOS live-resize loop, so the refresh callback uses this same
+    // path to avoid stretching the last completed frame until resizing ends.
+    void renderFrame();
 
     GLFWwindow* window_ = nullptr;
     FrameCallback frameCallback_;
     FileDropCallback fileDropCallback_;
     CloseGuard closeGuard_;
     bool shouldClose_ = false;
+    bool renderingFrame_ = false;
 };
 
 } // namespace dave::platform

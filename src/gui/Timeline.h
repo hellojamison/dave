@@ -58,6 +58,8 @@ enum class TimecodeMode {
     Samples      // raw sample count
 };
 
+enum class AutomationParameter { Volume, Pan };
+
 // TimelineViewState holds the user's view: horizontal scroll + zoom level.
 // Timeline itself is a pure function of (Edit, viewState) and reports any
 // interaction (drag, seek) back via the UndoStack + Transport.
@@ -151,10 +153,28 @@ struct TimelineViewState {
     // turns out not to be a drag seeks here: the cursor goes where you
     // clicked, while a selection edge goes to the nearest division.
     int64_t selectionPressSample = 0;
-    // Track ids whose disclosure arrow points down. Nothing reads this yet —
-    // the arrow is the affordance, landed ahead of whatever it will reveal
-    // (takes, automation lanes), so the header geometry settles first.
+    // Track ids whose disclosure arrow points down. Every audio, MIDI and bus
+    // channel reveals one parameter-selectable automation lane below its row.
     std::unordered_set<std::string> expandedTracks;
+    std::unordered_map<std::string, AutomationParameter> automationParameters;
+    std::string revealAutomationOwnerId;
+    bool draggingAutomation = false;
+    AutomationParameter activeAutomationParameter =
+        AutomationParameter::Volume;
+    std::string automationOwnerId;
+    std::string automationPointId;
+    // The `db` member is a generic lane value here: dB for Volume and the
+    // normalized -1..+1 position for Pan. It never enters the document until
+    // the parameter-specific undo command converts it on commit.
+    document::VolumeAutomationPoint automationOriginal;
+    document::VolumeAutomationPoint automationPreview;
+    // Double-clicking an envelope point opens a compact numeric editor beside
+    // it. This stays view-only; committing still goes through the undo stack.
+    bool editingAutomationValue = false;
+    bool focusAutomationValue = false;
+    std::string automationEditOwnerId;
+    std::string automationEditPointId;
+    double automationEditValue = 0.0;
     // Inline rename state.
     bool isRenaming = false;
     int renameTrackIndex = -1;

@@ -189,7 +189,7 @@ DaveApp::~DaveApp() {
     audio_.setCompiledGraph(nullptr);
 }
 
-bool DaveApp::init() {
+bool DaveApp::init(bool startAudio) {
     if (!window_.valid() || !imgui_.init(window_)) {
         return false;
     }
@@ -254,13 +254,15 @@ bool DaveApp::init() {
     platform::setupMacMenuBar();
 #endif
     audioPreferences_ = audioPreferencesStore_.load();
-    refreshAudioDevices();
-    if (!applyAudioPreferences(audioPreferences_, false)) {
-        std::fprintf(stderr, "Dave: audio engine failed to start\n");
-    }
-    if (audio_.playbackChannelCount() == 1) {
-        edit_.bus(document::kMainBusId)->mainOutput =
-            document::RouteTarget::hardwareOutput(0, 1);
+    if (startAudio) {
+        refreshAudioDevices();
+        if (!applyAudioPreferences(audioPreferences_, false)) {
+            std::fprintf(stderr, "Dave: audio engine failed to start\n");
+        }
+        if (audio_.playbackChannelCount() == 1) {
+            edit_.bus(document::kMainBusId)->mainOutput =
+                document::RouteTarget::hardwareOutput(0, 1);
+        }
     }
 
     // Wire the Edit's change signal to graph re-derivation.
@@ -710,6 +712,37 @@ void DaveApp::setTimelineSamplesPerPixel(double samplesPerPixel) {
                           audio_.transport().position());
 }
 
+void DaveApp::configureAutomationScreenshot() {
+    if (edit_.tracks().empty()) {
+        edit_.addTrack("Track 1");
+    }
+    const std::string trackId = edit_.tracks().front().id;
+    if (auto* points = edit_.volumeAutomation(trackId); points != nullptr) {
+        points->clear();
+    }
+    edit_.addVolumeAutomationPoint(trackId, 0, -18.0);
+    edit_.addVolumeAutomationPoint(trackId, 48000, 0.0);
+    edit_.addVolumeAutomationPoint(trackId, 96000, -12.0);
+    edit_.addVolumeAutomationPoint(trackId, 144000, 3.0);
+    if (auto* points = edit_.panAutomation(trackId); points != nullptr) {
+        points->clear();
+    }
+    edit_.addPanAutomationPoint(trackId, 0, -1.0);
+    const std::string editablePointId =
+        edit_.addPanAutomationPoint(trackId, 48000, 0.0);
+    edit_.addPanAutomationPoint(trackId, 96000, 0.75);
+    edit_.addPanAutomationPoint(trackId, 144000, -0.4);
+    view_.expandedTracks.insert(trackId);
+    view_.automationParameters[trackId] = gui::AutomationParameter::Pan;
+    view_.activeAutomationParameter = gui::AutomationParameter::Pan;
+    view_.revealAutomationOwnerId = trackId;
+    view_.editingAutomationValue = !editablePointId.empty();
+    view_.focusAutomationValue = !editablePointId.empty();
+    view_.automationEditOwnerId = trackId;
+    view_.automationEditPointId = editablePointId;
+    view_.automationEditValue = 0.0;
+}
+
 void DaveApp::onEditChanged() {
     bool armRefused = false;
     if (recordingSession_) {
@@ -743,12 +776,15 @@ void DaveApp::onEditChanged() {
 
     // UI thread. Re-derive the engine graph from the Edit, compile, publish.
     dirty_ = true; // any edit marks the project dirty
+    const double graphSampleRate = audio_.sampleRate() > 0.0
+        ? audio_.sampleRate()
+        : static_cast<double>(edit_.sampleRate());
     auto graph = builder_.build(
-        edit_, audio_.sampleRate(),
+        edit_, graphSampleRate,
         std::max(1, static_cast<int>(audio_.playbackChannelCount())));
     // Compile for the engine's own maximum, not a literal — the callback
     // sizes its passes from the same constant, so the two cannot drift.
-    auto [compiled, err] = engine::compile(*graph, audio_.sampleRate(),
+    auto [compiled, err] = engine::compile(*graph, graphSampleRate,
                                            platform::AudioEngine::maxBlockSize());
     if (err.has_value()) {
         std::fprintf(stderr, "Dave: compile failed: %s\n", err->message.c_str());
@@ -1372,7 +1408,8 @@ void DaveApp::drawUI() {
         }
         gui::drawMixer(edit_, undo_, view_, 124.0f,
                        static_cast<int>(audio_.captureChannelCount()),
-                       static_cast<int>(audio_.playbackChannelCount()));
+                       static_cast<int>(audio_.playbackChannelCount()),
+                       &builder_.trackGains());
         ImGui::End();
     }
     // Both the timeline and the mixer can ask for a picker or an editor, so

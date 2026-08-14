@@ -26,6 +26,7 @@ constexpr float kTrackHeight = 58.0f;
 constexpr float kGutterWidth = 260.0f;
 constexpr float kRulerHeight = 30.0f;
 constexpr float kMarkerLaneHeight = 28.0f;
+constexpr float kAutomationLaneHeight = 72.0f;
 
 struct LayoutRig : ImGuiRig {
     LayoutRig() { view.samplesPerPixel = 500.0; }
@@ -45,6 +46,31 @@ struct LayoutRig : ImGuiRig {
         tick(x, y, false);
         tick(x, y, true);
         tick(x, y, false);
+    }
+
+    void doubleClickTimelineAt(float x, float y) {
+        // Let any prior click age out before enabling ImGui's double-click
+        // window; otherwise a second call can begin as click three and close
+        // the editor it just opened.
+        for (int frame = 0; frame < 20; ++frame) {
+            tick(-100.0f, -100.0f, false);
+        }
+        ImGui::GetIO().MouseDoubleClickTime = 0.30f;
+        clickTimelineAt(x, y);
+        clickTimelineAt(x, y);
+        ImGui::GetIO().MouseDoubleClickTime = 0.0f;
+    }
+
+    void typeText(const char* text) {
+        ImGui::GetIO().AddInputCharactersUTF8(text);
+        tick(-100.0f, -100.0f, false);
+    }
+
+    void pressKey(ImGuiKey key) {
+        ImGui::GetIO().AddKeyEvent(key, true);
+        tick(-100.0f, -100.0f, false);
+        ImGui::GetIO().AddKeyEvent(key, false);
+        tick(-100.0f, -100.0f, false);
     }
 
     // One frame parked away from every control, purely to learn `origin`.
@@ -793,10 +819,8 @@ TEST_CASE("finishing a selection puts the playhead at its head",
 
 TEST_CASE("the track colour band toggles the disclosure state",
           "[timelinelayout]") {
-    // The band is the click target for the arrow. Nothing consumes the open
-    // state yet, so this guards the affordance itself: the arrow direction is
-    // derived from expandedTracks, and if the click stops landing the arrow
-    // silently stops responding with no other symptom.
+    // The band is the click target for the arrow. This guards the affordance
+    // independently from the lane interaction tests below.
     LayoutRig rig;
     rig.edit.addMarkerTrack("Markers");
     const std::string t0 = rig.edit.addTrack("Audio 1");
@@ -821,6 +845,175 @@ TEST_CASE("the track colour band toggles the disclosure state",
     rig.clickTimelineAt(bandX, tracksTop + kTrackHeight * 1.5f);
     CHECK(rig.view.expandedTracks.count(t1) == 1);
     CHECK(rig.view.expandedTracks.count(t0) == 0);
+}
+
+TEST_CASE("track disclosures open editable volume automation lanes",
+          "[timelinelayout][automation]") {
+    constexpr float bandInsetX = 17.0f;
+    constexpr float laneClickOffsetX = 180.0f;
+
+    SECTION("audio track") {
+        LayoutRig rig;
+        rig.edit.addMarkerTrack("Markers");
+        const std::string audio = rig.edit.addTrack("Dialog");
+        rig.seekTo(12345);
+        rig.settle();
+        const float tracksTop =
+            rig.origin.y + kRulerHeight + kMarkerLaneHeight;
+        rig.clickTimelineAt(rig.origin.x + bandInsetX,
+                            tracksTop + kTrackHeight * 0.5f);
+        REQUIRE(rig.view.expandedTracks.contains(audio));
+
+        rig.clickTimelineAt(
+            rig.origin.x + kGutterWidth + laneClickOffsetX,
+            tracksTop + kTrackHeight + kAutomationLaneHeight * 0.5f);
+        REQUIRE(rig.edit.track(audio)->volumeAutomation.size() == 1);
+
+        // Editing an envelope must not leak through to the generic timeline
+        // click handler and move the transport at the same time.
+        engine::TimeInfo time{};
+        rig.transport.advanceAndFill(time, 0, 48000.0);
+        CHECK(rig.transport.position() == 12345);
+        rig.undo.undo();
+        CHECK(rig.edit.track(audio)->volumeAutomation.empty());
+    }
+
+    SECTION("MIDI instrument track") {
+        LayoutRig rig;
+        rig.edit.addMarkerTrack("Markers");
+        const std::string midi = rig.edit.addMidiTrack("Instrument");
+        rig.settle();
+        const float tracksTop =
+            rig.origin.y + kRulerHeight + kMarkerLaneHeight;
+        const float midiHeight =
+            kTrackHeight + ImGui::GetFontSize() + 2.0f + 3.0f;
+        rig.clickTimelineAt(rig.origin.x + bandInsetX,
+                            tracksTop + midiHeight * 0.5f);
+        REQUIRE(rig.view.expandedTracks.contains(midi));
+        rig.clickTimelineAt(
+            rig.origin.x + kGutterWidth + laneClickOffsetX,
+            tracksTop + midiHeight + kAutomationLaneHeight * 0.5f);
+        REQUIRE(rig.edit.midiTrack(midi)->volumeAutomation.size() == 1);
+    }
+
+    SECTION("user bus and Main") {
+        LayoutRig rig;
+        rig.edit.addMarkerTrack("Markers");
+        const std::string bus = rig.edit.addBus("DX Stem");
+        rig.settle();
+        const float tracksTop =
+            rig.origin.y + kRulerHeight + kMarkerLaneHeight;
+
+        rig.clickTimelineAt(rig.origin.x + bandInsetX,
+                            tracksTop + kTrackHeight * 0.5f);
+        REQUIRE(rig.view.expandedTracks.contains(bus));
+        rig.clickTimelineAt(
+            rig.origin.x + kGutterWidth + laneClickOffsetX,
+            tracksTop + kTrackHeight + kAutomationLaneHeight * 0.5f);
+        REQUIRE(rig.edit.bus(bus)->volumeAutomation.size() == 1);
+
+        const float mainTop =
+            tracksTop + kTrackHeight + kAutomationLaneHeight;
+        rig.clickTimelineAt(rig.origin.x + bandInsetX,
+                            mainTop + kTrackHeight * 0.5f);
+        REQUIRE(rig.view.expandedTracks.contains(document::kMainBusId));
+        rig.clickTimelineAt(
+            rig.origin.x + kGutterWidth + laneClickOffsetX,
+            mainTop + kTrackHeight + kAutomationLaneHeight * 0.5f);
+        REQUIRE(rig.edit.mainBus()->volumeAutomation.size() == 1);
+    }
+}
+
+TEST_CASE("double-clicking an automation point opens an undoable dB editor",
+          "[timelinelayout][automation]") {
+    LayoutRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string track = rig.edit.addTrack("Dialog");
+    REQUIRE_FALSE(rig.edit.addVolumeAutomationPoint(track, 90000, 0.0).empty());
+    rig.settle();
+
+    const float tracksTop =
+        rig.origin.y + kRulerHeight + kMarkerLaneHeight;
+    rig.clickTimelineAt(rig.origin.x + 17.0f,
+                        tracksTop + kTrackHeight * 0.5f);
+    REQUIRE(rig.view.expandedTracks.contains(track));
+
+    // 90,000 samples at 500 samples/pixel is 180 px into the lane. The
+    // envelope spans +6 to -60 dB between its 8 px vertical insets.
+    const float pointX = rig.origin.x + kGutterWidth + 180.0f;
+    const float automationTop = tracksTop + kTrackHeight;
+    const float graphHeight = kAutomationLaneHeight - 16.0f;
+    const float pointY = automationTop + 8.0f +
+        static_cast<float>((document::kMaxVolumeAutomationDb - 0.0) /
+                           (document::kMaxVolumeAutomationDb -
+                            document::kMinVolumeAutomationDb)) * graphHeight;
+    rig.doubleClickTimelineAt(pointX, pointY);
+    REQUIRE(rig.view.editingAutomationValue);
+
+    rig.typeText("-7.5");
+    rig.pressKey(ImGuiKey_Enter);
+    REQUIRE_FALSE(rig.view.editingAutomationValue);
+    REQUIRE(rig.edit.track(track)->volumeAutomation.size() == 1);
+    CHECK(rig.edit.track(track)->volumeAutomation.front().db ==
+          Catch::Approx(-7.5));
+
+    REQUIRE(rig.undo.canUndo());
+    rig.undo.undo();
+    CHECK(rig.edit.track(track)->volumeAutomation.front().db ==
+          Catch::Approx(0.0));
+
+    // Clicking away is also a commit, but that click must not leak through
+    // and create another point in the envelope beneath the editor.
+    rig.doubleClickTimelineAt(pointX, pointY);
+    REQUIRE(rig.view.editingAutomationValue);
+    rig.typeText("-12.0");
+    rig.clickTimelineAt(pointX + 120.0f,
+                        automationTop + kAutomationLaneHeight * 0.5f);
+    CHECK_FALSE(rig.view.editingAutomationValue);
+    REQUIRE(rig.edit.track(track)->volumeAutomation.size() == 1);
+    CHECK(rig.edit.track(track)->volumeAutomation.front().db ==
+          Catch::Approx(-12.0));
+}
+
+TEST_CASE("pan automation lane edits normalized pan with percent entry",
+          "[timelinelayout][automation][pan]") {
+    LayoutRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string track = rig.edit.addTrack("Dialog");
+    REQUIRE_FALSE(
+        rig.edit.addPanAutomationPoint(track, 90000, -0.5).empty());
+    rig.view.automationParameters[track] = gui::AutomationParameter::Pan;
+    rig.settle();
+
+    const float tracksTop =
+        rig.origin.y + kRulerHeight + kMarkerLaneHeight;
+    rig.clickTimelineAt(rig.origin.x + 17.0f,
+                        tracksTop + kTrackHeight * 0.5f);
+    REQUIRE(rig.view.expandedTracks.contains(track));
+
+    // 90,000 samples at 500 samples/pixel is 180 px into the lane. Pan -0.5
+    // sits three quarters of the way down the -1..+1 graph.
+    const float pointX = rig.origin.x + kGutterWidth + 180.0f;
+    const float automationTop = tracksTop + kTrackHeight;
+    const float graphHeight = kAutomationLaneHeight - 16.0f;
+    const float pointY = automationTop + 8.0f + graphHeight * 0.75f;
+    rig.doubleClickTimelineAt(pointX, pointY);
+    REQUIRE(rig.view.editingAutomationValue);
+    CHECK(rig.view.activeAutomationParameter ==
+          gui::AutomationParameter::Pan);
+
+    rig.typeText("75");
+    rig.pressKey(ImGuiKey_Enter);
+    REQUIRE_FALSE(rig.view.editingAutomationValue);
+    REQUIRE(rig.edit.track(track)->panAutomation.size() == 1);
+    CHECK(rig.edit.track(track)->panAutomation.front().pan ==
+          Catch::Approx(0.75));
+    CHECK(rig.edit.track(track)->volumeAutomation.empty());
+
+    REQUIRE(rig.undo.canUndo());
+    rig.undo.undo();
+    CHECK(rig.edit.track(track)->panAutomation.front().pan ==
+          Catch::Approx(-0.5));
 }
 
 TEST_CASE("clicking the gutter beside the band does not toggle it",

@@ -107,7 +107,7 @@ TEST_CASE("v1 projects migrate routing without enabling input monitoring",
     CHECK(edit.midiTrack("m")->mainOutput == document::RouteTarget::bus());
 }
 
-TEST_CASE("v2 preserves unavailable hardware routes, buses, and muted sends",
+TEST_CASE("current documents preserve unavailable routes, buses, and muted sends",
           "[routing][document]") {
     document::Edit edit;
     const auto track = edit.addTrack("DX");
@@ -120,7 +120,7 @@ TEST_CASE("v2 preserves unavailable hardware routes, buses, and muted sends",
     REQUIRE_FALSE(sendId.empty());
 
     const std::string text = document::serializeEdit(edit);
-    CHECK(text.find("dave.doc/v2") != std::string::npos);
+    CHECK(text.find("dave.doc/v3") != std::string::npos);
     document::Edit loaded;
     REQUIRE(document::deserializeEdit(text, loaded).ok);
     CHECK(loaded.track(track)->hardwareInput == document::HardwareChannelSpan{31, 2});

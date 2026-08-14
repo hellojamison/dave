@@ -143,12 +143,108 @@ static AuxSend sendFromJson(const json& value) {
     return send;
 }
 
+static json volumeAutomationToJson(
+    const std::vector<VolumeAutomationPoint>& points) {
+    json result = json::array();
+    for (const auto& point : points) {
+        result.push_back({{"id", point.id},
+                          {"sample", point.sample},
+                          {"db", point.db}});
+    }
+    return result;
+}
+
+static std::vector<VolumeAutomationPoint> volumeAutomationFromJson(
+    const json& value) {
+    std::vector<VolumeAutomationPoint> result;
+    if (!value.is_array()) return result;
+    size_t fallbackId = 0;
+    for (const auto& stored : value) {
+        if (!stored.is_object() ||
+            (stored.contains("id") && !stored["id"].is_string()) ||
+            (stored.contains("sample") &&
+             !stored["sample"].is_number_integer()) ||
+            (stored.contains("db") && !stored["db"].is_number())) {
+            continue;
+        }
+        VolumeAutomationPoint point;
+        point.id = stored.value("id", "");
+        if (point.id.empty()) {
+            point.id = "automation_loaded_" + std::to_string(++fallbackId);
+        }
+        point.sample = std::max<int64_t>(
+            0, stored.value("sample", int64_t(0)));
+        point.db = clampVolumeAutomationDb(stored.value("db", 0.0));
+        const bool duplicate = std::any_of(
+            result.begin(), result.end(), [&](const auto& existing) {
+                return existing.id == point.id ||
+                       existing.sample == point.sample;
+            });
+        if (!duplicate) result.push_back(std::move(point));
+    }
+    std::sort(result.begin(), result.end(),
+              [](const auto& a, const auto& b) {
+                  return a.sample < b.sample;
+              });
+    return result;
+}
+
+static json panAutomationToJson(
+    const std::vector<PanAutomationPoint>& points) {
+    json result = json::array();
+    for (const auto& point : points) {
+        result.push_back({{"id", point.id},
+                          {"sample", point.sample},
+                          {"pan", point.pan}});
+    }
+    return result;
+}
+
+static std::vector<PanAutomationPoint> panAutomationFromJson(
+    const json& value) {
+    std::vector<PanAutomationPoint> result;
+    if (!value.is_array()) return result;
+    size_t fallbackId = 0;
+    for (const auto& stored : value) {
+        if (!stored.is_object() ||
+            (stored.contains("id") && !stored["id"].is_string()) ||
+            (stored.contains("sample") &&
+             !stored["sample"].is_number_integer()) ||
+            (stored.contains("pan") && !stored["pan"].is_number())) {
+            continue;
+        }
+        PanAutomationPoint point;
+        point.id = stored.value("id", "");
+        if (point.id.empty()) {
+            point.id = "pan_automation_loaded_" +
+                       std::to_string(++fallbackId);
+        }
+        point.sample = std::max<int64_t>(
+            0, stored.value("sample", int64_t(0)));
+        point.pan = clampPanAutomation(stored.value("pan", 0.0));
+        const bool duplicate = std::any_of(
+            result.begin(), result.end(), [&](const auto& existing) {
+                return existing.id == point.id ||
+                       existing.sample == point.sample;
+            });
+        if (!duplicate) result.push_back(std::move(point));
+    }
+    std::sort(result.begin(), result.end(),
+              [](const auto& a, const auto& b) {
+                  return a.sample < b.sample;
+              });
+    return result;
+}
+
 template <typename Channel>
 static void writeChannelRouting(json& value, const Channel& channel) {
     value["mainOutput"] = routeToJson(channel.mainOutput);
     json sends = json::array();
     for (const auto& send : channel.sends) sends.push_back(sendToJson(send));
     value["sends"] = std::move(sends);
+    value["volumeAutomation"] =
+        volumeAutomationToJson(channel.volumeAutomation);
+    value["panAutomation"] = panAutomationToJson(channel.panAutomation);
 }
 
 template <typename Channel>
@@ -161,13 +257,21 @@ static void readChannelRouting(const json& value, Channel& channel) {
             channel.sends.push_back(sendFromJson(send));
         }
     }
+    if (value.contains("volumeAutomation")) {
+        channel.volumeAutomation =
+            volumeAutomationFromJson(value["volumeAutomation"]);
+    }
+    if (value.contains("panAutomation")) {
+        channel.panAutomation =
+            panAutomationFromJson(value["panAutomation"]);
+    }
 }
 
 // ─── Serialize ──────────────────────────────────────────────────────────────
 
 std::string serializeEdit(const Edit& edit) {
     json j;
-    j["format"] = "dave.doc/v2";
+    j["format"] = "dave.doc/v3";
     // The session's own format, not a constant: sample positions in this
     // document are only meaningful against the rate that produced them.
     j["sampleRate"] = edit.sampleRate();
@@ -365,8 +469,9 @@ ProjectResult deserializeEdit(const std::string& text, Edit& edit) {
     }
     const std::string format = j.value("format", "");
     const bool legacyV1 = format == "dave.doc/v1";
-    if (!legacyV1 && format != "dave.doc/v2") {
-        return {false, "not a supported dave.doc project (expected v1 or v2)"};
+    if (!legacyV1 && format != "dave.doc/v2" && format != "dave.doc/v3") {
+        return {false,
+                "not a supported dave.doc project (expected v1, v2, or v3)"};
     }
 
     // Projects written before the session format was configurable carry no

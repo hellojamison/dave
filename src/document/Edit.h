@@ -107,6 +107,30 @@ public:
     // Applies to audio tracks, MIDI tracks, and buses. Empty restores the
     // type-specific default; malformed colors are refused.
     bool setTrackColor(const std::string& ownerId, std::string color);
+    std::vector<VolumeAutomationPoint>* volumeAutomation(
+        const std::string& ownerId);
+    const std::vector<VolumeAutomationPoint>* volumeAutomation(
+        const std::string& ownerId) const;
+    std::string addVolumeAutomationPoint(
+        const std::string& ownerId, int64_t sample, double db);
+    bool restoreVolumeAutomationPoint_(
+        const std::string& ownerId, VolumeAutomationPoint point, size_t index);
+    bool updateVolumeAutomationPoint(
+        const std::string& ownerId, VolumeAutomationPoint point);
+    bool removeVolumeAutomationPoint(
+        const std::string& ownerId, const std::string& pointId);
+    std::vector<PanAutomationPoint>* panAutomation(
+        const std::string& ownerId);
+    const std::vector<PanAutomationPoint>* panAutomation(
+        const std::string& ownerId) const;
+    std::string addPanAutomationPoint(
+        const std::string& ownerId, int64_t sample, double pan);
+    bool restorePanAutomationPoint_(
+        const std::string& ownerId, PanAutomationPoint point, size_t index);
+    bool updatePanAutomationPoint(
+        const std::string& ownerId, PanAutomationPoint point);
+    bool removePanAutomationPoint(
+        const std::string& ownerId, const std::string& pointId);
     std::string addSend(const std::string& ownerId, AuxSend send);
     bool restoreSend_(const std::string& ownerId, AuxSend send, size_t index);
     bool updateSend(const std::string& ownerId, const AuxSend& send);

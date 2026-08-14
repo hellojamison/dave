@@ -642,15 +642,26 @@ void drawTimeline(const document::Edit& edit,
     // header dimming below matches exactly what GraphBuilder silences.
     const bool anySoloed = edit.anySoloed();
     // MIDI rows carry one extra control row (the instrument), so they are
-    // taller than audio rows. Everything below the bands derives its position
-    // from these two heights rather than assuming a single row size.
+    // taller than audio rows. An opened disclosure adds a separate automation
+    // lane after the base row; collapsed geometry remains byte-for-byte the
+    // same as before automation existed.
     const float midiTrackHeight = trackHeight + compactControlHeight + rowGap;
-    const float audioRegionHeight =
-        static_cast<float>(tracks.size()) * trackHeight;
-    const float midiRegionHeight =
-        static_cast<float>(midiTracks.size()) * midiTrackHeight;
-    const float busRegionHeight =
-        static_cast<float>(buses.size()) * trackHeight;
+    constexpr float automationLaneHeight = 72.0f;
+    auto rowOffsets = [&](const auto& channels, float baseHeight) {
+        std::vector<float> offsets(channels.size() + 1, 0.0f);
+        for (size_t index = 0; index < channels.size(); ++index) {
+            offsets[index + 1] = offsets[index] + baseHeight +
+                (view.expandedTracks.contains(channels[index].id)
+                     ? automationLaneHeight : 0.0f);
+        }
+        return offsets;
+    };
+    const auto audioOffsets = rowOffsets(tracks, trackHeight);
+    const auto midiOffsets = rowOffsets(midiTracks, midiTrackHeight);
+    const auto busOffsets = rowOffsets(buses, trackHeight);
+    const float audioRegionHeight = audioOffsets.back();
+    const float midiRegionHeight = midiOffsets.back();
+    const float busRegionHeight = busOffsets.back();
     const float tracksRegionHeight =
         audioRegionHeight + midiRegionHeight + busRegionHeight;
     char areaBtn[32];
@@ -701,6 +712,14 @@ void drawTimeline(const document::Edit& edit,
     // One grid drives both the ruler and the lane lines, so a line under a
     // clip is always the same division as the label above it.
     const GridStep grid = gridStepFor(view.tcMode, view.samplesPerPixel, sr);
+    // One snap policy serves automation points, seeks, clip moves and range
+    // edges. Turning Snap off preserves the raw sample under the pointer.
+    auto snapPosition = [&](int64_t pos) -> int64_t {
+        pos = std::max<int64_t>(0, pos);
+        return view.snapEnabled
+            ? snapSampleToFormat(pos, view.tcMode, view.samplesPerPixel, sr)
+            : pos;
+    };
 
     // Walks the visible grid at `step`. Majors and minors are walked
     // separately rather than one loop testing `sample % major`: at 29.97 fps a
@@ -740,10 +759,8 @@ void drawTimeline(const document::Edit& edit,
     // both the audio and MIDI loops so the two bands cannot drift apart.
     //
     // The arrow points right when the track is closed and down when it is
-    // open, the direction convention every file browser uses. Nothing is wired
-    // to the open state yet — this lands the affordance and the geometry now,
-    // so whatever it eventually reveals (takes, automation lanes) does not
-    // also have to renegotiate the header layout.
+    // open, the direction convention every file browser uses. Open rows reveal
+    // a parameter-selectable automation lane below their ordinary content row.
     auto drawTrackBand = [&](float top, float height,
                              const ImVec4& fallbackColor,
                              const std::string& savedColor,
@@ -766,8 +783,12 @@ void drawTimeline(const document::Edit& edit,
         if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
             if (expanded) {
                 view.expandedTracks.erase(trackId);
+                if (view.revealAutomationOwnerId == trackId) {
+                    view.revealAutomationOwnerId.clear();
+                }
             } else {
                 view.expandedTracks.insert(trackId);
+                view.revealAutomationOwnerId = trackId;
             }
         }
 
@@ -777,7 +798,8 @@ void drawTimeline(const document::Edit& edit,
             ImGui::OpenPopup(popupId);
         }
         if (hovered) {
-            ImGui::SetTooltip("Click to expand; right-click for track color");
+            ImGui::SetTooltip(
+                "Open automation; right-click for track color");
         }
         std::string selectedColor;
         if (drawTrackColorPopup(popupId, savedColor, selectedColor)) {
@@ -884,23 +906,26 @@ void drawTimeline(const document::Edit& edit,
     // Row indices run across both bands — audio 0..n-1, then MIDI — the same
     // numbering selectedTrackIndex already uses, so a selection and a track
     // header selection can't disagree about which lane is which.
+    auto indexAtY = [](float y, float top,
+                       const std::vector<float>& offsets) -> int {
+        const float local = y - top;
+        if (local < 0.0f || offsets.empty() || local >= offsets.back()) {
+            return -1;
+        }
+        const auto next = std::upper_bound(offsets.begin(), offsets.end(), local);
+        const int index = static_cast<int>(next - offsets.begin()) - 1;
+        return index >= 0 && index + 1 < static_cast<int>(offsets.size())
+            ? index : -1;
+    };
     auto rowAtY = [&](float y) -> int {
-        if (y >= tracksTop && y < midiTop && trackHeight > 0.0f) {
-            const int i = static_cast<int>((y - tracksTop) / trackHeight);
-            if (i >= 0 && i < static_cast<int>(tracks.size())) return i;
+        if (const int i = indexAtY(y, tracksTop, audioOffsets); i >= 0) {
+            return i;
         }
-        if (y >= midiTop && y < midiTop + midiRegionHeight &&
-            midiTrackHeight > 0.0f) {
-            const int i = static_cast<int>((y - midiTop) / midiTrackHeight);
-            if (i >= 0 && i < static_cast<int>(midiTracks.size())) {
-                return static_cast<int>(tracks.size()) + i;
-            }
+        if (const int i = indexAtY(y, midiTop, midiOffsets); i >= 0) {
+            return static_cast<int>(tracks.size()) + i;
         }
-        if (y >= busTop && y < busTop + busRegionHeight && trackHeight > 0.0f) {
-            const int i = static_cast<int>((y - busTop) / trackHeight);
-            if (i >= 0 && i < static_cast<int>(buses.size())) {
-                return static_cast<int>(tracks.size() + midiTracks.size()) + i;
-            }
+        if (const int i = indexAtY(y, busTop, busOffsets); i >= 0) {
+            return static_cast<int>(tracks.size() + midiTracks.size()) + i;
         }
         return -1;
     };
@@ -909,20 +934,23 @@ void drawTimeline(const document::Edit& edit,
     auto rowExtent = [&](int row, float& outY, float& outH) -> bool {
         if (row < 0) return false;
         if (row < static_cast<int>(tracks.size())) {
-            outY = tracksTop + static_cast<float>(row) * trackHeight;
-            outH = trackHeight;
+            outY = tracksTop + audioOffsets[static_cast<size_t>(row)];
+            outH = audioOffsets[static_cast<size_t>(row) + 1] -
+                   audioOffsets[static_cast<size_t>(row)];
             return true;
         }
         const int mi = row - static_cast<int>(tracks.size());
         if (mi < static_cast<int>(midiTracks.size())) {
-            outY = midiTop + static_cast<float>(mi) * midiTrackHeight;
-            outH = midiTrackHeight;
+            outY = midiTop + midiOffsets[static_cast<size_t>(mi)];
+            outH = midiOffsets[static_cast<size_t>(mi) + 1] -
+                   midiOffsets[static_cast<size_t>(mi)];
             return true;
         }
         const int bi = mi - static_cast<int>(midiTracks.size());
         if (bi >= 0 && bi < static_cast<int>(buses.size())) {
-            outY = busTop + static_cast<float>(bi) * trackHeight;
-            outH = trackHeight;
+            outY = busTop + busOffsets[static_cast<size_t>(bi)];
+            outH = busOffsets[static_cast<size_t>(bi) + 1] -
+                   busOffsets[static_cast<size_t>(bi)];
             return true;
         }
         return false;
@@ -940,12 +968,455 @@ void drawTimeline(const document::Edit& edit,
     gutter.mouse = mouse;
     gutter.gutterHovered = gutterHovered;
 
+    bool automationMouseOver = false;
+    bool automationConsumedClick = false;
+    if (view.editingAutomationValue &&
+        !view.expandedTracks.contains(view.automationEditOwnerId)) {
+        view.editingAutomationValue = false;
+        view.focusAutomationValue = false;
+        view.automationEditOwnerId.clear();
+        view.automationEditPointId.clear();
+    }
+    const bool automationEditorOpenAtFrameStart =
+        view.editingAutomationValue;
+    auto drawAutomationLane = [&](
+        const std::string& ownerId,
+        const std::vector<document::VolumeAutomationPoint>& storedPoints,
+        float top, AutomationParameter parameter) {
+        const bool isPan = parameter == AutomationParameter::Pan;
+        const float bottom = top + automationLaneHeight;
+        const float laneLeft = origin.x + gutterWidth;
+        const float laneRight = origin.x + totalWidth;
+        constexpr float verticalPadding = 8.0f;
+        const float graphTop = top + verticalPadding;
+        const float graphBottom = bottom - verticalPadding;
+
+        dl->AddRectFilled(ImVec2(origin.x, top),
+                          ImVec2(laneLeft, bottom), C(pal.surfaceBase));
+        dl->AddRectFilled(ImVec2(laneLeft, top),
+                          ImVec2(laneRight, bottom), C(pal.trackLaneAlt));
+        dl->AddLine(ImVec2(origin.x, top), ImVec2(laneRight, top),
+                    C(pal.border));
+        dl->AddLine(ImVec2(origin.x, bottom), ImVec2(laneRight, bottom),
+                    C(pal.border));
+        const ImVec2 savedParameterCursor = ImGui::GetCursorScreenPos();
+        ImGui::SetCursorScreenPos(
+            ImVec2(origin.x + kGutterContentX - 4.0f, top + 5.0f));
+        ImGui::PushID(ownerId.c_str());
+        ImGui::SetNextItemWidth(112.0f);
+        const char* parameterName = isPan ? "Pan" : "Volume";
+        if (ImGui::BeginCombo("##automationParameter", parameterName,
+                              ImGuiComboFlags_HeightSmall)) {
+            for (const auto choice : {AutomationParameter::Volume,
+                                      AutomationParameter::Pan}) {
+                const bool selected = choice == parameter;
+                if (ImGui::Selectable(
+                        choice == AutomationParameter::Volume ? "Volume" : "Pan",
+                        selected)) {
+                    view.automationParameters[ownerId] = choice;
+                    if (view.automationOwnerId == ownerId) {
+                        view.draggingAutomation = false;
+                        view.automationOwnerId.clear();
+                        view.automationPointId.clear();
+                    }
+                    if (view.automationEditOwnerId == ownerId) {
+                        view.editingAutomationValue = false;
+                        view.automationEditOwnerId.clear();
+                        view.automationEditPointId.clear();
+                    }
+                    automationConsumedClick = true;
+                }
+                if (selected) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        automationMouseOver = automationMouseOver || ImGui::IsItemHovered();
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Automation parameter");
+        }
+        ImGui::PopID();
+        ImGui::SetCursorScreenPos(savedParameterCursor);
+
+        const double playheadValue = document::volumeAutomationDbAt(
+            storedPoints, transport.position());
+        char readout[24];
+        if (isPan) {
+            const std::string panText = theme::formatPan(playheadValue);
+            std::snprintf(readout, sizeof(readout), "%s", panText.c_str());
+        } else {
+            std::snprintf(readout, sizeof(readout), "%+.1f dB", playheadValue);
+        }
+        dl->AddText(ImVec2(origin.x + kGutterContentX, top + 32.0f),
+                    C(pal.textSubtle), readout);
+
+        auto clampLaneValue = [&](double value) {
+            return isPan ? document::clampPanAutomation(value)
+                         : document::clampVolumeAutomationDb(value);
+        };
+        const double minimumValue = isPan
+            ? -1.0 : document::kMinVolumeAutomationDb;
+        const double maximumValue = isPan
+            ? 1.0 : document::kMaxVolumeAutomationDb;
+        auto valueToY = [&](double value) {
+            const double clamped = clampLaneValue(value);
+            const double normalized =
+                (maximumValue - clamped) / (maximumValue - minimumValue);
+            return graphTop + static_cast<float>(normalized) *
+                                  (graphBottom - graphTop);
+        };
+        auto yToValue = [&](float y) {
+            const double normalized = std::clamp(
+                static_cast<double>((y - graphTop) /
+                                    std::max(1.0f, graphBottom - graphTop)),
+                0.0, 1.0);
+            return maximumValue - normalized *
+                (maximumValue - minimumValue);
+        };
+        auto xToSample = [&](float x) {
+            const double local = std::clamp(x, laneLeft, laneRight) - laneLeft;
+            return snapPosition(static_cast<int64_t>(
+                view.scrollSamples + local * view.samplesPerPixel));
+        };
+        auto sampleToX = [&](int64_t sample) {
+            return static_cast<float>(laneLeft +
+                (sample - view.scrollSamples) / view.samplesPerPixel);
+        };
+        auto movePoint = [&](const document::VolumeAutomationPoint& point) {
+            if (isPan) {
+                document::PanAutomationPoint panPoint;
+                panPoint.id = point.id;
+                panPoint.sample = point.sample;
+                panPoint.pan = point.db;
+                undo.execute(std::make_unique<
+                    editing::MovePanAutomationPointCommand>(
+                    ownerId, std::move(panPoint)));
+            } else {
+                undo.execute(std::make_unique<
+                    editing::MoveVolumeAutomationPointCommand>(
+                    ownerId, point));
+            }
+        };
+        auto addPoint = [&](int64_t sample, double value) {
+            if (isPan) {
+                undo.execute(std::make_unique<
+                    editing::AddPanAutomationPointCommand>(
+                    ownerId, sample, value));
+            } else {
+                undo.execute(std::make_unique<
+                    editing::AddVolumeAutomationPointCommand>(
+                    ownerId, sample, value));
+            }
+        };
+        auto removePoint = [&](const std::string& pointId) {
+            if (isPan) {
+                undo.execute(std::make_unique<
+                    editing::RemovePanAutomationPointCommand>(
+                    ownerId, pointId));
+            } else {
+                undo.execute(std::make_unique<
+                    editing::RemoveVolumeAutomationPointCommand>(
+                    ownerId, pointId));
+            }
+        };
+
+        if (isPan) {
+            for (double guide : {-1.0, -0.5, 0.0, 0.5, 1.0}) {
+                const float guideY = valueToY(guide);
+                dl->AddLine(ImVec2(laneLeft, guideY),
+                            ImVec2(laneRight, guideY),
+                            guide == 0.0 ? C(pal.borderStrong)
+                                         : C(pal.border));
+            }
+        } else {
+            for (double guide : {0.0, -12.0, -24.0, -48.0}) {
+                const float guideY = valueToY(guide);
+                dl->AddLine(ImVec2(laneLeft, guideY),
+                            ImVec2(laneRight, guideY),
+                            guide == 0.0 ? C(pal.borderStrong)
+                                         : C(pal.border));
+            }
+        }
+
+        std::vector<document::VolumeAutomationPoint> previewPoints;
+        const auto* drawPoints = &storedPoints;
+        if (view.draggingAutomation &&
+            view.automationOwnerId == ownerId &&
+            view.activeAutomationParameter == parameter) {
+            previewPoints = storedPoints;
+            const auto point = std::find_if(
+                previewPoints.begin(), previewPoints.end(), [&](const auto& p) {
+                    return p.id == view.automationPointId;
+                });
+            if (point != previewPoints.end()) {
+                *point = view.automationPreview;
+                std::sort(previewPoints.begin(), previewPoints.end(),
+                          [](const auto& a, const auto& b) {
+                              return a.sample < b.sample;
+                          });
+                drawPoints = &previewPoints;
+            }
+        }
+
+        const int64_t visibleStart = std::max<int64_t>(
+            0, static_cast<int64_t>(view.scrollSamples));
+        const int64_t visibleEnd = std::max<int64_t>(
+            visibleStart,
+            static_cast<int64_t>(view.scrollSamples +
+                (laneRight - laneLeft) * view.samplesPerPixel));
+        ImVec2 previous(laneLeft,
+                        valueToY(document::volumeAutomationDbAt(
+                            *drawPoints, visibleStart)));
+        for (const auto& point : *drawPoints) {
+            const float x = sampleToX(point.sample);
+            if (x <= laneLeft) continue;
+            if (x >= laneRight) break;
+            const ImVec2 current(x, valueToY(point.db));
+            dl->AddLine(previous, current, C(pal.accentStrong), 1.8f);
+            previous = current;
+        }
+        dl->AddLine(previous,
+                    ImVec2(laneRight,
+                           valueToY(document::volumeAutomationDbAt(
+                               *drawPoints, visibleEnd))),
+                    C(pal.accentStrong), 1.8f);
+
+        if (view.revealAutomationOwnerId == ownerId) {
+            const ImVec2 windowPos = ImGui::GetWindowPos();
+            const ImVec2 windowSize = ImGui::GetWindowSize();
+            const float visibleBottom =
+                windowPos.y + windowSize.y - ImGui::GetStyle().WindowPadding.y;
+            if (bottom > visibleBottom) {
+                ImGui::SetScrollFromPosY(bottom - windowPos.y, 1.0f);
+            }
+            view.revealAutomationOwnerId.clear();
+        }
+
+        std::string hoveredPointId;
+        for (const auto& point : *drawPoints) {
+            const ImVec2 center(sampleToX(point.sample), valueToY(point.db));
+            if (center.x < laneLeft - 6.0f || center.x > laneRight + 6.0f) {
+                continue;
+            }
+            const bool pointHovered =
+                std::fabs(mouse.x - center.x) <= 7.0f &&
+                std::fabs(mouse.y - center.y) <= 7.0f;
+            dl->AddCircleFilled(center, pointHovered ? 5.0f : 4.0f,
+                                C(pointHovered ? pal.primaryText
+                                               : pal.accentStrong));
+            dl->AddCircle(center, pointHovered ? 5.0f : 4.0f,
+                          C(pal.accentDeep), 0, 1.0f);
+            if (pointHovered) hoveredPointId = point.id;
+        }
+
+        const bool laneHovered = windowHeldOrHovered &&
+            mouse.x >= laneLeft && mouse.x <= laneRight &&
+            mouse.y >= top && mouse.y <= bottom;
+        automationMouseOver = automationMouseOver || laneHovered;
+        if (laneHovered && !hoveredPointId.empty()) {
+            ImGui::SetTooltip(isPan
+                ? "Drag to move; double-click to enter pan; right-click to delete"
+                : "Drag to move; double-click to enter dB; right-click to delete");
+        } else if (laneHovered) {
+            ImGui::SetTooltip(isPan
+                ? "Click to add a pan automation point"
+                : "Click to add a volume automation point");
+        }
+
+        const bool opensValueEditor =
+            laneHovered && !hoveredPointId.empty() &&
+            ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
+        if (opensValueEditor) {
+            const auto found = std::find_if(
+                storedPoints.begin(), storedPoints.end(), [&](const auto& point) {
+                    return point.id == hoveredPointId;
+                });
+            if (found != storedPoints.end()) {
+                view.draggingAutomation = false;
+                view.activeAutomationParameter = parameter;
+                view.automationOwnerId.clear();
+                view.automationPointId.clear();
+                view.editingAutomationValue = true;
+                view.focusAutomationValue = true;
+                view.automationEditOwnerId = ownerId;
+                view.automationEditPointId = found->id;
+                view.automationEditValue = isPan
+                    ? found->db * 100.0 : found->db;
+                automationConsumedClick = true;
+            }
+        }
+
+        const bool editingValueAtFrameStart =
+            view.editingAutomationValue &&
+            view.automationEditOwnerId == ownerId &&
+            view.activeAutomationParameter == parameter;
+        if (editingValueAtFrameStart) {
+            const auto editedPoint = std::find_if(
+                storedPoints.begin(), storedPoints.end(), [&](const auto& point) {
+                    return point.id == view.automationEditPointId;
+                });
+            if (editedPoint == storedPoints.end()) {
+                view.editingAutomationValue = false;
+                view.focusAutomationValue = false;
+                view.automationEditOwnerId.clear();
+                view.automationEditPointId.clear();
+            } else {
+                constexpr float editorWidth = 82.0f;
+                const float editorHeight = ImGui::GetFrameHeight();
+                const ImVec2 pointCenter(sampleToX(editedPoint->sample),
+                                         valueToY(editedPoint->db));
+                const ImVec2 savedCursor = ImGui::GetCursorScreenPos();
+                ImGui::SetCursorScreenPos(ImVec2(
+                    std::clamp(pointCenter.x + 10.0f, laneLeft + 4.0f,
+                               laneRight - editorWidth - 4.0f),
+                    std::clamp(pointCenter.y - editorHeight * 0.5f,
+                               top + 2.0f, bottom - editorHeight - 2.0f)));
+                ImGui::PushID(ownerId.c_str());
+                ImGui::PushID(view.automationEditPointId.c_str());
+                ImGui::SetNextItemWidth(editorWidth);
+                if (view.focusAutomationValue) {
+                    ImGui::SetKeyboardFocusHere();
+                    view.focusAutomationValue = false;
+                }
+                const bool submitted = ImGui::InputDouble(
+                    "##automationValue", &view.automationEditValue,
+                    0.0, 0.0, isPan ? "%+.0f" : "%+.1f dB",
+                    ImGuiInputTextFlags_EnterReturnsTrue |
+                        ImGuiInputTextFlags_AutoSelectAll);
+                const bool cancelled = ImGui::IsItemActive() &&
+                    ImGui::IsKeyPressed(ImGuiKey_Escape);
+                const bool deactivated = ImGui::IsItemDeactivated();
+                automationMouseOver = automationMouseOver ||
+                    ImGui::IsItemHovered();
+                if (ImGui::IsItemHovered()) {
+                    if (isPan) {
+                        ImGui::SetTooltip(
+                            "Pan (-100 = left, 0 = centre, +100 = right)");
+                    } else {
+                        ImGui::SetTooltip("Volume (%+.1f to %+.1f dB)",
+                                          document::kMinVolumeAutomationDb,
+                                          document::kMaxVolumeAutomationDb);
+                    }
+                }
+                ImGui::PopID();
+                ImGui::PopID();
+                ImGui::SetCursorScreenPos(savedCursor);
+
+                if (cancelled) {
+                    view.editingAutomationValue = false;
+                    view.automationEditOwnerId.clear();
+                    view.automationEditPointId.clear();
+                    automationConsumedClick = true;
+                } else if (submitted || deactivated) {
+                    auto updated = *editedPoint;
+                    updated.db = clampLaneValue(isPan
+                        ? view.automationEditValue / 100.0
+                        : view.automationEditValue);
+                    if (updated.db != editedPoint->db) {
+                        movePoint(updated);
+                    }
+                    view.editingAutomationValue = false;
+                    view.automationEditOwnerId.clear();
+                    view.automationEditPointId.clear();
+                    automationConsumedClick = true;
+                }
+            }
+        }
+
+        if (automationEditorOpenAtFrameStart ||
+            editingValueAtFrameStart || opensValueEditor) {
+            automationConsumedClick = true;
+        } else if (!automationConsumedClick &&
+                   view.draggingAutomation &&
+                   view.automationOwnerId == ownerId &&
+                   view.activeAutomationParameter == parameter) {
+            if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                view.automationPreview.sample = xToSample(mouse.x);
+                view.automationPreview.db = clampLaneValue(yToValue(mouse.y));
+            } else if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+                const bool sampleOccupied = std::any_of(
+                    storedPoints.begin(), storedPoints.end(),
+                    [&](const auto& point) {
+                        return point.id != view.automationPointId &&
+                               point.sample == view.automationPreview.sample;
+                    });
+                if (!sampleOccupied &&
+                    view.automationPreview != view.automationOriginal) {
+                    movePoint(view.automationPreview);
+                }
+                view.draggingAutomation = false;
+                view.automationOwnerId.clear();
+                view.automationPointId.clear();
+                automationConsumedClick = true;
+            }
+        } else if (!automationConsumedClick && laneHovered &&
+                   ImGui::IsMouseClicked(ImGuiMouseButton_Right) &&
+                   !hoveredPointId.empty()) {
+            removePoint(hoveredPointId);
+            automationConsumedClick = true;
+        } else if (!automationConsumedClick && laneHovered &&
+                   ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            const auto found = std::find_if(
+                storedPoints.begin(), storedPoints.end(), [&](const auto& point) {
+                    return point.id == hoveredPointId;
+                });
+            if (found != storedPoints.end()) {
+                view.draggingAutomation = true;
+                view.activeAutomationParameter = parameter;
+                view.automationOwnerId = ownerId;
+                view.automationPointId = found->id;
+                view.automationOriginal = *found;
+                view.automationPreview = *found;
+            } else {
+                const int64_t sample = xToSample(mouse.x);
+                const double value = clampLaneValue(yToValue(mouse.y));
+                const auto sameSample = std::find_if(
+                    storedPoints.begin(), storedPoints.end(),
+                    [sample](const auto& point) {
+                        return point.sample == sample;
+                    });
+                if (sameSample != storedPoints.end()) {
+                    auto moved = *sameSample;
+                    moved.db = value;
+                    movePoint(moved);
+                } else {
+                    addPoint(sample, value);
+                }
+            }
+            automationConsumedClick = true;
+        }
+
+    };
+    auto drawChannelAutomationLane = [&](
+        const std::string& ownerId,
+        const std::vector<document::VolumeAutomationPoint>& volumePoints,
+        const std::vector<document::PanAutomationPoint>& panPoints,
+        float top) {
+        const auto [parameterIt, inserted] = view.automationParameters.try_emplace(
+            ownerId, AutomationParameter::Volume);
+        (void)inserted;
+        const AutomationParameter parameter = parameterIt->second;
+        if (parameter == AutomationParameter::Volume) {
+            drawAutomationLane(ownerId, volumePoints, top, parameter);
+            return;
+        }
+
+        // The lane renderer is deliberately parameter-agnostic. Normalize pan
+        // points into its lightweight UI shape, then convert back only when an
+        // undoable document command is committed.
+        std::vector<document::VolumeAutomationPoint> normalized;
+        normalized.reserve(panPoints.size());
+        for (const auto& point : panPoints) {
+            normalized.push_back({point.id, point.sample, point.pan});
+        }
+        drawAutomationLane(ownerId, normalized, top, parameter);
+    };
+
     // Tracks + clips.
     ImGui::PushStyleVar(
         ImGuiStyleVar_FramePadding, ImVec2(style.FramePadding.x, 1.0f));
     for (size_t ti = 0; ti < tracks.size(); ++ti) {
         const auto& track = tracks[ti];
-        float y = tracksTop + static_cast<float>(ti) * trackHeight;
+        float y = tracksTop + audioOffsets[ti];
         if (y > origin.y + totalHeight) break;
 
         bool selected = view.selectedTrackIndex == static_cast<int>(ti);
@@ -999,6 +1470,10 @@ void drawTimeline(const document::Edit& edit,
                                               &mutableTrack.solo,
                                               &mutableTrack.recordArm},
                             selected);
+        }
+        if (view.expandedTracks.contains(track.id)) {
+            drawChannelAutomationLane(track.id, track.volumeAutomation,
+                                      track.panAutomation, y + trackHeight);
         }
 
         // A soloed track elsewhere silences this one. Without a cue in the
@@ -1165,7 +1640,7 @@ void drawTimeline(const document::Edit& edit,
     // from an audio track in what feeds it, not in how it is arranged.
     for (size_t mi = 0; mi < midiTracks.size(); ++mi) {
         const auto& track = midiTracks[mi];
-        const float y = midiTop + static_cast<float>(mi) * midiTrackHeight;
+        const float y = midiTop + midiOffsets[mi];
         if (y > origin.y + totalHeight) break;
         // Ids continue past the audio tracks so ImGui state and the single
         // inline-rename slot can't collide between the two bands.
@@ -1249,6 +1724,11 @@ void drawTimeline(const document::Edit& edit,
                     : "Choose an instrument for this track");
             }
             ImGui::PopID();
+        }
+        if (view.expandedTracks.contains(track.id)) {
+            drawChannelAutomationLane(
+                track.id, track.volumeAutomation, track.panAutomation,
+                y + midiTrackHeight);
         }
 
         if (!track.mute && !track.solo && anySoloed) {
@@ -1369,7 +1849,7 @@ void drawTimeline(const document::Edit& edit,
     // and selection model but deliberately draw no clip interaction surface.
     for (size_t bi = 0; bi < buses.size(); ++bi) {
         const auto& bus = buses[bi];
-        const float y = busTop + static_cast<float>(bi) * trackHeight;
+        const float y = busTop + busOffsets[bi];
         if (y > origin.y + totalHeight) break;
         const int uid = static_cast<int>(tracks.size() + midiTracks.size() + bi);
         const bool selected = view.selectedTrackIndex == uid;
@@ -1400,6 +1880,10 @@ void drawTimeline(const document::Edit& edit,
                                           &mutableBus.gain, &mutableBus.pan,
                                           &mutableBus.mute, &mutableBus.solo,
                                           nullptr}, selected);
+        if (view.expandedTracks.contains(bus.id)) {
+            drawChannelAutomationLane(bus.id, bus.volumeAutomation,
+                                      bus.panAutomation, y + trackHeight);
+        }
         const char* kind = bus.isMain ? "MAIN BUS" : "BUS";
         dl->AddText(ImVec2(origin.x + gutterWidth + 8.0f, y + 8.0f),
                     C(pal.textSubtle), kind);
@@ -1474,16 +1958,6 @@ void drawTimeline(const document::Edit& edit,
         ImGui::EndPopup();
     }
 
-    // One snap policy serves seeks, clip moves and range edges. The active
-    // ruler format defines the valid divisions; turning Snap off preserves
-    // the raw sample position under the pointer.
-    auto snapPosition = [&](int64_t pos) -> int64_t {
-        pos = std::max<int64_t>(0, pos);
-        return view.snapEnabled
-            ? snapSampleToFormat(pos, view.tcMode, view.samplesPerPixel, sr)
-            : pos;
-    };
-
     // Handle drag delta for the active drag (committed on release).
     const bool draggingAudioClip =
         view.isDragging(TimelineViewState::DragKind::AudioClip);
@@ -1499,19 +1973,9 @@ void drawTimeline(const document::Edit& edit,
         // a MIDI track, and a note sequence has no waveform for an audio one.
         int targetTrackIndex = -1;
         if (draggingMidiClip) {
-            if (mouse.y >= midiTop && midiTrackHeight > 0.0f) {
-                targetTrackIndex =
-                    static_cast<int>((mouse.y - midiTop) / midiTrackHeight);
-                if (targetTrackIndex < 0 ||
-                    targetTrackIndex >= static_cast<int>(midiTracks.size())) {
-                    targetTrackIndex = -1;
-                }
-            }
-        } else if (mouse.y >= tracksTop && mouse.y < midiTop) {
-            targetTrackIndex = static_cast<int>((mouse.y - tracksTop) / trackHeight);
-            if (targetTrackIndex < 0 || targetTrackIndex >= static_cast<int>(tracks.size())) {
-                targetTrackIndex = -1;
-            }
+            targetTrackIndex = indexAtY(mouse.y, midiTop, midiOffsets);
+        } else {
+            targetTrackIndex = indexAtY(mouse.y, tracksTop, audioOffsets);
         }
 
         // Preview only — the document is not touched until mouse-up, so
@@ -1528,7 +1992,8 @@ void drawTimeline(const document::Edit& edit,
         if (targetTrackIndex >= 0) {
             const float rowHeight = draggingMidiClip ? midiTrackHeight : trackHeight;
             const float bandTop = draggingMidiClip ? midiTop : tracksTop;
-            const float ty = bandTop + static_cast<float>(targetTrackIndex) * rowHeight;
+            const auto& offsets = draggingMidiClip ? midiOffsets : audioOffsets;
+            const float ty = bandTop + offsets[static_cast<size_t>(targetTrackIndex)];
             dl->AddRectFilled(ImVec2(origin.x + gutterWidth, ty),
                               ImVec2(origin.x + totalWidth, ty + rowHeight),
                               C(ImVec4(pal.accent.x, pal.accent.y, pal.accent.z, 0.12f)));
@@ -1604,8 +2069,9 @@ void drawTimeline(const document::Edit& edit,
     }
 
     // Track area: click empty space seeks (but not on clips — those drag).
-    if (canvasHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
-        !view.isDragging()) {
+    if (canvasHovered && !automationMouseOver && !automationConsumedClick &&
+        ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+        !view.isDragging() && !view.draggingAutomation) {
         bool hitClip = false;
         auto spansMouse = [&](int64_t start, int64_t length) {
             const double x = origin.x + gutterWidth +

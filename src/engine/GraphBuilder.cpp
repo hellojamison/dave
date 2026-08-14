@@ -181,6 +181,18 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit,
         const bool active = !anySoloed || soloActive.count(channel.id) != 0;
         gain->setGain(!channel.mute && active ? channel.gain : 0.0);
         gain->setPan(channel.pan);
+        std::vector<GainNode::AutomationPoint> automation;
+        automation.reserve(channel.volumeAutomation.size());
+        for (const auto& point : channel.volumeAutomation) {
+            automation.push_back({point.sample, point.db});
+        }
+        gain->setVolumeAutomation(std::move(automation));
+        std::vector<GainNode::PanAutomationPoint> panAutomation;
+        panAutomation.reserve(channel.panAutomation.size());
+        for (const auto& point : channel.panAutomation) {
+            panAutomation.push_back({point.sample, point.pan});
+        }
+        gain->setPanAutomation(std::move(panAutomation));
         const NodeId gainId = graph->addNode(gain);
         graph->connect(preFader, 0, gainId, 0);
         trackGains_[channel.id] = gain;

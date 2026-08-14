@@ -24,11 +24,16 @@ playback over a selection or a loop marker. A timeline with tracks, clips,
 drag editing, peak waveforms, undo/redo, and lane-scoped range selection that
 snaps to the divisions of the current timing format — min:sec, timecode,
 bars|beats, feet+frames or samples, each with a matching grid. A mixer with
-per-track gain, pan, mute and solo, per-track hardware inputs, explicit input monitoring, hardware output spans,
+per-track gain, pan, mute and solo, per-track hardware inputs, explicit input
+monitoring, hardware output spans,
 a permanent Main bus, user buses, pre/post auxiliary sends, cycle-safe
-track-to-track/bus routing, and plug-in delay compensation. VST3 hosting — scanning, loading, native
-plugin editor windows, bypass and state save/restore — including instruments
-on MIDI tracks. MIDI file import onto MIDI tracks. A multi-track marker lane
+track-to-track/bus routing, and plug-in delay compensation. VST3 hosting —
+scanning, loading, native plugin editor windows, bypass and state save/restore,
+including instruments on MIDI tracks. Parameter-selectable Volume and Pan
+automation lanes on audio,
+MIDI, bus, and Main channels, with point editing, numeric entry, persistence,
+undo/redo, and sample-accurate playback. MIDI file import onto MIDI tracks. A
+multi-track marker lane
 with Reaper CSV import/export and loop regions. Video playback with a preview
 panel synced to the audio clock, plus a video lane with thumbnails. Projects
 save and load as `.dave` bundles with content-addressed assets, carrying the
@@ -36,7 +41,8 @@ session sample rate and bit depth.
 
 **Not yet:** punch/loop recording, takes/playlists, live
 waveforms, unsaved-session scratch recording, crash recovery, orphan cleanup,
-or MIDI recording. Also Windows (untested), automation, video editing,
+or MIDI recording. Also Windows (untested), automation write modes and plug-in
+parameter automation, video editing,
 rendering and export, AU and CLAP hosting,
 live MIDI I/O, and time/pitch. See the roadmap.
 
@@ -129,7 +135,7 @@ stays available under the project's licence.
 | 6 — Video NLE | Video tracks; transitions; compositor; render/export | ⬜ |
 | — | MIDI | 🟡 File import, MIDI tracks and instrument hosting; live I/O and editing pending |
 | — | Recording | 🟡 Linear armed-track WAV takes and explicit input monitoring; punch, loop record, takes model and recovery pending |
-| — | Automation, time/pitch | ⬜ |
+| — | Automation, time/pitch | 🟡 Volume/Pan envelope editing and playback; Off/Read/Touch/Write, plug-in parameters and time/pitch pending |
 | — | Test suite + CI | 🟡 Unit tests + macOS CI; RT-safety checks (TSan/ASan, no allocs or locks on the audio thread) pending |
 | 7 — Polish / 1.0 | Theming; a11y; crash reporting; packaging; DAWproject | 🟡 Theming done; rest pending |
 

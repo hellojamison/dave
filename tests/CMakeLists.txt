@@ -19,6 +19,8 @@ add_executable(dave_tests
     test_timelinelayout.cpp
     test_maineditorlayout.cpp
     test_trackcolor.cpp
+    test_automation.cpp
+    test_trackmeter.cpp
     test_transport.cpp
     test_spscqueue.cpp
     test_ringbuffer.cpp

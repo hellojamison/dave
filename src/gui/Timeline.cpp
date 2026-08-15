@@ -239,6 +239,59 @@ namespace {
 constexpr size_t kPeakCacheBytes = 32u * 1024u * 1024u;
 constexpr size_t kMaxBucketsPerLevel = 1u << 20;
 
+// The toolbar and lane cursor share one pencil silhouette so the selected
+// tool and the thing under the user's hand cannot drift into different icons.
+// `tip` is also the cursor hotspot: drawing begins at the graphite point.
+void drawPencilGlyph(ImDrawList* dl, ImVec2 tip, float scale = 1.0f) {
+    const auto point = [&](float x, float y) {
+        return ImVec2(tip.x + x * scale, tip.y + y * scale);
+    };
+    const ImU32 outline = IM_COL32(36, 33, 30, 255);
+    const ImU32 yellow = IM_COL32(244, 190, 54, 255);
+    const ImU32 highlight = IM_COL32(255, 226, 116, 255);
+    const ImU32 eraserColor = IM_COL32(224, 126, 143, 255);
+    const ImU32 ferruleColor = IM_COL32(172, 181, 181, 255);
+    const ImU32 wood = IM_COL32(226, 187, 132, 255);
+    const ImU32 graphite = IM_COL32(32, 31, 29, 255);
+
+    const ImVec2 bodyUpper = point(2.2f, -6.4f);
+    const ImVec2 bodyLower = point(6.6f, -2.0f);
+    const ImVec2 ferruleUpper = point(9.4f, -13.6f);
+    const ImVec2 ferruleLower = point(13.8f, -9.2f);
+    const ImVec2 eraserUpper = point(12.9f, -17.1f);
+    const ImVec2 eraserLower = point(17.3f, -12.7f);
+
+    const ImVec2 body[4] = {
+        bodyUpper, ferruleUpper, ferruleLower, bodyLower,
+    };
+    dl->AddConvexPolyFilled(body, 4, yellow);
+    dl->AddTriangleFilled(tip, bodyUpper, bodyLower, wood);
+
+    const ImVec2 ferrule[4] = {
+        ferruleUpper, point(11.5f, -15.7f), point(15.9f, -11.3f),
+        ferruleLower,
+    };
+    dl->AddConvexPolyFilled(ferrule, 4, ferruleColor);
+
+    const ImVec2 eraser[4] = {
+        eraserUpper, point(15.0f, -19.2f), point(19.4f, -14.8f),
+        eraserLower,
+    };
+    dl->AddConvexPolyFilled(eraser, 4, eraserColor);
+
+    dl->AddTriangleFilled(tip, point(0.7f, -2.1f), point(2.1f, -0.7f),
+                          graphite);
+    dl->AddLine(point(4.8f, -6.2f), point(10.8f, -12.2f), highlight,
+                1.2f * scale);
+
+    const ImVec2 silhouette[7] = {
+        tip, bodyUpper, ferruleUpper, eraserUpper, point(19.4f, -14.8f),
+        eraserLower, bodyLower,
+    };
+    dl->AddPolyline(silhouette, 7, outline, ImDrawFlags_Closed,
+                    1.4f * scale);
+}
+
 // ─── Track gutter (header column) ───────────────────────────────────────────
 // Audio and MIDI tracks differ in what plays, not in how they are mixed, so
 // the header column — name, mute/solo, gain, pan — is written once here rather
@@ -1116,72 +1169,8 @@ void drawTimeline(const document::Edit& edit,
             const ImU32 iconColor = C(selected ? pal.primaryText
                                                : pal.textMuted);
             if (tool == AutomationTool::Pencil) {
-                // A conventional edit-pencil silhouette: graphite at the
-                // lower-left, a broad yellow body, metal ferrule, then eraser.
-                // Keeping each physical part visible is what prevents a 24 px
-                // tool icon from collapsing back into an abstract slash.
-                const ImU32 outline = IM_COL32(36, 33, 30, 255);
-                const ImU32 yellow = IM_COL32(244, 190, 54, 255);
-                const ImU32 highlight = IM_COL32(255, 226, 116, 255);
-                const ImU32 eraserColor = IM_COL32(224, 126, 143, 255);
-                const ImU32 ferruleColor = IM_COL32(172, 181, 181, 255);
-                const ImU32 wood = IM_COL32(226, 187, 132, 255);
-                const ImU32 graphite = IM_COL32(32, 31, 29, 255);
-
-                const ImVec2 tip(buttonMin.x + 3.2f, buttonMin.y + 20.6f);
-                const ImVec2 bodyUpper(buttonMin.x + 5.4f,
-                                       buttonMin.y + 14.2f);
-                const ImVec2 bodyLower(buttonMin.x + 9.8f,
-                                       buttonMin.y + 18.6f);
-                const ImVec2 ferruleUpper(buttonMin.x + 12.6f,
-                                          buttonMin.y + 7.0f);
-                const ImVec2 ferruleLower(buttonMin.x + 17.0f,
-                                          buttonMin.y + 11.4f);
-                const ImVec2 eraserUpper(buttonMin.x + 16.1f,
-                                         buttonMin.y + 3.5f);
-                const ImVec2 eraserLower(buttonMin.x + 20.5f,
-                                         buttonMin.y + 7.9f);
-
-                const ImVec2 body[4] = {
-                    bodyUpper, ferruleUpper, ferruleLower, bodyLower,
-                };
-                dl->AddConvexPolyFilled(body, 4, yellow);
-                dl->AddTriangleFilled(tip, bodyUpper, bodyLower, wood);
-
-                const ImVec2 ferrule[4] = {
-                    ferruleUpper,
-                    ImVec2(buttonMin.x + 14.7f, buttonMin.y + 4.9f),
-                    ImVec2(buttonMin.x + 19.1f, buttonMin.y + 9.3f),
-                    ferruleLower,
-                };
-                dl->AddConvexPolyFilled(ferrule, 4, ferruleColor);
-
-                const ImVec2 eraser[4] = {
-                    eraserUpper,
-                    ImVec2(buttonMin.x + 18.2f, buttonMin.y + 1.4f),
-                    ImVec2(buttonMin.x + 22.6f, buttonMin.y + 5.8f),
-                    eraserLower,
-                };
-                dl->AddConvexPolyFilled(eraser, 4, eraserColor);
-
-                const ImVec2 leadUpper(buttonMin.x + 3.9f,
-                                       buttonMin.y + 18.5f);
-                const ImVec2 leadLower(buttonMin.x + 5.3f,
-                                       buttonMin.y + 19.9f);
-                dl->AddTriangleFilled(tip, leadUpper, leadLower, graphite);
-                dl->AddLine(ImVec2(buttonMin.x + 8.0f,
-                                   buttonMin.y + 14.4f),
-                            ImVec2(buttonMin.x + 14.0f,
-                                   buttonMin.y + 8.4f),
-                            highlight, 1.2f);
-
-                const ImVec2 silhouette[7] = {
-                    tip, bodyUpper, ferruleUpper, eraserUpper,
-                    ImVec2(buttonMin.x + 22.6f, buttonMin.y + 5.8f),
-                    eraserLower, bodyLower,
-                };
-                dl->AddPolyline(silhouette, 7, outline,
-                                ImDrawFlags_Closed, 1.4f);
+                drawPencilGlyph(
+                    dl, ImVec2(buttonMin.x + 3.2f, buttonMin.y + 20.6f));
             } else if (tool == AutomationTool::Curve) {
                 constexpr int curveSegments = 10;
                 ImVec2 curve[curveSegments + 1];
@@ -1640,6 +1629,16 @@ void drawTimeline(const document::Edit& edit,
                     automationConsumedClick = true;
                 }
             }
+        }
+
+        const bool showPencilCursor =
+            laneHovered && view.automationTool == AutomationTool::Pencil &&
+            !view.editingAutomationValue && !opensValueEditor;
+        if (showPencilCursor) {
+            // Hide the platform arrow and draw the shared pencil with its
+            // graphite point exactly at the automation sample/value hotspot.
+            ImGui::SetMouseCursor(ImGuiMouseCursor_None);
+            drawPencilGlyph(ImGui::GetForegroundDrawList(), mouse, 1.1f);
         }
 
         if (automationEditorOpenAtFrameStart ||

@@ -995,6 +995,33 @@ TEST_CASE("automation lane toggles between pencil line and curve tools",
     CHECK_FALSE(rig.undo.canUndo());
 }
 
+TEST_CASE("pencil tool uses its pencil as the automation lane cursor",
+          "[timelinelayout][automation][tools][cursor]") {
+    LayoutRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string track = rig.edit.addTrack("Dialog");
+    rig.settle();
+    const float tracksTop =
+        rig.origin.y + kRulerHeight + kMarkerLaneHeight;
+    const float automationTop = tracksTop + effectiveTrackHeight();
+    rig.clickTimelineAt(rig.origin.x + 17.0f,
+                        tracksTop + kTrackHeight * 0.5f);
+    REQUIRE(rig.view.expandedTracks.contains(track));
+
+    const float laneX = rig.origin.x + kGutterWidth + 80.0f;
+    const float laneY = automationTop + kAutomationLaneHeight * 0.5f;
+    rig.tick(laneX, laneY, false);
+    CHECK(ImGui::GetMouseCursor() == ImGuiMouseCursor_None);
+
+    rig.view.automationTool = gui::AutomationTool::Line;
+    rig.tick(laneX, laneY, false);
+    CHECK(ImGui::GetMouseCursor() != ImGuiMouseCursor_None);
+
+    rig.view.automationTool = gui::AutomationTool::Pencil;
+    rig.tick(rig.origin.x + 40.0f, tracksTop + 10.0f, false);
+    CHECK(ImGui::GetMouseCursor() != ImGuiMouseCursor_None);
+}
+
 TEST_CASE("pencil draws a thinned envelope as one undoable gesture",
           "[timelinelayout][automation][tools]") {
     LayoutRig rig;

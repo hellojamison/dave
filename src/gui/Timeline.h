@@ -193,8 +193,8 @@ struct TimelineViewState {
     // Pencil, Line and Curve gestures are preview-only until mouse-up. The
     // generic `db` value is dB for Volume and normalized -1..+1 for Pan,
     // matching the point-drag preview above. One bulk command commits the
-    // completed stroke. Curve reads Option/Alt throughout the gesture so the
-    // preview can switch live between parabolic and logarithmic shapes.
+    // completed stroke. Curve reads Option/Alt and Control throughout the
+    // gesture so its shape and slope direction can switch live.
     bool drawingAutomation = false;
     AutomationParameter drawingAutomationParameter =
         AutomationParameter::Volume;

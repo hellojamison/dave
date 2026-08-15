@@ -104,6 +104,10 @@ struct LayoutRig : ImGuiRig {
     // set back — so this holds Option down across a whole gesture.
     void holdAlt(bool down) { ImGui::GetIO().AddKeyEvent(ImGuiMod_Alt, down); }
 
+    void holdControl(bool down) {
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, down);
+    }
+
     void holdSuper(bool down) {
         ImGui::GetIO().AddKeyEvent(ImGuiMod_Super, down);
     }
@@ -1301,6 +1305,54 @@ TEST_CASE("holding Option switches an active curve to logarithmic automation",
 
     rig.undo.undo();
     CHECK(rig.edit.track(track)->panAutomation.empty());
+}
+
+TEST_CASE("holding Control reverses an active curve slope",
+          "[timelinelayout][automation][tools][curve][slope]") {
+    LayoutRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string track = rig.edit.addTrack("Dialog");
+    rig.settle();
+    const float tracksTop =
+        rig.origin.y + kRulerHeight + kMarkerLaneHeight;
+    const float automationTop = tracksTop + effectiveTrackHeight();
+    rig.clickTimelineAt(rig.origin.x + 17.0f,
+                        tracksTop + kTrackHeight * 0.5f);
+    rig.clickTimelineAt(rig.origin.x + 216.0f, automationTop + 16.0f);
+    REQUIRE(rig.view.automationTool == gui::AutomationTool::Curve);
+
+    auto volumeY = [&](double db) {
+        return automationTop + 8.0f +
+            static_cast<float>((document::kMaxVolumeAutomationDb - db) /
+                (document::kMaxVolumeAutomationDb -
+                 document::kMinVolumeAutomationDb)) *
+                (kAutomationLaneHeight - 16.0f);
+    };
+    const float x0 = rig.origin.x + kGutterWidth + 100.0f;
+    const float x1 = rig.origin.x + kGutterWidth + 300.0f;
+    auto midpointDb = [&] {
+        const auto midpoint = std::find_if(
+            rig.view.automationDrawStroke.begin(),
+            rig.view.automationDrawStroke.end(), [](const auto& point) {
+                return point.sample == 100000;
+            });
+        REQUIRE(midpoint != rig.view.automationDrawStroke.end());
+        return midpoint->db;
+    };
+
+    rig.tick(x0, volumeY(-48.0), false);
+    rig.tick(x0, volumeY(-48.0), true);
+    rig.tick(x1, volumeY(0.0), true);
+    CHECK(midpointDb() == Catch::Approx(-36.0).margin(1.5));
+
+    rig.holdControl(true);
+    rig.tick(x1, volumeY(0.0), true);
+    CHECK(midpointDb() == Catch::Approx(-12.0).margin(1.5));
+
+    rig.holdControl(false);
+    rig.tick(x1, volumeY(0.0), true);
+    CHECK(midpointDb() == Catch::Approx(-36.0).margin(1.5));
+    rig.tick(x1, volumeY(0.0), false);
 }
 
 TEST_CASE("latest automation draw values use lane-specific readouts",

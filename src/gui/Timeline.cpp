@@ -1214,7 +1214,7 @@ void drawTimeline(const document::Edit& edit,
                        "Line: drag a straight automation ramp");
         drawToolButton("##curve", AutomationTool::Curve,
                        toolsLeft + 2.0f * (toolSize.x + toolGap),
-                       "Curve: drag a parabolic ramp; hold Option (Alt on Windows) for logarithmic");
+                       "Curve: drag a parabolic ramp; hold Option (Alt on Windows) for logarithmic; hold Control to reverse the slope");
         ImGui::PopID();
         ImGui::PopID();
         ImGui::SetCursorScreenPos(savedParameterCursor);
@@ -1307,14 +1307,28 @@ void drawTimeline(const document::Edit& edit,
                            std::fabs(dx) / pointSpacing)));
                 const double startValue = view.automationDrawAnchor.db;
                 const double endValue = yToValue(mouse.y);
+#if defined(__APPLE__)
+                // ImGui's macOS behavior swaps Command and Control internally:
+                // physical Control is exposed as KeySuper here.
+                const bool reverseSlope = ImGui::GetIO().KeySuper;
+#else
+                const bool reverseSlope = ImGui::GetIO().KeyCtrl;
+#endif
+                auto shapeAmount = [&](double amount) {
+                    return view.automationDrawLogarithmic
+                        ? std::log10(1.0 + 9.0 * amount)
+                        : amount * amount;
+                };
                 for (int step = 0; step <= steps; ++step) {
                     const double t = static_cast<double>(step) /
                                      static_cast<double>(steps);
                     // A finite, endpoint-preserving logarithmic mapping makes
                     // Option/Alt useful for both volume and bipolar pan lanes.
-                    const double shaped = view.automationDrawLogarithmic
-                        ? std::log10(1.0 + 9.0 * t)
-                        : t * t;
+                    // Control mirrors the mapping around the midpoint, moving
+                    // the steep part of either shape to the opposite endpoint.
+                    const double shaped = reverseSlope
+                        ? 1.0 - shapeAmount(1.0 - t)
+                        : shapeAmount(t);
                     const float x = anchorX + dx * static_cast<float>(t);
                     const double value = startValue +
                         (endValue - startValue) * shaped;
@@ -1577,7 +1591,7 @@ void drawTimeline(const document::Edit& edit,
             } else if (view.automationTool == AutomationTool::Curve) {
                 ImGui::SetTooltip(
                     "Drag a parabolic ramp; hold Option (Alt on Windows) "
-                    "for logarithmic; "
+                    "for logarithmic; hold Control to reverse the slope; "
                     "double-click to enter a value; right-click to delete");
             } else {
                 ImGui::SetTooltip(isPan
@@ -1590,7 +1604,8 @@ void drawTimeline(const document::Edit& edit,
             } else if (view.automationTool == AutomationTool::Curve) {
                 ImGui::SetTooltip(
                     "Drag a parabolic automation ramp; hold Option "
-                    "(Alt on Windows) for logarithmic");
+                    "(Alt on Windows) for logarithmic; hold Control to "
+                    "reverse the slope");
             } else {
                 ImGui::SetTooltip(
                     "Drag to draw automation; click to add one point");

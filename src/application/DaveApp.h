@@ -177,7 +177,7 @@ private:
     // laid out side by side, so it wants horizontal room, which the 360px
     // sidebar does not have. Height is user-draggable and persists for the
     // session.
-    bool showMixer_ = true;
+    bool showMixer_ = false;
     float mixerHeight_ = 340.0f;
 
     // ─── Loop transport ─────────────────────────────────────────────────────

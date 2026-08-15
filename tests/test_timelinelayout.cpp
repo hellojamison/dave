@@ -913,7 +913,7 @@ TEST_CASE("track disclosures open editable volume automation lanes",
         rig.clickTimelineAt(
             rig.origin.x + kGutterWidth + laneClickOffsetX,
             tracksTop + kTrackHeight + kAutomationLaneHeight * 0.5f);
-        REQUIRE(rig.edit.track(audio)->volumeAutomation.size() == 1);
+        REQUIRE(rig.edit.track(audio)->volumeAutomation.size() == 2);
 
         // Editing an envelope must not leak through to the generic timeline
         // click handler and move the transport at the same time.
@@ -939,7 +939,7 @@ TEST_CASE("track disclosures open editable volume automation lanes",
         rig.clickTimelineAt(
             rig.origin.x + kGutterWidth + laneClickOffsetX,
             tracksTop + midiHeight + kAutomationLaneHeight * 0.5f);
-        REQUIRE(rig.edit.midiTrack(midi)->volumeAutomation.size() == 1);
+        REQUIRE(rig.edit.midiTrack(midi)->volumeAutomation.size() == 2);
     }
 
     SECTION("user bus and Main") {
@@ -956,7 +956,7 @@ TEST_CASE("track disclosures open editable volume automation lanes",
         rig.clickTimelineAt(
             rig.origin.x + kGutterWidth + laneClickOffsetX,
             tracksTop + kTrackHeight + kAutomationLaneHeight * 0.5f);
-        REQUIRE(rig.edit.bus(bus)->volumeAutomation.size() == 1);
+        REQUIRE(rig.edit.bus(bus)->volumeAutomation.size() == 2);
 
         const float mainTop =
             tracksTop + kTrackHeight + kAutomationLaneHeight;
@@ -966,7 +966,7 @@ TEST_CASE("track disclosures open editable volume automation lanes",
         rig.clickTimelineAt(
             rig.origin.x + kGutterWidth + laneClickOffsetX,
             mainTop + kTrackHeight + kAutomationLaneHeight * 0.5f);
-        REQUIRE(rig.edit.mainBus()->volumeAutomation.size() == 1);
+        REQUIRE(rig.edit.mainBus()->volumeAutomation.size() == 2);
     }
 }
 
@@ -1030,6 +1030,7 @@ TEST_CASE("pencil draws a thinned envelope as one undoable gesture",
     rig.edit.addVolumeAutomationPoint(track, 0, -12.0);
     rig.edit.addVolumeAutomationPoint(track, 200000, -6.0);
     const auto before = rig.edit.track(track)->volumeAutomation;
+    const double incomingBefore = document::volumeAutomationDbAt(before, 25000);
     rig.settle();
     const float tracksTop =
         rig.origin.y + kRulerHeight + kMarkerLaneHeight;
@@ -1076,6 +1077,18 @@ TEST_CASE("pencil draws a thinned envelope as one undoable gesture",
     // vertical quantization (about 1.2 dB at this lane height).
     CHECK(start->db == Catch::Approx(-36.0).margin(1.2));
     CHECK(end->db == Catch::Approx(-18.0).margin(1.2));
+    const auto guard = std::find_if(drawn.begin(), drawn.end(),
+                                    [](const auto& point) {
+                                        return point.sample == 49999;
+                                    });
+    REQUIRE(guard != drawn.end());
+    CHECK(guard->db == Catch::Approx(
+        document::volumeAutomationDbAt(before, 49999)));
+    // Starting a stroke must not pull the untouched incoming line toward the
+    // first drawn value. It remains on the original envelope until the guard.
+    const double incomingAfter =
+        document::volumeAutomationDbAt(drawn, 25000);
+    CHECK(incomingAfter == Catch::Approx(incomingBefore));
 
     rig.undo.undo();
     CHECK(rig.edit.track(track)->volumeAutomation == before);
@@ -1114,24 +1127,27 @@ TEST_CASE("line tool replaces its range with one straight ramp",
     rig.tick(x1, volumeY(0.0), false);
 
     const auto& ramp = rig.edit.track(track)->volumeAutomation;
-    REQUIRE(ramp.size() == 4);
+    REQUIRE(ramp.size() == 5);
     CHECK(rig.undo.undoDepth() == 1);
     CHECK(ramp[0] == before[0]);
-    CHECK(ramp[1].sample == 50000);
-    CHECK(ramp[1].db == Catch::Approx(-24.0).margin(1.2));
-    CHECK(ramp[2].sample == 150000);
-    CHECK(ramp[2].db == Catch::Approx(0.0).margin(1.2));
-    CHECK(ramp[3] == before[2]);
-    const std::string firstRampId = ramp[1].id;
-    const std::string lastRampId = ramp[2].id;
+    CHECK(ramp[1].sample == 49999);
+    CHECK(ramp[1].db == Catch::Approx(
+        document::volumeAutomationDbAt(before, 49999)));
+    CHECK(ramp[2].sample == 50000);
+    CHECK(ramp[2].db == Catch::Approx(-24.0).margin(1.2));
+    CHECK(ramp[3].sample == 150000);
+    CHECK(ramp[3].db == Catch::Approx(0.0).margin(1.2));
+    CHECK(ramp[4] == before[2]);
+    const std::string firstRampId = ramp[2].id;
+    const std::string lastRampId = ramp[3].id;
     CHECK_FALSE(firstRampId.empty());
     CHECK_FALSE(lastRampId.empty());
 
     rig.undo.undo();
     CHECK(rig.edit.track(track)->volumeAutomation == before);
     rig.undo.redo();
-    CHECK(rig.edit.track(track)->volumeAutomation[1].id == firstRampId);
-    CHECK(rig.edit.track(track)->volumeAutomation[2].id == lastRampId);
+    CHECK(rig.edit.track(track)->volumeAutomation[2].id == firstRampId);
+    CHECK(rig.edit.track(track)->volumeAutomation[3].id == lastRampId);
 }
 
 TEST_CASE("line tool draws pan automation with normalized values",
@@ -1162,11 +1178,13 @@ TEST_CASE("line tool draws pan automation with normalized values",
     rig.tick(x1, panY(0.5), false);
 
     const auto& ramp = rig.edit.track(track)->panAutomation;
-    REQUIRE(ramp.size() == 2);
-    CHECK(ramp[0].sample == 50000);
-    CHECK(ramp[0].pan == Catch::Approx(-0.75).margin(0.04));
-    CHECK(ramp[1].sample == 150000);
-    CHECK(ramp[1].pan == Catch::Approx(0.5).margin(0.04));
+    REQUIRE(ramp.size() == 3);
+    CHECK(ramp[0].sample == 49999);
+    CHECK(ramp[0].pan == 0.0);
+    CHECK(ramp[1].sample == 50000);
+    CHECK(ramp[1].pan == Catch::Approx(-0.75).margin(0.04));
+    CHECK(ramp[2].sample == 150000);
+    CHECK(ramp[2].pan == Catch::Approx(0.5).margin(0.04));
     CHECK(rig.undo.undoDepth() == 1);
     rig.undo.undo();
     CHECK(rig.edit.track(track)->panAutomation.empty());
@@ -1214,14 +1232,19 @@ TEST_CASE("curve tool draws a parabolic ramp as one undoable gesture",
     REQUIRE(midpoint != curve.end());
     // t^2 at the halfway point is 0.25: -48 + (48 * 0.25) = -36 dB.
     CHECK(midpoint->db == Catch::Approx(-36.0).margin(1.5));
-    CHECK(curve.front().db == Catch::Approx(-48.0).margin(1.5));
+    const auto start = std::find_if(
+        curve.begin(), curve.end(), [](const auto& point) {
+            return point.sample == 50000;
+        });
+    REQUIRE(start != curve.end());
+    CHECK(start->db == Catch::Approx(-48.0).margin(1.5));
     CHECK(curve.back().db == Catch::Approx(0.0).margin(1.5));
 
     rig.undo.undo();
     CHECK(rig.edit.track(track)->volumeAutomation.empty());
 }
 
-TEST_CASE("Command changes the curve tool to logarithmic pan automation",
+TEST_CASE("holding Option switches an active curve to logarithmic automation",
           "[timelinelayout][automation][tools][curve][pan]") {
     LayoutRig rig;
     rig.edit.addMarkerTrack("Markers");
@@ -1243,13 +1266,23 @@ TEST_CASE("Command changes the curve tool to logarithmic pan automation",
     };
     const float x0 = rig.origin.x + kGutterWidth + 100.0f;
     const float x1 = rig.origin.x + kGutterWidth + 300.0f;
-    rig.holdSuper(true);
     rig.tick(x0, panY(-1.0), false);
     rig.tick(x0, panY(-1.0), true);
+    CHECK_FALSE(rig.view.automationDrawLogarithmic);
+    rig.tick(x1, panY(1.0), true);
+
+    rig.holdAlt(true);
+    rig.tick(x1, panY(1.0), true);
     CHECK(rig.view.automationDrawLogarithmic);
+
+    rig.holdAlt(false);
+    rig.tick(x1, panY(1.0), true);
+    CHECK_FALSE(rig.view.automationDrawLogarithmic);
+
+    rig.holdAlt(true);
     rig.tick(x1, panY(1.0), true);
     rig.tick(x1, panY(1.0), false);
-    rig.holdSuper(false);
+    rig.holdAlt(false);
     rig.settle();
 
     const auto& curve = rig.edit.track(track)->panAutomation;
@@ -1268,6 +1301,16 @@ TEST_CASE("Command changes the curve tool to logarithmic pan automation",
 
     rig.undo.undo();
     CHECK(rig.edit.track(track)->panAutomation.empty());
+}
+
+TEST_CASE("latest automation draw values use lane-specific readouts",
+          "[timelinelayout][automation][tools][readout]") {
+    CHECK(gui::formatAutomationDrawValue(
+              gui::AutomationParameter::Volume, -12.34) == "-12.3 dB");
+    CHECK(gui::formatAutomationDrawValue(
+              gui::AutomationParameter::Volume, 0.0) == "+0.0 dB");
+    CHECK(gui::formatAutomationDrawValue(
+              gui::AutomationParameter::Pan, -0.5) == "L50");
 }
 
 TEST_CASE("double-clicking an automation point opens an undoable dB editor",

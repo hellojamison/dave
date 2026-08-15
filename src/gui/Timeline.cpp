@@ -61,6 +61,17 @@ std::string formatTimecode(int64_t samples, TimecodeMode mode,
     return buf;
 }
 
+std::string formatAutomationDrawValue(AutomationParameter parameter,
+                                      double value) {
+    if (parameter == AutomationParameter::Pan) {
+        return theme::formatPan(document::clampPanAutomation(value));
+    }
+    char text[24];
+    std::snprintf(text, sizeof(text), "%+.1f dB",
+                  document::clampVolumeAutomationDb(value));
+    return text;
+}
+
 namespace {
 
 // The divisions a format counts in, ascending, in samples. One definition
@@ -1203,7 +1214,7 @@ void drawTimeline(const document::Edit& edit,
                        "Line: drag a straight automation ramp");
         drawToolButton("##curve", AutomationTool::Curve,
                        toolsLeft + 2.0f * (toolSize.x + toolGap),
-                       "Curve: drag a parabolic ramp; hold Command (Ctrl on Windows) for logarithmic");
+                       "Curve: drag a parabolic ramp; hold Option (Alt on Windows) for logarithmic");
         ImGui::PopID();
         ImGui::PopID();
         ImGui::SetCursorScreenPos(savedParameterCursor);
@@ -1285,6 +1296,7 @@ void drawTimeline(const document::Edit& edit,
                                   view.automationDrawAnchor.db);
                 upsertStrokePoint(xToSample(mouse.x), yToValue(mouse.y));
             } else if (view.drawingAutomationTool == AutomationTool::Curve) {
+                view.automationDrawLogarithmic = ImGui::GetIO().KeyAlt;
                 view.automationDrawStroke.clear();
                 const float anchorX = sampleToX(
                     view.automationDrawAnchor.sample);
@@ -1299,7 +1311,7 @@ void drawTimeline(const document::Edit& edit,
                     const double t = static_cast<double>(step) /
                                      static_cast<double>(steps);
                     // A finite, endpoint-preserving logarithmic mapping makes
-                    // Command useful for both volume and bipolar pan lanes.
+                    // Option/Alt useful for both volume and bipolar pan lanes.
                     const double shaped = view.automationDrawLogarithmic
                         ? std::log10(1.0 + 9.0 * t)
                         : t * t;
@@ -1331,6 +1343,25 @@ void drawTimeline(const document::Edit& edit,
             if (view.automationDrawStroke.empty()) return result;
             const int64_t first = view.automationDrawStroke.front().sample;
             const int64_t last = view.automationDrawStroke.back().sample;
+            // Preserve the incoming envelope through the sample immediately
+            // before the stroke. Without this guard, linear interpolation from
+            // the previous breakpoint to the first drawn value would pull the
+            // untouched line away from its original level.
+            if (first > 0) {
+                const int64_t guardSample = first - 1;
+                const bool alreadyGuarded = std::any_of(
+                    view.automationDrawOriginal.begin(),
+                    view.automationDrawOriginal.end(),
+                    [&](const auto& point) {
+                        return point.sample == guardSample;
+                    });
+                if (!alreadyGuarded) {
+                    result.push_back(document::VolumeAutomationPoint{
+                        {}, guardSample,
+                        document::volumeAutomationDbAt(
+                            view.automationDrawOriginal, guardSample)});
+                }
+            }
             result.erase(std::remove_if(result.begin(), result.end(),
                                         [&](const auto& point) {
                                             return point.sample >= first &&
@@ -1499,6 +1530,41 @@ void drawTimeline(const document::Edit& edit,
             if (pointHovered) hoveredPointId = point.id;
         }
 
+        if (view.drawingAutomation &&
+            view.drawingAutomationOwnerId == ownerId &&
+            view.drawingAutomationParameter == parameter &&
+            ImGui::IsMouseDown(ImGuiMouseButton_Left) &&
+            !view.automationDrawStroke.empty()) {
+            const int64_t latestSample = xToSample(mouse.x);
+            const double latestValue = clampLaneValue(yToValue(mouse.y));
+            const ImVec2 latestPoint(sampleToX(latestSample),
+                                     valueToY(latestValue));
+            const std::string valueText =
+                formatAutomationDrawValue(parameter, latestValue);
+            const ImVec2 textSize = ImGui::CalcTextSize(valueText.c_str());
+            constexpr float badgePaddingX = 5.0f;
+            constexpr float badgePaddingY = 3.0f;
+            constexpr float badgeGap = 8.0f;
+            const ImVec2 badgeSize(textSize.x + badgePaddingX * 2.0f,
+                                   textSize.y + badgePaddingY * 2.0f);
+            ImVec2 badgeMin(latestPoint.x + badgeGap,
+                            latestPoint.y - badgeSize.y - badgeGap);
+            if (badgeMin.x + badgeSize.x > laneRight) {
+                badgeMin.x = latestPoint.x - badgeSize.x - badgeGap;
+            }
+            badgeMin.x = std::clamp(badgeMin.x, laneLeft,
+                                    laneRight - badgeSize.x);
+            badgeMin.y = std::clamp(badgeMin.y, graphTop,
+                                    graphBottom - badgeSize.y);
+            const ImVec2 badgeMax(badgeMin.x + badgeSize.x,
+                                  badgeMin.y + badgeSize.y);
+            dl->AddRectFilled(badgeMin, badgeMax, C(pal.surfaceStrong), 3.0f);
+            dl->AddRect(badgeMin, badgeMax, C(pal.borderStrong), 3.0f);
+            dl->AddText(ImVec2(badgeMin.x + badgePaddingX,
+                               badgeMin.y + badgePaddingY),
+                        C(pal.primaryText), valueText.c_str());
+        }
+
         const bool laneHovered = windowHeldOrHovered &&
             mouse.x >= laneLeft && mouse.x <= laneRight &&
             mouse.y >= top && mouse.y <= bottom;
@@ -1510,7 +1576,7 @@ void drawTimeline(const document::Edit& edit,
                     "right-click to delete");
             } else if (view.automationTool == AutomationTool::Curve) {
                 ImGui::SetTooltip(
-                    "Drag a parabolic ramp; hold Command (Ctrl on Windows) "
+                    "Drag a parabolic ramp; hold Option (Alt on Windows) "
                     "for logarithmic; "
                     "double-click to enter a value; right-click to delete");
             } else {
@@ -1523,8 +1589,8 @@ void drawTimeline(const document::Edit& edit,
                 ImGui::SetTooltip("Drag a straight automation ramp");
             } else if (view.automationTool == AutomationTool::Curve) {
                 ImGui::SetTooltip(
-                    "Drag a parabolic automation ramp; hold Command "
-                    "(Ctrl on Windows) for logarithmic");
+                    "Drag a parabolic automation ramp; hold Option "
+                    "(Alt on Windows) for logarithmic");
             } else {
                 ImGui::SetTooltip(
                     "Drag to draw automation; click to add one point");
@@ -1707,7 +1773,7 @@ void drawTimeline(const document::Edit& edit,
                 view.drawingAutomationTool = view.automationTool;
                 view.automationDrawLogarithmic =
                     view.automationTool == AutomationTool::Curve &&
-                    ImGui::GetIO().KeyCtrl;
+                    ImGui::GetIO().KeyAlt;
                 view.drawingAutomationOwnerId = ownerId;
                 view.automationDrawOriginal = storedPoints;
                 view.automationDrawStroke.clear();

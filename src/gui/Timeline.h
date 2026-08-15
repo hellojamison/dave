@@ -62,6 +62,9 @@ enum class TimecodeMode {
 enum class AutomationParameter { Volume, Pan };
 enum class AutomationTool { Pencil, Line, Curve };
 
+std::string formatAutomationDrawValue(AutomationParameter parameter,
+                                      double value);
+
 // TimelineViewState holds the user's view: horizontal scroll + zoom level.
 // Timeline itself is a pure function of (Edit, viewState) and reports any
 // interaction (drag, seek) back via the UndoStack + Transport.
@@ -190,8 +193,8 @@ struct TimelineViewState {
     // Pencil, Line and Curve gestures are preview-only until mouse-up. The
     // generic `db` value is dB for Volume and normalized -1..+1 for Pan,
     // matching the point-drag preview above. One bulk command commits the
-    // completed stroke. Curve captures the Command modifier at mouse-down so
-    // the entire gesture is consistently parabolic or logarithmic.
+    // completed stroke. Curve reads Option/Alt throughout the gesture so the
+    // preview can switch live between parabolic and logarithmic shapes.
     bool drawingAutomation = false;
     AutomationParameter drawingAutomationParameter =
         AutomationParameter::Volume;

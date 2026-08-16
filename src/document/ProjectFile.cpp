@@ -276,6 +276,27 @@ std::string serializeEdit(const Edit& edit) {
     // document are only meaningful against the rate that produced them.
     j["sampleRate"] = edit.sampleRate();
     j["bitDepth"] = edit.bitDepth();
+    // tempoBpm stays as the bar-1 value so a build that predates the tempo
+    // map still opens a session at the right starting tempo.
+    j["tempoBpm"] = edit.tempoBpm();
+    {
+        json tempo = json::array();
+        for (const auto& change : edit.tempoMap()) {
+            tempo.push_back(json{{"bar", change.bar},
+                                 {"beat", change.beat},
+                                 {"bpm", change.bpm}});
+        }
+        j["tempoMap"] = std::move(tempo);
+    }
+    {
+        json meter = json::array();
+        for (const auto& signature : edit.meterMap()) {
+            meter.push_back(json{{"bar", signature.bar},
+                                 {"numerator", signature.numerator},
+                                 {"denominator", signature.denominator}});
+        }
+        j["meterMap"] = std::move(meter);
+    }
 
     // One tracks array. What used to be three — audio tracks, MIDI tracks and
     // buses — are one type now, so a row carries whichever of audio clips,
@@ -347,6 +368,17 @@ std::string serializeEdit(const Edit& edit) {
         json plugins = json::array();
         for (const auto& plugin : t.plugins) {
             plugins.push_back(pluginSlotToJson(plugin));
+        }
+        {
+            json chain = json::array();
+            for (const auto& slot : t.chain) {
+                const char* kind =
+                    slot.kind == ChainSlot::Kind::Insert ? "insert"
+                  : slot.kind == ChainSlot::Kind::Send   ? "send"
+                                                         : "fader";
+                chain.push_back(json{{"kind", kind}, {"id", slot.id}});
+            }
+            jt["chain"] = std::move(chain);
         }
         jt["plugins"] = std::move(plugins);
         tracks.push_back(std::move(jt));
@@ -484,7 +516,36 @@ ProjectResult deserializeEdit(const std::string& text, Edit& edit) {
 
     // Projects written before the session format was configurable carry no
     // bitDepth and a hardcoded 48000; both defaults match what they meant.
+    // 24 stays the default for a file that has no bitDepth: it was written
+    // when that was the only depth, and reopening it as float would be
+    // inventing a format decision the session never made. New sessions get
+    // float from Edit's own default.
     edit.loadSessionFormat_(j.value("sampleRate", 48000), j.value("bitDepth", 24));
+    {
+        // A project written before musical time existed is 120 bpm in 4/4 —
+        // the values the ruler was hardcoded to when it was saved, so it
+        // reopens looking the same.
+        std::vector<TimeSignature> meter;
+        if (j.contains("meterMap") && j["meterMap"].is_array()) {
+            for (const auto& jm : j["meterMap"]) {
+                meter.push_back(TimeSignature{jm.value("bar", 1),
+                                              jm.value("numerator", 4),
+                                              jm.value("denominator", 4)});
+            }
+        }
+        std::vector<TempoChange> tempo;
+        if (j.contains("tempoMap") && j["tempoMap"].is_array()) {
+            for (const auto& jt : j["tempoMap"]) {
+                tempo.push_back(TempoChange{jt.value("bar", 1),
+                                            jt.value("beat", 1),
+                                            jt.value("bpm", 120.0)});
+            }
+        } else {
+            // A project from before the map: its one tempo becomes bar 1.
+            tempo.push_back(TempoChange{1, 1, j.value("tempoBpm", 120.0)});
+        }
+        edit.loadMusicalTime_(std::move(tempo), std::move(meter));
+    }
 
     // We rebuild the Edit by mutating it directly (its public mutators fire
     // notifyChanged, which we don't want during load — so use tracksMut() etc.
@@ -552,6 +613,43 @@ ProjectResult deserializeEdit(const std::string& text, Edit& edit) {
             // isMain is derived from the id rather than trusted: a file
             // claiming a second Main would give the document two permanent
             // channels it can never remove.
+            if (jt.contains("chain") && jt["chain"].is_array()) {
+            for (const auto& jc : jt["chain"]) {
+                const std::string kind = jc.value("kind", "insert");
+                ChainSlot slot;
+                // "meter" was a separate entry for one build before the two
+                // collapsed; it is dropped rather than mapped, since the fader
+                // entry beside it already says where the level is read.
+                if (kind == "meter") continue;
+                slot.kind = kind == "send"  ? ChainSlot::Kind::Send
+                          : kind == "fader" ? ChainSlot::Kind::Fader
+                                            : ChainSlot::Kind::Insert;
+                slot.id = jc.value("id", std::string{});
+                t.chain.push_back(std::move(slot));
+            }
+        } else {
+            // Before the chain existed, order was implied: inserts in their
+            // stored order, the meter wherever meterTapIndex put it, then the
+            // fader, and sends placed by their pre/post tap. Rebuilding it
+            // that way is what keeps an existing session sounding the same.
+            // The fader sat after every insert, so that is where it goes.
+            // Anything else would move it in the signal path and change how
+            // the session sounds.
+            for (const auto& plugin : t.plugins) {
+                t.chain.push_back({ChainSlot::Kind::Insert, plugin.id});
+            }
+            for (const auto& send : t.sends) {
+                if (send.tap == SendTap::PreFader) {
+                    t.chain.push_back({ChainSlot::Kind::Send, send.id});
+                }
+            }
+            t.chain.push_back({ChainSlot::Kind::Fader, {}});
+            for (const auto& send : t.sends) {
+                if (send.tap != SendTap::PreFader) {
+                    t.chain.push_back({ChainSlot::Kind::Send, send.id});
+                }
+            }
+        }
             t.isMain = t.id == kMainBusId && jt.value("isMain", true);
             if (jt.contains("plugins")) {
                 for (const auto& jp : jt["plugins"]) {

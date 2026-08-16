@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "document/Edit.h"
+#include "gui/Timeline.h"
 #include "document/ProjectFile.h"
 #include "editing/Commands.h"
 #include "engine/GraphBuilder.h"
@@ -326,4 +327,108 @@ TEST_CASE("GraphBuilder publishes automation for every channel type",
               .at(dave::document::kMainBusId)
               ->panAutomation()[0]
               .pan == Approx(1.0));
+}
+
+// ─── Deleting a range of automation ────────────────────────────────────────
+
+TEST_CASE("delete clears the automation points inside the selection",
+          "[automation]") {
+    dave::document::Edit edit;
+    dave::editing::UndoStack undo{edit};
+    const std::string t = edit.addTrack("Audio");
+    for (int i = 0; i < 5; ++i) {
+        REQUIRE_FALSE(edit.addVolumeAutomationPoint(
+            t, i * 48000, -6.0 + i).empty());
+    }
+
+    dave::gui::TimelineViewState view;
+    view.selectedTrackIndex = 0;
+    REQUIRE(edit.tracks()[0].id == t);
+    view.expandedTracks.insert(t);
+    view.hasSelection = true;
+    view.selectionStart = 48000;
+    view.selectionEnd = 144000;   // covers points 1, 2 and 3
+
+    REQUIRE(dave::gui::deleteAutomationInSelection(edit, undo, view));
+    const auto* points = edit.volumeAutomation(t);
+    REQUIRE(points != nullptr);
+    REQUIRE(points->size() == 2);
+    CHECK((*points)[0].sample == 0);
+    CHECK((*points)[1].sample == 192000);
+
+    // One undo entry for the whole range, not one per point.
+    undo.undo();
+    CHECK(edit.volumeAutomation(t)->size() == 5);
+}
+
+TEST_CASE("a backwards selection still names a range", "[automation]") {
+    dave::document::Edit edit;
+    dave::editing::UndoStack undo{edit};
+    const std::string t = edit.addTrack("Audio");
+    for (int i = 0; i < 3; ++i) {
+        edit.addVolumeAutomationPoint(t, i * 48000, 0.0);
+    }
+
+    dave::gui::TimelineViewState view;
+    view.selectedTrackIndex = 0;
+    view.expandedTracks.insert(t);
+    view.hasSelection = true;
+    // Dragged right to left.
+    view.selectionStart = 96000;
+    view.selectionEnd = 48000;
+
+    REQUIRE(dave::gui::deleteAutomationInSelection(edit, undo, view));
+    REQUIRE(edit.volumeAutomation(t)->size() == 1);
+    CHECK(edit.volumeAutomation(t)->front().sample == 0);
+}
+
+TEST_CASE("delete acts on the lane the track is showing", "[automation]") {
+    dave::document::Edit edit;
+    dave::editing::UndoStack undo{edit};
+    const std::string t = edit.addTrack("Audio");
+    edit.addVolumeAutomationPoint(t, 48000, 0.0);
+    edit.addPanAutomationPoint(t, 48000, 0.5);
+
+    dave::gui::TimelineViewState view;
+    view.selectedTrackIndex = 0;
+    view.expandedTracks.insert(t);
+    view.hasSelection = true;
+    view.selectionStart = 0;
+    view.selectionEnd = 96000;
+    view.automationParameters[t] = dave::gui::AutomationParameter::Pan;
+
+    REQUIRE(dave::gui::deleteAutomationInSelection(edit, undo, view));
+    // Pan cleared, volume untouched — the other lane is not visible, and an
+    // edit to something you cannot see has no visible cause.
+    CHECK(edit.panAutomation(t)->empty());
+    CHECK(edit.volumeAutomation(t)->size() == 1);
+}
+
+TEST_CASE("delete does nothing without a selection or an open lane",
+          "[automation]") {
+    dave::document::Edit edit;
+    dave::editing::UndoStack undo{edit};
+    const std::string t = edit.addTrack("Audio");
+    edit.addVolumeAutomationPoint(t, 48000, 0.0);
+
+    dave::gui::TimelineViewState view;
+    view.selectedTrackIndex = 0;
+    view.hasSelection = true;
+    view.selectionStart = 0;
+    view.selectionEnd = 96000;
+
+    // Lane closed: nothing happens, and the caller is free to let Delete mean
+    // something else.
+    CHECK_FALSE(dave::gui::deleteAutomationInSelection(edit, undo, view));
+
+    view.expandedTracks.insert(t);
+    view.hasSelection = false;
+    CHECK_FALSE(dave::gui::deleteAutomationInSelection(edit, undo, view));
+
+    // Open lane, real selection, but no points inside it.
+    view.hasSelection = true;
+    view.selectionStart = 480000;
+    view.selectionEnd = 960000;
+    CHECK_FALSE(dave::gui::deleteAutomationInSelection(edit, undo, view));
+    CHECK(edit.volumeAutomation(t)->size() == 1);
 }

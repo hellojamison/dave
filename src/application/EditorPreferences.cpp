@@ -83,6 +83,10 @@ EditorPreferences EditorPreferencesStore::load() const noexcept {
         if (preFader != root.end() && preFader->is_boolean()) {
             preferences.meterPreFader = preFader->get<bool>();
         }
+        const auto peakHold = root.find("meterPeakHoldSeconds");
+        if (peakHold != root.end() && peakHold->is_number()) {
+            preferences.meterPeakHoldSeconds = peakHold->get<float>();
+        }
         const auto rmsBody = root.find("meterRmsBody");
         if (rmsBody != root.end() && rmsBody->is_boolean()) {
             preferences.meterRmsBody = rmsBody->get<bool>();
@@ -107,6 +111,7 @@ bool EditorPreferencesStore::save(
             {"takeNamePattern", preferences.takeNamePattern},
             {"meterPreFader", preferences.meterPreFader},
             {"meterRmsBody", preferences.meterRmsBody},
+            {"meterPeakHoldSeconds", preferences.meterPeakHoldSeconds},
         };
         std::error_code error;
         const auto parent = path_.parent_path();

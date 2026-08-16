@@ -80,4 +80,17 @@ bool drawTrackColorPopup(const char* popupId, const std::string& currentColor,
     return changed;
 }
 
+ImVec4 defaultTrackColor(int rowIndex) {
+    const auto& pal = theme::palette();
+    const ImVec4 cycle[] = {
+        pal.markerCue, pal.markerSection, pal.markerLoop,
+        pal.markerPunch, pal.markerCd, pal.markerCustom
+    };
+    const int count = static_cast<int>(sizeof(cycle) / sizeof(cycle[0]));
+    // Negative rows are not reachable through the UI, but a caller that
+    // passes one should get a colour rather than read off the front.
+    const int index = ((rowIndex % count) + count) % count;
+    return cycle[index];
+}
+
 } // namespace dave::gui

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "gui/Timeline.h"
+
+#include "document/MusicalTime.h"
 #include "editing/Commands.h"
 #include "gui/Theme.h"
 #include "gui/TrackColorPicker.h"
@@ -17,8 +19,27 @@ namespace dave::gui {
 
 // Format a sample position into the selected timecode mode.
 // sr=48000, fps=24 (default), bpm=120, beatsPerBar=4.
+double automationCurveShape(double t, double steepness, bool flipped) {
+    t = std::clamp(t, 0.0, 1.0);
+    const double exponent = std::clamp(steepness, 0.1, 12.0);
+    return flipped ? 1.0 - std::pow(1.0 - t, exponent)
+                   : std::pow(t, exponent);
+}
+
+double automationSteepnessForDrag(double latched, float dx) {
+    // 55 px doubles it, so the useful range is a short flick rather than a
+    // reach across the lane. Exponential rather than additive so the gesture
+    // feels the same at 0.3 as at 6 — additive would jam against the floor.
+    constexpr float kPixelsPerDoubling = 55.0f;
+    const double scaled = std::clamp(latched, 0.1, 12.0) *
+                          std::pow(2.0, dx / kPixelsPerDoubling);
+    return std::clamp(scaled, 0.1, 12.0);
+}
+
 std::string formatTimecode(int64_t samples, TimecodeMode mode,
-                           double sr, double fps, double bpm) {
+                           double sr, double fps, double bpm,
+                           const std::vector<document::TimeSignature>* meter,
+                           const std::vector<document::TempoChange>* tempo) {
     char buf[32];
     switch (mode) {
         case TimecodeMode::MinSec: {
@@ -38,12 +59,18 @@ std::string formatTimecode(int64_t samples, TimecodeMode mode,
             break;
         }
         case TimecodeMode::BarsBeats: {
-            double beatsPerSec = bpm / 60.0;
-            double totalBeats = (samples / sr) * beatsPerSec;
-            int bars = static_cast<int>(totalBeats / 4) + 1;  // 1-indexed
-            int beats = static_cast<int>(totalBeats) % 4 + 1;
-            int ticks = static_cast<int>((totalBeats - static_cast<int>(totalBeats)) * 960);
-            std::snprintf(buf, sizeof(buf), "%d.%d.%03d", bars, beats, ticks);
+            // Through the meter map, so a 3/4 bar reads as three beats and
+            // every bar line after a change lands where the map puts it.
+            static const std::vector<document::TimeSignature> kCommonTime{
+                document::TimeSignature{1, 4, 4}};
+            const auto& map = meter != nullptr ? *meter : kCommonTime;
+            const auto position = tempo != nullptr
+                ? document::barsBeatsAtSample(samples, sr, *tempo, map)
+                : document::barsBeatsAtSample(samples, sr, bpm, map);
+            // Pipes, not dots: a dot reads as a decimal point, and "2.3.480"
+            // looks like one number where "2|3|480" reads as three fields.
+            std::snprintf(buf, sizeof(buf), "%d|%d|%03d", position.bar,
+                          position.beat, position.tick);
             break;
         }
         case TimecodeMode::FeetFrames: {
@@ -97,7 +124,11 @@ TimelineViewState::DragKind clipGestureAt(float mouseX, float clipLeft,
 // serves both the grid lines and the snap increment, so a selection edge can
 // never land somewhere the grid says is not a division.
 std::vector<double> formatLadder(TimecodeMode mode, double sr, double fps,
-                                 double bpm, int& subdivisions) {
+                                 double bpm, int& subdivisions,
+                                 const std::vector<document::TimeSignature>*
+                                     meter,
+                                 const std::vector<document::TempoChange>*
+                                     tempo) {
     const double frame = (fps > 0.0) ? sr / fps : sr;
     std::vector<double> ladder;
     subdivisions = 5;
@@ -121,14 +152,21 @@ std::vector<double> formatLadder(TimecodeMode mode, double sr, double fps,
             break;
         }
         case TimecodeMode::BarsBeats: {
-            // Sixteenth-note up to 128 bars, in 4/4 — the only meter Dave has
-            // until a real tempo map lands (see MidiClip::sourceTempi).
-            const double beat = (bpm > 0.0) ? sr * 60.0 / bpm : sr;
+            // The beat at bar 1. A meter change further down the timeline
+            // changes bar LENGTHS, which the ruler walks per bar; the ladder
+            // only needs a unit to scale by.
+            static const std::vector<document::TimeSignature> kCommonTime{
+                document::TimeSignature{1, 4, 4}};
+            const auto& map = meter != nullptr ? *meter : kCommonTime;
+            const double beat = tempo != nullptr
+                ? document::samplesPerBeatAtBar(1, sr, *tempo, map)
+                : document::samplesPerBeatAtBar(1, sr, bpm, map);
             for (double b : {0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0,
                              128.0, 256.0, 512.0, 1024.0}) {
                 ladder.push_back(b * beat);
             }
-            subdivisions = 4;   // four beats to the bar
+            subdivisions = std::max(
+                1, document::signatureAtBar(map, 1).numerator);
             break;
         }
         case TimecodeMode::FeetFrames: {
@@ -156,15 +194,16 @@ std::vector<double> formatLadder(TimecodeMode mode, double sr, double fps,
 // disclosure arrow, so the band is both the track's identity colour and the
 // control that opens it — one target instead of a stripe plus a separate
 // twisty squeezed in beside the name.
-// Meter first, then the colour band with its disclosure arrow, then the
-// controls. The meter is the thing being read continuously, so it takes the
-// outermost column where a glance down the edge catches every track at once.
-constexpr float kMeterX = 8.0f;
-constexpr float kMeterW = 17.0f;                            // two 7 px bars
-constexpr float kBandX = kMeterX + kMeterW + 5.0f;          // 30
+// The colour band takes the outer edge, then the meter, then the controls.
+// The band is the track's identity, so it reads as the row's left border; the
+// meter sits inboard of it, still in its own column so a glance down the
+// gutter still catches every track's level at once.
+constexpr float kBandX = 8.0f;
 constexpr float kBandW = 18.0f;
-// Everything else in the gutter starts clear of the band.
-constexpr float kGutterContentX = kBandX + kBandW + 6.0f;   // 54
+constexpr float kMeterX = kBandX + kBandW + 5.0f;           // 31
+constexpr float kMeterW = 17.0f;                            // two 7 px bars
+// Everything else in the gutter starts clear of the meter.
+constexpr float kGutterContentX = kMeterX + kMeterW + 6.0f; // 54
 
 // The first division at least `targetPixels` wide, so both callers scale
 // through the format's own units instead of falling back to raw samples.
@@ -206,7 +245,9 @@ void zoomAroundSample(TimelineViewState& view, double newSamplesPerPixel,
 }
 
 GridStep gridStepFor(TimecodeMode mode, double samplesPerPixel,
-                     double sr, double fps, double bpm) {
+                     double sr, double fps, double bpm,
+                     const std::vector<document::TimeSignature>* meter,
+                     const std::vector<document::TempoChange>* tempo) {
     // Keep labelled divisions roughly a label-width apart whatever the format,
     // so the choice follows zoom rather than a fixed step that goes unreadable
     // at one end of the range and useless at the other.
@@ -214,7 +255,7 @@ GridStep gridStepFor(TimecodeMode mode, double samplesPerPixel,
     const double frame = (fps > 0.0) ? sr / fps : sr;
     int subdivisions = 5;
     const std::vector<double> ladder =
-        formatLadder(mode, sr, fps, bpm, subdivisions);
+        formatLadder(mode, sr, fps, bpm, subdivisions, meter, tempo);
     const double major =
         ladderStepFor(ladder, kTargetMajorPixels, samplesPerPixel, sr);
 
@@ -234,7 +275,9 @@ GridStep gridStepFor(TimecodeMode mode, double samplesPerPixel,
 }
 
 int64_t snapStepFor(TimecodeMode mode, double samplesPerPixel, double sr,
-                    double fps, double bpm) {
+                    double fps, double bpm,
+                    const std::vector<document::TimeSignature>* meter,
+                    const std::vector<document::TempoChange>* tempo) {
     // Three pixels is about the finest a drag can be aimed at. Below that the
     // snap stops being a help and becomes a floor the pointer cannot reach
     // between; above it, the same ladder steps up in the format's own units,
@@ -243,16 +286,19 @@ int64_t snapStepFor(TimecodeMode mode, double samplesPerPixel, double sr,
     constexpr double kTargetSnapPixels = 3.0;
     int subdivisions = 5;
     const std::vector<double> ladder =
-        formatLadder(mode, sr, fps, bpm, subdivisions);
+        formatLadder(mode, sr, fps, bpm, subdivisions, meter, tempo);
     return std::max<int64_t>(1, std::llround(ladderStepFor(
         ladder, kTargetSnapPixels, samplesPerPixel, 1.0)));
 }
 
 int64_t snapSampleToFormat(int64_t sample, TimecodeMode mode,
                            double samplesPerPixel, double sr,
-                           double fps, double bpm) {
+                           double fps, double bpm,
+                           const std::vector<document::TimeSignature>* meter,
+                           const std::vector<document::TempoChange>* tempo) {
     sample = std::max<int64_t>(0, sample);
-    const int64_t step = snapStepFor(mode, samplesPerPixel, sr, fps, bpm);
+    const int64_t step =
+        snapStepFor(mode, samplesPerPixel, sr, fps, bpm, meter, tempo);
     if (step <= 1) return sample;
 
     const int64_t wholeSteps = sample / step;
@@ -410,7 +456,7 @@ float drawTrackGutter(const GutterLayout& g, TimelineViewState& view,
             dl->PushClipRect(
                 ImVec2(origin.x + kGutterContentX, y),
                 ImVec2(origin.x + g.gutterWidth -
-                           (f.recordArm != nullptr ? 86.0f : 62.0f),
+                           (f.recordArm != nullptr ? 110.0f : 86.0f),
                        y + g.headerHeight + g.rowPadding * 2.0f),
                 true);
             dl->AddText(nameFont, g.labelHeight,
@@ -421,7 +467,7 @@ float drawTrackGutter(const GutterLayout& g, TimelineViewState& view,
         if (g.gutterHovered &&
             g.mouse.x >= origin.x + 16.0f &&
             g.mouse.x <= origin.x + g.gutterWidth -
-                             (f.recordArm != nullptr ? 86.0f : 62.0f) &&
+                             (f.recordArm != nullptr ? 110.0f : 86.0f) &&
             g.mouse.y >= y &&
             g.mouse.y <= y + g.headerHeight + g.rowPadding * 2.0f &&
             ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
@@ -440,9 +486,30 @@ float drawTrackGutter(const GutterLayout& g, TimelineViewState& view,
         const float msGap = 3.0f;
         const float msY = y + g.rowPadding;
         const int toggleCount = f.recordArm != nullptr ? 3 : 2;
+        // The strip button shares the toggle row's geometry but is momentary:
+        // it opens a panel rather than holding a state the row can show.
+        const int slotCount = toggleCount + 1;
         float msX = origin.x + g.gutterWidth -
-            (msSize.x * static_cast<float>(toggleCount) +
-             msGap * static_cast<float>(toggleCount - 1)) - 12.0f;
+            (msSize.x * static_cast<float>(slotCount) +
+             msGap * static_cast<float>(slotCount - 1)) - 12.0f;
+        if (f.trackId != nullptr) {
+            ImGui::PushID(uid + 9000);
+            ImGui::SetCursorScreenPos(ImVec2(msX, msY));
+            const bool pressed = ImGui::InvisibleButton("##strip", msSize);
+            const bool hovered = ImGui::IsItemHovered();
+            if (pressed) view.requestChannelStripTrackId = *f.trackId;
+            const ImVec2 bMin(msX, msY);
+            const ImVec2 bMax(msX + msSize.x, msY + msSize.y);
+            dl->AddRectFilled(bMin, bMax,
+                              hovered ? C(pal.surfaceStrong)
+                                      : C(pal.trackControlInactive), 3.0f);
+            dl->AddRect(bMin, bMax, C(pal.border), 3.0f);
+            theme::drawCenteredControlLabel(
+                dl, theme::Rect{bMin, bMax}, C(pal.textMuted), "E");
+            if (hovered) ImGui::SetTooltip("Channel strip");
+            ImGui::PopID();
+            msX += msSize.x + msGap;
+        }
         struct Toggle {
             const char* label;
             bool* flag;
@@ -534,9 +601,7 @@ float drawTrackGutter(const GutterLayout& g, TimelineViewState& view,
         // The readout lives beside, not on, the grab so centre remains usable.
         const bool gainDragged =
             ImGui::SliderFloat("##gain", &gainDb, -60.0f, 6.0f, "");
-        const bool gainReset =
-            ImGui::IsItemClicked(ImGuiMouseButton_Left) &&
-            ImGui::GetIO().KeyAlt;
+        const bool gainReset = theme::altClickedReset();
         if (gainReset) gainDb = 0.0f;
         const double nextGain = std::pow(10.0f, gainDb / 20.0f);
         if ((gainDragged || gainReset) && *f.gain != nextGain) {
@@ -560,9 +625,7 @@ float drawTrackGutter(const GutterLayout& g, TimelineViewState& view,
         ImGui::PushItemWidth(sliderW);
         const bool panDragged =
             ImGui::SliderFloat("##pan", &panVal, -1.0f, 1.0f, "");
-        const bool panReset =
-            ImGui::IsItemClicked(ImGuiMouseButton_Left) &&
-            ImGui::GetIO().KeyAlt;
+        const bool panReset = theme::altClickedReset();
         if (panReset) panVal = 0.0f;
         if ((panDragged || panReset) && *f.pan != panVal) {
             *f.pan = panVal;
@@ -829,13 +892,18 @@ void drawTimeline(const document::Edit& edit,
     const double sr = static_cast<double>(edit.sampleRate());
     // One grid drives both the ruler and the lane lines, so a line under a
     // clip is always the same division as the label above it.
-    const GridStep grid = gridStepFor(view.tcMode, view.samplesPerPixel, sr);
+    const double bpm = edit.tempoBpm();
+    const auto& meterMap = edit.meterMap();
+    const auto& tempoMap = edit.tempoMap();
+    const GridStep grid = gridStepFor(view.tcMode, view.samplesPerPixel, sr,
+                                      24.0, bpm, &meterMap, &tempoMap);
     // One snap policy serves automation points, seeks, clip moves and range
     // edges. Turning Snap off preserves the raw sample under the pointer.
     auto snapPosition = [&](int64_t pos) -> int64_t {
         pos = std::max<int64_t>(0, pos);
         return view.snapEnabled
-            ? snapSampleToFormat(pos, view.tcMode, view.samplesPerPixel, sr)
+            ? snapSampleToFormat(pos, view.tcMode, view.samplesPerPixel, sr,
+                                 24.0, bpm, &meterMap, &tempoMap)
             : pos;
     };
 
@@ -843,7 +911,7 @@ void drawTimeline(const document::Edit& edit,
     // separately rather than one loop testing `sample % major`: at 29.97 fps a
     // whole-frame minor does not divide a whole-second major, and every major
     // tick would go missing.
-    auto forEachGridLine = [&](int64_t step, auto&& fn) {
+    auto forEachUniformLine = [&](int64_t step, auto&& fn) {
         if (step <= 0) return;
         const int64_t first = std::max<int64_t>(
             0, static_cast<int64_t>(std::floor(view.scrollSamples / step)) * step);
@@ -853,6 +921,62 @@ void drawTimeline(const document::Edit& edit,
             if (x > origin.x + totalWidth) break;
             if (x >= origin.x + gutterWidth) fn(x, sample);
         }
+    };
+
+    // Bars are not a fixed number of samples once the meter can change, so
+    // bars|beats walks the map instead of stepping. A uniform step drawn under
+    // a 3/4 section puts every line in the wrong place — and the ruler labels
+    // would disagree with the counter, which reads through the same map.
+    const bool musicalGrid = view.tcMode == TimecodeMode::BarsBeats;
+    auto forEachMusicalLine = [&](bool majors, auto&& fn) {
+        const double perBar =
+            document::samplesPerBarAtBar(1, sr, tempoMap, meterMap);
+        if (!(perBar > 0.0)) return;
+        // Show every bar until they crowd, then every 2, 4, 8… — the same
+        // ladder idea as the uniform grid, counted in bars.
+        int barStride = 1;
+        while (perBar * barStride / view.samplesPerPixel < 44.0 &&
+               barStride < 4096) {
+            barStride *= 2;
+        }
+        const int64_t viewEnd = view.scrollSamples + static_cast<int64_t>(
+            (totalWidth - gutterWidth) * view.samplesPerPixel);
+        for (int bar = 1;; bar += barStride) {
+            const int64_t barSample =
+                document::sampleAtBar(bar, sr, tempoMap, meterMap);
+            if (barSample > viewEnd) break;
+            const auto emit = [&](int64_t sample) {
+                if (sample < view.scrollSamples) return;
+                const double x = origin.x + gutterWidth +
+                    (sample - view.scrollSamples) / view.samplesPerPixel;
+                if (x >= origin.x + gutterWidth &&
+                    x <= origin.x + totalWidth) {
+                    fn(x, sample);
+                }
+            };
+            if (majors) {
+                emit(barSample);
+            } else if (barStride == 1) {
+                // Beats only while every bar is drawn; past that the minors
+                // would be closer together than they are readable.
+                const auto signature =
+                    document::signatureAtBar(meterMap, bar);
+                const double perBeat =
+                    document::samplesPerBeatAtBar(bar, sr, tempoMap, meterMap);
+                for (int beat = 1; beat < signature.numerator; ++beat) {
+                    emit(barSample + static_cast<int64_t>(perBeat * beat));
+                }
+            }
+            if (barSample > viewEnd) break;
+        }
+    };
+
+    auto forEachGridLine = [&](int64_t step, auto&& fn) {
+        if (musicalGrid) {
+            forEachMusicalLine(step == grid.major, fn);
+            return;
+        }
+        forEachUniformLine(step, fn);
     };
 
     ImFont* rulerFont = theme::fonts().monoSmall != nullptr
@@ -867,7 +991,9 @@ void drawTimeline(const document::Edit& edit,
     forEachGridLine(grid.major, [&](double x, int64_t sample) {
         dl->AddLine(ImVec2(x, origin.y + 15.0f),
                     ImVec2(x, origin.y + timelineHeight), C(pal.borderStrong));
-        const std::string label = formatTimecode(sample, view.tcMode, sr);
+        const std::string label =
+            formatTimecode(sample, view.tcMode, sr, 24.0, bpm, &meterMap,
+                           &tempoMap);
         dl->AddText(rulerFont, rulerFontSize, ImVec2(x + 4.0f, origin.y + 2.0f),
                     C(pal.textMuted), label.c_str());
     });
@@ -887,7 +1013,9 @@ void drawTimeline(const document::Edit& edit,
             if (found != gainNodes->end()) node = found->second.get();
         }
         if (drawLevelMeter(node, ImVec2(origin.x + kMeterX, meterTop),
-                           meterHeight, view.meterOptions, 2)) {
+                           meterHeight, view.meterOptions, 2,
+                           LevelMeterStyle{},
+                           sessionHasFloatHeadroom(edit.bitDepth()))) {
             view.meterOptionsChanged = true;
         }
     };
@@ -1092,7 +1220,8 @@ void drawTimeline(const document::Edit& edit,
         view.drawingAutomationOwnerId.clear();
         view.automationDrawOriginal.clear();
         view.automationDrawStroke.clear();
-        view.automationDrawLogarithmic = false;
+        view.automationDrawFlipped = false;
+                view.automationSteepnessLatched = false;
     }
     const bool automationEditorOpenAtFrameStart =
         view.editingAutomationValue;
@@ -1146,7 +1275,8 @@ void drawTimeline(const document::Edit& edit,
                         view.drawingAutomationOwnerId.clear();
                         view.automationDrawOriginal.clear();
                         view.automationDrawStroke.clear();
-                        view.automationDrawLogarithmic = false;
+                        view.automationDrawFlipped = false;
+                view.automationSteepnessLatched = false;
                     }
                     automationConsumedClick = true;
                 }
@@ -1186,7 +1316,8 @@ void drawTimeline(const document::Edit& edit,
                 view.drawingAutomationOwnerId.clear();
                 view.automationDrawOriginal.clear();
                 view.automationDrawStroke.clear();
-                view.automationDrawLogarithmic = false;
+                view.automationDrawFlipped = false;
+                view.automationSteepnessLatched = false;
                 automationConsumedClick = true;
             }
             const ImU32 buttonFill = C(selected ? pal.surfaceStrong
@@ -1233,7 +1364,10 @@ void drawTimeline(const document::Edit& edit,
                        "Line: drag a straight automation ramp");
         drawToolButton("##curve", AutomationTool::Curve,
                        toolsLeft + 2.0f * (toolSize.x + toolGap),
-                       "Curve: drag a parabolic ramp; hold Option (Alt on Windows) for logarithmic; hold Control to reverse the slope");
+                       "Curve: drag a ramp\n"
+                       "Option (Alt): flip it\n"
+                       "Shift or Control: hold the end still and sweep how "
+                       "steep it is");
         ImGui::PopID();
         ImGui::PopID();
         ImGui::SetCursorScreenPos(savedParameterCursor);
@@ -1287,7 +1421,8 @@ void drawTimeline(const document::Edit& edit,
             view.drawingAutomationOwnerId.clear();
             view.automationDrawOriginal.clear();
             view.automationDrawStroke.clear();
-            view.automationDrawLogarithmic = false;
+            view.automationDrawFlipped = false;
+                view.automationSteepnessLatched = false;
         };
         auto upsertStrokePoint = [&](int64_t sample, double value) {
             auto& stroke = view.automationDrawStroke;
@@ -1315,39 +1450,66 @@ void drawTimeline(const document::Edit& edit,
                                   view.automationDrawAnchor.db);
                 upsertStrokePoint(xToSample(mouse.x), yToValue(mouse.y));
             } else if (view.drawingAutomationTool == AutomationTool::Curve) {
-                view.automationDrawLogarithmic = ImGui::GetIO().KeyAlt;
+                // Option flips the curve — and only Option. Control used to
+                // mirror it too, by a different route, which made the two
+                // modifiers do the same visible thing.
+                view.automationDrawFlipped = ImGui::GetIO().KeyAlt;
+                // Shift as well as Control, because on macOS Control+left is
+                // not reliably a drag at all: ImGui converts a left press made
+                // while Control is held into a RIGHT click, to match the OS
+                // convention (see AddMouseButtonEvent). Pressing Control after
+                // the drag has started works; pressing it first never begins
+                // one. Shift is not hijacked by anything and always does.
+#if defined(__APPLE__)
+                // ImGui's macOS behavior swaps Command and Control internally:
+                // physical Control is exposed as KeySuper here.
+                const bool adjustSteepness =
+                    ImGui::GetIO().KeySuper || ImGui::GetIO().KeyShift;
+#else
+                const bool adjustSteepness =
+                    ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeyShift;
+#endif
+                if (adjustSteepness) {
+                    if (!view.automationSteepnessLatched) {
+                        // Latch where the curve currently ends. Without this
+                        // the far end would jump to wherever the pointer had
+                        // drifted the moment Control was released.
+                        view.automationSteepnessLatched = true;
+                        view.automationSteepnessAnchorX = mouse.x;
+                        view.automationSteepnessAtLatch =
+                            view.automationDrawSteepness;
+                        view.automationFrozenSample = xToSample(mouse.x);
+                        view.automationFrozenValue = yToValue(mouse.y);
+                    }
+                    view.automationDrawSteepness = automationSteepnessForDrag(
+                        view.automationSteepnessAtLatch,
+                        mouse.x - view.automationSteepnessAnchorX);
+                } else {
+                    view.automationSteepnessLatched = false;
+                }
+
                 view.automationDrawStroke.clear();
                 const float anchorX = sampleToX(
                     view.automationDrawAnchor.sample);
-                const float dx = mouse.x - anchorX;
+                // While steepness is being swept the end stays put, so the
+                // drag changes the shape and nothing else.
+                const int64_t endSample = view.automationSteepnessLatched
+                    ? view.automationFrozenSample : xToSample(mouse.x);
+                const double endValue = view.automationSteepnessLatched
+                    ? view.automationFrozenValue : yToValue(mouse.y);
+                const float endX = sampleToX(endSample);
+                const float dx = endX - anchorX;
                 constexpr float pointSpacing = 6.0f;
                 const int steps = std::max(
                     1, static_cast<int>(std::ceil(
                            std::fabs(dx) / pointSpacing)));
                 const double startValue = view.automationDrawAnchor.db;
-                const double endValue = yToValue(mouse.y);
-#if defined(__APPLE__)
-                // ImGui's macOS behavior swaps Command and Control internally:
-                // physical Control is exposed as KeySuper here.
-                const bool reverseSlope = ImGui::GetIO().KeySuper;
-#else
-                const bool reverseSlope = ImGui::GetIO().KeyCtrl;
-#endif
-                auto shapeAmount = [&](double amount) {
-                    return view.automationDrawLogarithmic
-                        ? std::log10(1.0 + 9.0 * amount)
-                        : amount * amount;
-                };
                 for (int step = 0; step <= steps; ++step) {
                     const double t = static_cast<double>(step) /
                                      static_cast<double>(steps);
-                    // A finite, endpoint-preserving logarithmic mapping makes
-                    // Option/Alt useful for both volume and bipolar pan lanes.
-                    // Control mirrors the mapping around the midpoint, moving
-                    // the steep part of either shape to the opposite endpoint.
-                    const double shaped = reverseSlope
-                        ? 1.0 - shapeAmount(1.0 - t)
-                        : shapeAmount(t);
+                    const double shaped = automationCurveShape(
+                        t, view.automationDrawSteepness,
+                        view.automationDrawFlipped);
                     const float x = anchorX + dx * static_cast<float>(t);
                     const double value = startValue +
                         (endValue - startValue) * shaped;
@@ -1735,9 +1897,12 @@ void drawTimeline(const document::Edit& edit,
             laneHovered && view.automationTool == AutomationTool::Pencil &&
             !view.editingAutomationValue && !opensValueEditor;
         if (showPencilCursor) {
-            // Hide the platform arrow and draw the shared pencil with its
-            // graphite point exactly at the automation sample/value hotspot.
+            // Two mechanisms on purpose. ImGui's is what a headless test can
+            // observe; the view flag is what actually reaches the screen,
+            // because the backend's own cursor handling shares one state
+            // across viewports and drops the request.
             ImGui::SetMouseCursor(ImGuiMouseCursor_None);
+            view.wantsHiddenCursor = true;
             drawPencilGlyph(ImGui::GetForegroundDrawList(), mouse, 1.1f);
         }
 
@@ -1805,9 +1970,13 @@ void drawTimeline(const document::Edit& edit,
                 view.drawingAutomation = true;
                 view.drawingAutomationParameter = parameter;
                 view.drawingAutomationTool = view.automationTool;
-                view.automationDrawLogarithmic =
+                view.automationDrawFlipped =
                     view.automationTool == AutomationTool::Curve &&
                     ImGui::GetIO().KeyAlt;
+                // Steepness carries over between strokes — it is a tool
+                // setting, like a brush size, not something to relearn every
+                // time. Only the latch resets.
+                view.automationSteepnessLatched = false;
                 view.drawingAutomationOwnerId = ownerId;
                 view.automationDrawOriginal = storedPoints;
                 view.automationDrawStroke.clear();
@@ -1886,12 +2055,7 @@ void drawTimeline(const document::Edit& edit,
         dl->AddLine(ImVec2(origin.x, y + trackHeight),
                     ImVec2(origin.x + totalWidth, y + trackHeight),
                     C(pal.border));
-        const ImVec4 trackColors[] = {
-            pal.markerCue, pal.markerSection, pal.markerLoop,
-            pal.markerPunch, pal.markerCd, pal.markerCustom
-        };
-        const ImVec4& trackColor =
-            trackColors[ti % (sizeof(trackColors) / sizeof(trackColors[0]))];
+        const ImVec4 trackColor = defaultTrackColor(static_cast<int>(ti));
         drawTrackMeter(y, trackHeight, track.id);
         drawTrackBand(y, trackHeight, trackColor, track.color, track.id,
                       static_cast<int>(ti));
@@ -2763,6 +2927,44 @@ const char* markerKindLabel(document::MarkerKind k) {
 
 } // namespace
 
+bool deleteAutomationInSelection(document::Edit& edit,
+                                 editing::UndoStack& undo,
+                                 TimelineViewState& view) {
+    if (!view.hasSelection || view.selectedTrackIndex < 0) return false;
+    const auto& tracks = edit.tracks();
+    if (view.selectedTrackIndex >= static_cast<int>(tracks.size())) return false;
+    const auto& track = tracks[static_cast<size_t>(view.selectedTrackIndex)];
+    // Only a lane that is open: deleting points on a lane the user cannot see
+    // would be an edit with no visible cause.
+    if (!view.expandedTracks.contains(track.id)) return false;
+
+    // A selection dragged right-to-left still names a range.
+    const int64_t start = std::min(view.selectionStart, view.selectionEnd);
+    const int64_t end = std::max(view.selectionStart, view.selectionEnd);
+
+    auto parameter = AutomationParameter::Volume;
+    const auto found = view.automationParameters.find(track.id);
+    if (found != view.automationParameters.end()) parameter = found->second;
+
+    if (parameter == AutomationParameter::Pan) {
+        const auto* points = edit.panAutomation(track.id);
+        if (points == nullptr) return false;
+        auto kept = pointsOutsideRange(*points, start, end);
+        if (kept.size() == points->size()) return false;
+        undo.execute(std::make_unique<editing::ReplacePanAutomationCommand>(
+            track.id, std::move(kept)));
+        return true;
+    }
+
+    const auto* points = edit.volumeAutomation(track.id);
+    if (points == nullptr) return false;
+    auto kept = pointsOutsideRange(*points, start, end);
+    if (kept.size() == points->size()) return false;
+    undo.execute(std::make_unique<editing::ReplaceVolumeAutomationCommand>(
+        track.id, std::move(kept)));
+    return true;
+}
+
 bool duplicateSelectedClip(const document::Edit& edit,
                            editing::UndoStack& undo,
                            TimelineViewState& view) {
@@ -2803,7 +3005,9 @@ float drawMarkerLane(const document::Edit& edit,
         sample = std::max<int64_t>(0, sample);
         return view.snapEnabled
             ? snapSampleToFormat(sample, view.tcMode, samplesPerPixel,
-                                 static_cast<double>(edit.sampleRate()))
+                                 static_cast<double>(edit.sampleRate()),
+                                 24.0, edit.tempoBpm(), &edit.meterMap(),
+                                 &edit.tempoMap())
             : sample;
     };
 
@@ -3110,7 +3314,9 @@ float drawVideoLane(const document::Edit& edit,
         sample = std::max<int64_t>(0, sample);
         return view.snapEnabled
             ? snapSampleToFormat(sample, view.tcMode, samplesPerPixel,
-                                 static_cast<double>(edit.sampleRate()))
+                                 static_cast<double>(edit.sampleRate()),
+                                 24.0, edit.tempoBpm(), &edit.meterMap(),
+                                 &edit.tempoMap())
             : sample;
     };
 

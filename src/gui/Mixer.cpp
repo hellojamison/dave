@@ -107,7 +107,8 @@ struct StripModel {
 // has finished. Mutating the track vectors mid-loop would invalidate the very
 // references the remaining strips are drawn from.
 struct StripAction {
-    enum class Kind { None, AddInsert, RemoveInsert, ClearInstrument };
+    enum class Kind { None, AddInsert, RemoveInsert, ClearInstrument,
+                      SetBypass };
     Kind kind = Kind::None;
     std::string trackId;
     std::string slotId;
@@ -138,7 +139,7 @@ bool drawPanKnob(const char* id, float& value) {
             }
         }
     }
-    if ((ImGui::IsItemClicked() && ImGui::GetIO().KeyAlt) ||
+    if (theme::altClickedReset() ||
         (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))) {
         if (value != 0.0f) {
             value = 0.0f;
@@ -202,8 +203,9 @@ bool drawPanKnob(const char* id, float& value) {
 // The mixer's strips are always stereo, so it keeps a two-channel shorthand
 // over the shared drawer.
 void drawLevelMeter2(engine::GainNode* node, ImVec2 pos, float height,
-                     TimelineViewState& view) {
-    if (drawLevelMeter(node, pos, height, view.meterOptions, 2)) {
+                     TimelineViewState& view, bool floatHeadroom) {
+    if (drawLevelMeter(node, pos, height, view.meterOptions, 2,
+                       LevelMeterStyle{}, floatHeadroom)) {
         view.meterOptionsChanged = true;
     }
 }
@@ -213,7 +215,7 @@ void drawLevelMeter2(engine::GainNode* node, ImVec2 pos, float height,
 // if the row wants to be removed.
 bool drawSlotRow(int uid, const char* label, document::PluginSlot& slot,
                  document::Edit& edit, TimelineViewState& view, float width,
-                 bool isInstrument) {
+                 bool isInstrument, bool* bypassRequested) {
     const auto& pal = theme::palette();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImGui::PushID(uid);
@@ -229,8 +231,9 @@ bool drawSlotRow(int uid, const char* label, document::PluginSlot& slot,
     if (ImGui::BeginPopupContextItem("##slotmenu")) {
         if (ImGui::MenuItem("Open Editor")) view.requestPluginEditorSlotId = slot.id;
         if (ImGui::MenuItem("Bypass", nullptr, slot.bypass)) {
-            slot.bypass = !slot.bypass;
-            edit.notifyChanged();
+            // Deferred to the caller, which owns the undo stack — and past
+            // this row, since the command reallocates the chain it lives in.
+            if (bypassRequested != nullptr) *bypassRequested = true;
         }
         ImGui::Separator();
         if (ImGui::MenuItem(isInstrument ? "Clear Instrument" : "Remove Insert")) {
@@ -464,10 +467,17 @@ StripAction drawStrip(const StripModel& m, document::Edit& edit,
                     TimelineViewState::PluginPicker::MidiInstrument;
                 view.requestPickerTrackId = m.trackId;
             }
-        } else if (drawSlotRow(2, "Instrument", *m.instrument, edit, view,
-                               inner, true)) {
-            action = StripAction{StripAction::Kind::ClearInstrument, m.trackId,
-                                 m.instrument->id, true};
+        } else {
+            bool bypassRequested = false;
+            if (drawSlotRow(2, "Instrument", *m.instrument, edit, view, inner,
+                            true, &bypassRequested)) {
+                action = StripAction{StripAction::Kind::ClearInstrument,
+                                     m.trackId, m.instrument->id, true};
+            }
+            if (bypassRequested) {
+                action = StripAction{StripAction::Kind::SetBypass, m.trackId,
+                                     m.instrument->id, true};
+            }
         }
     } else {
         drawSummaryRow("##mixInput", "IN MIX", inner,
@@ -512,8 +522,14 @@ StripAction drawStrip(const StripModel& m, document::Edit& edit,
     for (auto& slot : *m.inserts) {
         char label[16];
         std::snprintf(label, sizeof(label), "Insert %d", insertIdx + 1);
-        if (drawSlotRow(100 + insertIdx, label, slot, edit, view, inner, false)) {
+        bool bypassRequested = false;
+        if (drawSlotRow(100 + insertIdx, label, slot, edit, view, inner, false,
+                        &bypassRequested)) {
             action = StripAction{StripAction::Kind::RemoveInsert, m.trackId,
+                                 slot.id, m.isMidi};
+        }
+        if (bypassRequested) {
+            action = StripAction{StripAction::Kind::SetBypass, m.trackId,
                                  slot.id, m.isMidi};
         }
         verticalSpace(kSpaceXs);
@@ -640,9 +656,7 @@ StripAction drawStrip(const StripModel& m, document::Edit& edit,
         const bool faderDragged = ImGui::VSliderFloat(
             "##fader", ImVec2(faderW, faderH), &gainDb,
             -60.0f, 6.0f, "");
-        const bool faderReset =
-            ImGui::IsItemClicked(ImGuiMouseButton_Left) &&
-            ImGui::GetIO().KeyAlt;
+        const bool faderReset = theme::altClickedReset();
         if (faderReset) gainDb = 0.0f;
         const double nextGain = std::pow(10.0f, gainDb / 20.0f);
         if ((faderDragged || faderReset) && *m.gain != nextGain) {
@@ -655,7 +669,8 @@ StripAction drawStrip(const StripModel& m, document::Edit& edit,
         drawLevelMeter2(m.meter,
                         ImVec2(faderPos.x + faderW + faderMeterGap,
                                faderPos.y),
-                        faderH, view);
+                        faderH, view,
+                        sessionHasFloatHeadroom(edit.bitDepth()));
         char dbText[16];
         std::snprintf(dbText, sizeof(dbText), "%+.1f", gainDb);
         const ImVec2 ts = ImGui::CalcTextSize(dbText);
@@ -773,14 +788,17 @@ void drawMixer(document::Edit& edit, editing::UndoStack& undo,
             view.requestPickerTrackId = action.trackId;
             break;
         case StripAction::Kind::RemoveInsert:
-            if (action.isMidi) {
-                undo.execute(std::make_unique<editing::RemovePluginCommand>(
-                    action.trackId, action.slotId));
-            } else {
-                undo.execute(std::make_unique<editing::RemovePluginCommand>(
-                    action.trackId, action.slotId));
-            }
+            undo.execute(std::make_unique<editing::RemovePluginCommand>(
+                action.trackId, action.slotId));
             break;
+        case StripAction::Kind::SetBypass: {
+            // Read the current state here rather than carrying it through the
+            // action: by now the row that requested it has been rebuilt.
+            const auto* slot = edit.pluginSlot(action.slotId);
+            undo.execute(std::make_unique<editing::SetPluginBypassCommand>(
+                action.slotId, slot != nullptr && !slot->bypass));
+            break;
+        }
         case StripAction::Kind::ClearInstrument:
             undo.execute(std::make_unique<editing::SetMidiInstrumentCommand>(
                 action.trackId, document::PluginSlot{}));

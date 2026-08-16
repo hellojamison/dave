@@ -1170,6 +1170,150 @@ private:
     size_t index_ = 0;
 };
 
+// Bypass or enable a plugin. Undoable like every other chain edit — bypass is
+// a mix decision, and one you make while comparing, which is exactly when you
+// want to take it back.
+class SetPluginBypassCommand : public Command {
+public:
+    SetPluginBypassCommand(std::string slotId, bool bypass)
+        : slotId_(std::move(slotId)), bypass_(bypass) {}
+
+    void perform(document::Edit& e) override {
+        if (const auto* slot = e.pluginSlot(slotId_)) previous_ = slot->bypass;
+        applied_ = e.setPluginBypass(slotId_, bypass_);
+    }
+
+    void undo(document::Edit& e) override {
+        if (applied_) e.setPluginBypass(slotId_, previous_);
+    }
+
+    std::string name() const override {
+        return bypass_ ? "Bypass Plugin" : "Enable Plugin";
+    }
+
+private:
+    std::string slotId_;
+    bool bypass_ = false;
+    bool previous_ = false;
+    bool applied_ = false;
+};
+
+// Set or replace the time signature at a bar. Undoable because it moves every
+// bar line after it — an accidental change to bar 1 renumbers the whole
+// session, and the only way back is the exact map that was there before.
+class SetTimeSignatureCommand : public Command {
+public:
+    SetTimeSignatureCommand(int bar, int numerator, int denominator)
+        : bar_(bar), numerator_(numerator), denominator_(denominator) {}
+
+    void perform(document::Edit& e) override {
+        before_ = e.meterMap();
+        applied_ = e.setTimeSignature(bar_, numerator_, denominator_);
+    }
+    void undo(document::Edit& e) override {
+        if (applied_) e.setMeterMap(before_);
+    }
+    std::string name() const override { return "Set Time Signature"; }
+
+private:
+    int bar_ = 1;
+    int numerator_ = 4;
+    int denominator_ = 4;
+    std::vector<document::TimeSignature> before_;
+    bool applied_ = false;
+};
+
+class RemoveTimeSignatureCommand : public Command {
+public:
+    explicit RemoveTimeSignatureCommand(int bar) : bar_(bar) {}
+    void perform(document::Edit& e) override {
+        before_ = e.meterMap();
+        applied_ = e.removeTimeSignature(bar_);
+    }
+    void undo(document::Edit& e) override {
+        if (applied_) e.setMeterMap(before_);
+    }
+    std::string name() const override { return "Remove Time Signature"; }
+
+private:
+    int bar_ = 1;
+    std::vector<document::TimeSignature> before_;
+    bool applied_ = false;
+};
+
+// Tempo moves every bar line after it, so it gets the same treatment as a
+// meter change: undo restores the whole map, because a change at bar 1
+// re-times the entire session.
+class SetTempoCommand : public Command {
+public:
+    explicit SetTempoCommand(double bpm) : bar_(1), beat_(1), bpm_(bpm) {}
+    SetTempoCommand(int bar, int beat, double bpm)
+        : bar_(bar), beat_(beat), bpm_(bpm) {}
+
+    void perform(document::Edit& e) override {
+        before_ = e.tempoMap();
+        applied_ = e.setTempoChange(bar_, beat_, bpm_);
+    }
+    void undo(document::Edit& e) override {
+        if (applied_) e.setTempoMap(before_);
+    }
+    std::string name() const override { return "Set Tempo"; }
+
+private:
+    int bar_ = 1;
+    int beat_ = 1;
+    double bpm_ = 120.0;
+    std::vector<document::TempoChange> before_;
+    bool applied_ = false;
+};
+
+class RemoveTempoCommand : public Command {
+public:
+    RemoveTempoCommand(int bar, int beat) : bar_(bar), beat_(beat) {}
+    void perform(document::Edit& e) override {
+        before_ = e.tempoMap();
+        applied_ = e.removeTempoChange(bar_, beat_);
+    }
+    void undo(document::Edit& e) override {
+        if (applied_) e.setTempoMap(before_);
+    }
+    std::string name() const override { return "Remove Tempo Change"; }
+
+private:
+    int bar_ = 1;
+    int beat_ = 1;
+    std::vector<document::TempoChange> before_;
+    bool applied_ = false;
+};
+
+// Move one entry of a channel's chain — an insert, a send, the meter or the
+// fader. One command because there is one list: the two it replaced
+// (SetMeterTapCommand, ReorderSendCommand) were the same move expressed twice
+// because the meter and the sends used to live in separate orderings.
+class MoveChainSlotCommand : public Command {
+public:
+    MoveChainSlotCommand(std::string trackId, size_t from, size_t to)
+        : trackId_(std::move(trackId)), from_(from), to_(to) {}
+
+    void perform(document::Edit& e) override {
+        moved_ = e.moveChainSlot(trackId_, from_, to_);
+    }
+
+    void undo(document::Edit& e) override {
+        // Back to where it came from, which after the shift is `from_` — the
+        // entries it passed have closed up behind it.
+        if (moved_) e.moveChainSlot(trackId_, to_, from_);
+    }
+
+    std::string name() const override { return "Reorder Chain"; }
+
+private:
+    std::string trackId_;
+    size_t from_ = 0;
+    size_t to_ = 0;
+    bool moved_ = false;
+};
+
 class UpdateSendCommand : public Command {
 public:
     UpdateSendCommand(std::string ownerId, document::AuxSend send)

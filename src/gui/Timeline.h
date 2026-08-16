@@ -140,6 +140,9 @@ struct TimelineViewState {
     PluginPicker requestPicker = PluginPicker::None;
     std::string requestPickerTrackId;
     std::string requestPluginEditorSlotId;       // open a plugin's editor
+    // A track asking for the channel strip. The strip is opt-in, so the E
+    // button on a row is how it opens — the app selects that row and shows it.
+    std::string requestChannelStripTrackId;
     std::string requestTrackColorId;
     std::string requestTrackColor;               // empty restores default
     bool deferRecordArmRequests = false;
@@ -201,6 +204,10 @@ struct TimelineViewState {
     // even though their compact toggle is repeated inside each open lane.
     AutomationTool automationTool = AutomationTool::Pencil;
     std::string revealAutomationOwnerId;
+    // The pointer is over something that draws its own cursor, so the system
+    // one has to go. Set during the frame by whatever owns that tool and read
+    // by the application afterwards; cleared each frame before drawing.
+    bool wantsHiddenCursor = false;
     bool draggingAutomation = false;
     AutomationParameter activeAutomationParameter =
         AutomationParameter::Volume;
@@ -226,7 +233,23 @@ struct TimelineViewState {
     std::vector<document::VolumeAutomationPoint> automationDrawStroke;
     float automationDrawLastX = 0.0f;
     float automationDrawLastY = 0.0f;
-    bool automationDrawLogarithmic = false;
+    // The curve tool's shape, as an exponent: 1 is a straight line, 2 the
+    // default parabola, below 1 the mirror of a parabola. One parameter
+    // instead of a boolean shape swap, because Control now sweeps it
+    // continuously and a two-state flag has nothing to sweep.
+    double automationDrawSteepness = 2.0;
+    // Option mirrors the shape around its midpoint, moving the steep part to
+    // the other end. This is the ONLY flip: Control used to do the same thing
+    // by another route, which made the two modifiers indistinguishable.
+    bool automationDrawFlipped = false;
+    // While Control is held the curve's far end stops following the pointer
+    // and the drag sweeps steepness instead. The end is latched so letting go
+    // of Control does not snap the curve to wherever the mouse wandered.
+    bool automationSteepnessLatched = false;
+    float automationSteepnessAnchorX = 0.0f;
+    double automationSteepnessAtLatch = 2.0;
+    int64_t automationFrozenSample = 0;
+    double automationFrozenValue = 0.0;
     // Double-clicking an envelope point opens a compact numeric editor beside
     // it. This stays view-only; committing still goes through the undo stack.
     bool editingAutomationValue = false;
@@ -256,10 +279,24 @@ struct TimelineViewState {
 void zoomAroundSample(TimelineViewState& view, double newSamplesPerPixel,
                       int64_t anchorSample);
 
+// The curve tool's shape at `t` in 0..1. `steepness` is an exponent — 1 is a
+// straight line, 2 a parabola — and `flipped` mirrors it around the midpoint,
+// which moves the steep part to the other end. Both endpoints are preserved
+// whatever the shape, so a curve always starts and ends where it was drawn.
+double automationCurveShape(double t, double steepness, bool flipped);
+
+// Steepness after a Control-drag of `dx` pixels from where it was latched.
+// Exponential in the drag so the same gesture halves or doubles the exponent
+// whichever end of the range it starts from.
+double automationSteepnessForDrag(double latched, float dx);
+
 // Format a sample position into a timecode string for the selected mode.
 std::string formatTimecode(int64_t samples, TimecodeMode mode,
                            double sr = 48000.0, double fps = 24.0,
-                           double bpm = 120.0);
+                           double bpm = 120.0,
+                           const std::vector<document::TimeSignature>* meter = nullptr,
+                           const std::vector<document::TempoChange>* tempo =
+                               nullptr);
 
 // The grid divisions for a timing format, in samples. `major` is the labelled
 // one; `minor` is its subdivision.
@@ -276,7 +313,10 @@ struct GridStep {
 // to prevent: the labels tick over at positions that are not beats.
 GridStep gridStepFor(TimecodeMode mode, double samplesPerPixel,
                      double sr = 48000.0, double fps = 24.0,
-                     double bpm = 120.0);
+                     double bpm = 120.0,
+                     const std::vector<document::TimeSignature>* meter =
+                         nullptr,
+                     const std::vector<document::TempoChange>* tempo = nullptr);
 
 // The increment timeline edits land on while Snap is enabled, in samples —
 // the finest division of the current format that is still wide enough to aim
@@ -284,7 +324,10 @@ GridStep gridStepFor(TimecodeMode mode, double samplesPerPixel,
 // Zooming out steps it up through the same units rather than abandoning them.
 int64_t snapStepFor(TimecodeMode mode, double samplesPerPixel,
                     double sr = 48000.0, double fps = 24.0,
-                    double bpm = 120.0);
+                    double bpm = 120.0,
+                    const std::vector<document::TimeSignature>* meter =
+                        nullptr,
+                     const std::vector<document::TempoChange>* tempo = nullptr);
 
 // Round a non-negative timeline position to the nearest current-format snap
 // division. Kept separate from the widget so every timeline lane can use the
@@ -292,7 +335,10 @@ int64_t snapStepFor(TimecodeMode mode, double samplesPerPixel,
 int64_t snapSampleToFormat(int64_t sample, TimecodeMode mode,
                            double samplesPerPixel,
                            double sr = 48000.0, double fps = 24.0,
-                           double bpm = 120.0);
+                           double bpm = 120.0,
+                           const std::vector<document::TimeSignature>* meter =
+                               nullptr,
+                     const std::vector<document::TempoChange>* tempo = nullptr);
 
 // Draw the timeline widget. Caller passes everything in; the widget holds no
 // state itself (immediate-mode). Interactions fire commands on the UndoStack
@@ -323,6 +369,32 @@ void drawTimeline(const document::Edit& edit,
 // This lives here rather than in the key handler because DaveApp is not in the
 // test target — the dispatch is the part that can be got wrong, so it belongs
 // somewhere a test can reach it. Returns false when nothing is selected.
+// Delete every automation point inside the timeline selection, on the lane
+// the selected track currently shows. Returns false when there is nothing to
+// act on — no selection, no open lane, or no points inside it — so the caller
+// can let the key fall through to whatever else Delete might mean.
+//
+// Here rather than in the key handler for the usual reason: DaveApp is not in
+// the test target, and deciding WHICH points are inside a range is the part
+// worth testing.
+bool deleteAutomationInSelection(document::Edit& edit,
+                                 editing::UndoStack& undo,
+                                 TimelineViewState& view);
+
+// The points that survive removing everything in [start, end] inclusive.
+// Exposed because the range arithmetic is the whole of the decision.
+template <typename Point>
+std::vector<Point> pointsOutsideRange(const std::vector<Point>& points,
+                                      int64_t start, int64_t end) {
+    std::vector<Point> kept;
+    kept.reserve(points.size());
+    for (const auto& point : points) {
+        if (point.sample >= start && point.sample <= end) continue;
+        kept.push_back(point);
+    }
+    return kept;
+}
+
 bool duplicateSelectedClip(const document::Edit& edit,
                            editing::UndoStack& undo,
                            TimelineViewState& view);

@@ -522,3 +522,87 @@ TEST_CASE("plugins can be added to any track, including one made for MIDI",
     CHECK(edit.removePlugin(keys, id));
     CHECK(edit.track(keys)->plugins.empty());
 }
+
+TEST_CASE("moving a send through the chain moves where it taps",
+          "[routing][render]") {
+    // The order in the list has to be the order in the signal, or the chain is
+    // decoration. Pre/post-fader is no longer a property of the send — it is
+    // whether the send sits before or after the Fader entry.
+    document::Edit edit;
+    const auto trackId = edit.addTrack("DX");
+    auto* track = edit.track(trackId);
+    REQUIRE(track != nullptr);
+    track->gain = 0.5;
+    REQUIRE(edit.setInputMonitor(trackId, true));
+
+    document::AuxSend send;
+    send.target = document::RouteTarget::hardwareOutput(2, 1);
+    send.gain = 1.0;
+    send.muted = false;
+    const std::string sendId = edit.addSend(trackId, send);
+    REQUIRE_FALSE(sendId.empty());
+
+    const auto tapLevel = [&]() {
+        engine::GraphBuilder builder;
+        auto graph = builder.build(edit, 48000.0, 4);
+        auto [compiled, error] = engine::compile(*graph, 48000.0, 16);
+        REQUIRE_FALSE(error.has_value());
+        std::vector<std::vector<float>> input(1, std::vector<float>(16, 0.0f));
+        input[0][0] = 1.0f;
+        return render(*compiled, 4, 16, input)[2][0];
+    };
+
+    // Default placement is after the fader, so the 0.5 fader scales it.
+    CHECK(tapLevel() == Catch::Approx(0.5f));
+
+    // Find the send and the fader, and put the send ahead of the fader.
+    const auto& chain = edit.track(trackId)->chain;
+    size_t sendRow = chain.size();
+    size_t faderRow = chain.size();
+    for (size_t i = 0; i < chain.size(); ++i) {
+        if (chain[i].kind == document::ChainSlot::Kind::Send) sendRow = i;
+        if (chain[i].kind == document::ChainSlot::Kind::Fader) faderRow = i;
+    }
+    REQUIRE(sendRow < chain.size());
+    REQUIRE(faderRow < chain.size());
+    REQUIRE(edit.moveChainSlot(trackId, sendRow, faderRow));
+
+    // Now it taps ahead of the fader and the fader no longer affects it.
+    CHECK(tapLevel() == Catch::Approx(1.41421356f));
+}
+
+TEST_CASE("the chain meter reads the level arriving at the fader",
+          "[routing][render]") {
+    // The fader's row is drawn as a meter, and the point of putting it there
+    // is that it shows the level you are setting the fader AGAINST. A tap on
+    // the far side would show the result instead, which is the one thing it
+    // must not do — you would be reading your own fader move.
+    document::Edit edit;
+    const auto trackId = edit.addTrack("DX");
+    auto* track = edit.track(trackId);
+    REQUIRE(track != nullptr);
+    track->gain = 0.5;
+    REQUIRE(edit.setInputMonitor(trackId, true));
+
+    engine::GraphBuilder builder;
+    auto graph = builder.build(edit, 48000.0, 2);
+    auto [compiled, error] = engine::compile(*graph, 48000.0, 16);
+    REQUIRE_FALSE(error.has_value());
+
+    std::vector<std::vector<float>> input(1, std::vector<float>(16, 1.0f));
+    (void)render(*compiled, 2, 16, input);
+
+    REQUIRE(builder.meterTaps().count(trackId) == 1);
+    auto tap = builder.meterTaps().at(trackId);
+    REQUIRE(tap != nullptr);
+    // Full scale at the tap, with the 0.5 fader still ahead of it.
+    CHECK(tap->meter(0, true).peak == Catch::Approx(1.0f).margin(0.01f));
+
+    // And the track's own gain node sees the same signal on its input, which
+    // is what makes the two readings comparable.
+    REQUIRE(builder.trackGains().count(trackId) == 1);
+    CHECK(builder.trackGains().at(trackId)->meter(0, true).peak ==
+          Catch::Approx(1.0f).margin(0.01f));
+    // Post-fader is where the halving shows up.
+    CHECK(builder.trackGains().at(trackId)->meter(0, false).peak < 0.75f);
+}

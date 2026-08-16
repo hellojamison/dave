@@ -3,6 +3,7 @@
 
 #include "application/AudioPreferences.h"
 #include "application/EditorPreferences.h"
+#include "application/PunchRecording.h"
 #include "audio/TransientAnalysisCache.h"
 #include "document/Edit.h"
 #include "editing/Command.h"
@@ -17,6 +18,7 @@
 #include "engine/video/VideoDecoder.h"
 #include "gui/ImGuiLayer.h"
 #include "gui/IoPanel.h"
+#include "gui/ChannelStrip.h"
 #include "gui/Mixer.h"
 #include "gui/Timeline.h"
 #include "platform/AudioEngine.h"
@@ -102,17 +104,26 @@ private:
     void toggleSelectedTrackSolo();
     void toggleSelectedTrackArm();
     void toggleTrackArm(const std::string& trackId);
-    bool startRecording();
-    void stopRecording();
+    // Capture and regions are separate. A session exists for as long as the
+    // transport rolls over armed tracks; punches decide what is kept.
+    bool beginCapture();
+    void beginCaptureIfArmed();
+    void endCapture();
+    void punchIn();
+    void punchOut();
     void toggleRecording();
-    bool recordingActive() const { return recordingSession_ != nullptr; }
+    // A capture is running — the engine is writing to disk, so routing
+    // topology is frozen even when nothing is being kept.
+    bool capturing() const { return recordingSession_ != nullptr; }
+    // Actually keeping audio: what the record button is lit for.
+    bool recordingActive() const {
+        return capturing() && !recordingSession_->punches.empty() &&
+               recordingSession_->punches.back().open();
+    }
     void showStatus(std::string message, bool error = false);
     bool requestClose();
     bool loadWavIntoNewTrack(const std::string& path);
     void drawUI();
-    void drawPluginsPanel();        // legacy wrapper (unused — see drawPluginsPanelContent)
-    void drawPluginsPanelContent(); // content only (caller manages Begin/End)
-    void drawMidiTrackPanel(const document::MidiTrack& track);
     void drawPluginBrowser();
     void drawVideoPreview();        // legacy wrapper
     void drawVideoPreviewContent(); // content only (caller manages Begin/End)
@@ -131,11 +142,19 @@ private:
     struct RecordingSession {
         engine::DiskWriter writer;
         engine::RecordController controller;
+        // Where the continuous capture began. Regions are cut out of it.
         int64_t takeStartSample = 0;
         int latencyOffsetSamples = 0;
         std::vector<std::string> armedTrackIds;
+        // Which parts of the capture the user asked to keep. Empty means the
+        // transport rolled over armed tracks without anyone pressing Record,
+        // which writes a file and commits nothing.
+        std::vector<application::PunchRange> punches;
     };
     std::unique_ptr<RecordingSession> recordingSession_;
+    // Capture follows the transport, so the frame loop watches for the edge
+    // rather than every place that can start or stop playback.
+    bool transportWasRolling_ = false;
     std::string statusMessage_;
     bool statusIsError_ = false;
     double statusUntil_ = 0.0;
@@ -162,7 +181,12 @@ private:
 
     // Docked utility panes keep explicit pixel sizes. Native window resizing
     // changes the arrangement editor; only splitter drags change these.
-    float sidebarWidth_ = 360.0f;
+    // The strip is a single narrow column now, not a plugin list, and it is
+    // opt-in: a session that isn't routing anything shouldn't spend width on
+    // it. The E button on a track header opens it.
+    bool showChannelStrip_ = false;
+    float sidebarWidth_ = 260.0f;
+    gui::ChannelStripState channelStrip_;
     float videoHeight_ = 322.0f;
 
 
@@ -214,6 +238,7 @@ private:
         MidiInstrument,  // the instrument slot of a MIDI track (instruments only)
         MidiFx,          // post-instrument effect chain of a MIDI track
     };
+    void drawMeterEditor();
     void openPluginBrowser(BrowserMode mode, std::string trackId);
     void openPluginEditor(const document::PluginSlot& slot);
     // Find a slot by id anywhere it can live: an audio track's chain, a MIDI

@@ -12,6 +12,7 @@ add_executable(dave_tests
     test_mixer.cpp
     test_clipmove.cpp
     test_trackcommands.cpp
+    test_channelstrip.cpp
     test_smf.cpp
     test_mididoc.cpp
     test_instrument.cpp
@@ -33,6 +34,8 @@ add_executable(dave_tests
     test_audiopreferences.cpp
     test_editorpreferences.cpp
     test_takenaming.cpp
+    test_punchrecording.cpp
+    test_musicaltime.cpp
     test_transientdetector.cpp
     test_transientcache.cpp
     test_transientnavigation.cpp
@@ -48,10 +51,12 @@ add_executable(dave_tests
     "${CMAKE_SOURCE_DIR}/src/document/Sha256.cpp"
     "${CMAKE_SOURCE_DIR}/src/application/AudioPreferences.cpp"
     "${CMAKE_SOURCE_DIR}/src/application/TakeNaming.cpp"
+    "${CMAKE_SOURCE_DIR}/src/application/PunchRecording.cpp"
     "${CMAKE_SOURCE_DIR}/src/application/EditorPreferences.cpp"
     "${CMAKE_SOURCE_DIR}/src/audio/TransientDetector.cpp"
     "${CMAKE_SOURCE_DIR}/src/audio/TransientAnalysisCache.cpp"
     "${CMAKE_SOURCE_DIR}/src/document/Edit.cpp"
+    "${CMAKE_SOURCE_DIR}/src/document/MusicalTime.cpp"
     "${CMAKE_SOURCE_DIR}/src/document/MarkerCsv.cpp"
     "${CMAKE_SOURCE_DIR}/src/document/ProjectFile.cpp"
     "${CMAKE_SOURCE_DIR}/src/engine/midi/SmfReader.cpp"
@@ -71,6 +76,7 @@ add_executable(dave_tests
     "${CMAKE_SOURCE_DIR}/src/gui/Timeline.cpp"
     "${CMAKE_SOURCE_DIR}/src/gui/TransientNavigation.cpp"
     "${CMAKE_SOURCE_DIR}/src/gui/LevelMeter.cpp"
+    "${CMAKE_SOURCE_DIR}/src/gui/ChannelStrip.cpp"
     "${CMAKE_SOURCE_DIR}/src/gui/Mixer.cpp"
     "${CMAKE_SOURCE_DIR}/src/gui/Theme.cpp"
     "${CMAKE_SOURCE_DIR}/src/gui/IoPanel.cpp"

@@ -324,11 +324,10 @@ void drawIoPanel(IoPanelState& state) {
         state.requestRefresh();
     }
 
-    drawDevicePicker(
-        "##output-device", "OUTPUT", state.playbackCatalog(),
-        state.selectedOutput(), state.selectedOutputAvailable(),
-        state.selectedOutputLabel(),
-        [&](const std::string& id) { state.requestOutput(id); });
+    // Input first, and everything about the input together: the picker, the
+    // status line that reports on it, and its meters. Signal flows in before
+    // it flows out, and the status text is about capture — sitting it below
+    // the output picker read as if it were about playback.
     drawDevicePicker(
         "##input-device", "INPUT", state.captureCatalog(),
         state.selectedInput(), state.selectedInputAvailable(),
@@ -359,6 +358,12 @@ void drawIoPanel(IoPanelState& state) {
         state.requestClearInputClips();
     }
     drawMeterBank("##input-meters", state.meterSnapshot().inputs);
+
+    drawDevicePicker(
+        "##output-device", "OUTPUT", state.playbackCatalog(),
+        state.selectedOutput(), state.selectedOutputAvailable(),
+        state.selectedOutputLabel(),
+        [&](const std::string& id) { state.requestOutput(id); });
 
     ImGui::PopStyleVar(2);
     ImGui::PopID();

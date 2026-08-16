@@ -40,11 +40,10 @@ constexpr float kTrackHeight = 58.0f;
 // gutter content origin (colour band + level meter), then the 112 px parameter
 // combo, then three 24 px buttons 4 px apart. Kept in one place because five
 // tests depend on it and a layout change used to break all of them separately.
-// Gutter columns, mirroring Timeline.cpp: level meter, then the colour band
-// with its disclosure arrow, then the controls. Named because eleven tests
+// Gutter columns, mirroring Timeline.cpp: the colour band with its disclosure
+// arrow, then the level meter, then the controls. Named because eleven tests
 // click the band and every one of them used to carry the same magic number.
-constexpr float kMeterCenterX = 16.0f;
-constexpr float kBandCenterX = 39.0f;
+constexpr float kBandCenterX = 17.0f;
 constexpr float kGutterContentX = 54.0f;
 constexpr float kAutomationToolsLeft = kGutterContentX - 4.0f + 112.0f + 8.0f;
 constexpr float automationToolCenter(int index) {
@@ -131,6 +130,10 @@ struct LayoutRig : ImGuiRig {
 
     void holdControl(bool down) {
         ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, down);
+    }
+
+    void holdShift(bool down) {
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Shift, down);
     }
 
     void holdSuper(bool down) {
@@ -1043,16 +1046,28 @@ TEST_CASE("pencil tool uses its pencil as the automation lane cursor",
 
     const float laneX = rig.origin.x + kGutterWidth + 80.0f;
     const float laneY = automationTop + kAutomationLaneHeight * 0.5f;
+    rig.view.wantsHiddenCursor = false;
     rig.tick(laneX, laneY, false);
     CHECK(ImGui::GetMouseCursor() == ImGuiMouseCursor_None);
+    // The flag the application actually acts on. ImGui's cursor is arbitrated
+    // between every widget in the frame and then applied by a backend that
+    // shares one state across viewports, so asking it to hide reached the
+    // screen only some of the time — the pencil drew with the arrow still on
+    // top of it. This is the request that gets there.
+    CHECK(rig.view.wantsHiddenCursor);
 
     rig.view.automationTool = gui::AutomationTool::Line;
+    rig.view.wantsHiddenCursor = false;
     rig.tick(laneX, laneY, false);
     CHECK(ImGui::GetMouseCursor() != ImGuiMouseCursor_None);
+    CHECK_FALSE(rig.view.wantsHiddenCursor);
 
     rig.view.automationTool = gui::AutomationTool::Pencil;
+    rig.view.wantsHiddenCursor = false;
     rig.tick(rig.origin.x + 40.0f, tracksTop + 10.0f, false);
     CHECK(ImGui::GetMouseCursor() != ImGuiMouseCursor_None);
+    // Off the lane the arrow comes back, or the cursor would vanish for good.
+    CHECK_FALSE(rig.view.wantsHiddenCursor);
 }
 
 TEST_CASE("pencil draws a thinned envelope as one undoable gesture",
@@ -1280,8 +1295,11 @@ TEST_CASE("curve tool draws a parabolic ramp as one undoable gesture",
     CHECK(rig.edit.track(track)->volumeAutomation.empty());
 }
 
-TEST_CASE("holding Option switches an active curve to logarithmic automation",
+TEST_CASE("Option flips an active curve and nothing else does",
           "[timelinelayout][automation][tools][curve][pan]") {
+    // Option is the only flip. Control used to mirror the shape too, by a
+    // different route, so the two modifiers did the same visible thing and
+    // neither was worth reaching for.
     LayoutRig rig;
     rig.edit.addMarkerTrack("Markers");
     const std::string track = rig.edit.addTrack("Dialog");
@@ -1305,16 +1323,16 @@ TEST_CASE("holding Option switches an active curve to logarithmic automation",
     const float x1 = rig.origin.x + kGutterWidth + 300.0f;
     rig.tick(x0, panY(-1.0), false);
     rig.tick(x0, panY(-1.0), true);
-    CHECK_FALSE(rig.view.automationDrawLogarithmic);
+    CHECK_FALSE(rig.view.automationDrawFlipped);
     rig.tick(x1, panY(1.0), true);
 
     rig.holdAlt(true);
     rig.tick(x1, panY(1.0), true);
-    CHECK(rig.view.automationDrawLogarithmic);
+    CHECK(rig.view.automationDrawFlipped);
 
     rig.holdAlt(false);
     rig.tick(x1, panY(1.0), true);
-    CHECK_FALSE(rig.view.automationDrawLogarithmic);
+    CHECK_FALSE(rig.view.automationDrawFlipped);
 
     rig.holdAlt(true);
     rig.tick(x1, panY(1.0), true);
@@ -1330,17 +1348,17 @@ TEST_CASE("holding Option switches an active curve to logarithmic automation",
             return point.sample == 100000;
         });
     REQUIRE(midpoint != curve.end());
-    const double expected = -1.0 + 2.0 * std::log10(5.5);
+    // Flipped, the steep part is at the START, so the midpoint is already
+    // most of the way up. The default parabola would put it at -0.5.
+    const double expected = -1.0 + 2.0 * (1.0 - 0.5 * 0.5);
     CHECK(midpoint->pan == Catch::Approx(expected).margin(0.05));
-    // The same endpoints with the default parabola would be at -0.5 here.
     CHECK(midpoint->pan > 0.4);
-    CHECK_FALSE(rig.view.automationDrawLogarithmic);
 
     rig.undo.undo();
     CHECK(rig.edit.track(track)->panAutomation.empty());
 }
 
-TEST_CASE("holding Control reverses an active curve slope",
+TEST_CASE("Control sweeps steepness instead of moving the point",
           "[timelinelayout][automation][tools][curve][slope]") {
     LayoutRig rig;
     rig.edit.addMarkerTrack("Markers");
@@ -1364,6 +1382,10 @@ TEST_CASE("holding Control reverses an active curve slope",
     };
     const float x0 = rig.origin.x + kGutterWidth + 100.0f;
     const float x1 = rig.origin.x + kGutterWidth + 300.0f;
+    auto strokeEnd = [&] {
+        REQUIRE_FALSE(rig.view.automationDrawStroke.empty());
+        return rig.view.automationDrawStroke.back();
+    };
     auto midpointDb = [&] {
         const auto midpoint = std::find_if(
             rig.view.automationDrawStroke.begin(),
@@ -1377,16 +1399,117 @@ TEST_CASE("holding Control reverses an active curve slope",
     rig.tick(x0, volumeY(-48.0), false);
     rig.tick(x0, volumeY(-48.0), true);
     rig.tick(x1, volumeY(0.0), true);
-    CHECK(midpointDb() == Catch::Approx(-36.0).margin(1.5));
+    const double defaultMid = midpointDb();
+    CHECK(defaultMid == Catch::Approx(-36.0).margin(1.5));
+    const auto endBefore = strokeEnd();
 
+    // Control down, then drag well to the right. The far end must not follow.
     rig.holdControl(true);
     rig.tick(x1, volumeY(0.0), true);
-    CHECK(midpointDb() == Catch::Approx(-12.0).margin(1.5));
+    rig.tick(x1 + 140.0f, volumeY(0.0), true);
+    const auto endDuring = strokeEnd();
+    CHECK(endDuring.sample == endBefore.sample);
+    CHECK(endDuring.db == Catch::Approx(endBefore.db).margin(0.01));
+    // Steeper: a higher exponent holds the curve down longer, so the midpoint
+    // is quieter than the parabola's.
+    CHECK(rig.view.automationDrawSteepness > 3.0);
+    CHECK(midpointDb() < defaultMid);
 
+    // Dragging back the other way makes it shallower than the default.
+    rig.tick(x1 - 140.0f, volumeY(0.0), true);
+    CHECK(rig.view.automationDrawSteepness < 1.5);
+    CHECK(midpointDb() > defaultMid);
+
+    // Releasing Control leaves the end where it was latched rather than
+    // snapping it to wherever the pointer wandered while sweeping.
     rig.holdControl(false);
-    rig.tick(x1, volumeY(0.0), true);
-    CHECK(midpointDb() == Catch::Approx(-36.0).margin(1.5));
+    rig.tick(x1 - 140.0f, volumeY(0.0), true);
+    CHECK_FALSE(rig.view.automationSteepnessLatched);
     rig.tick(x1, volumeY(0.0), false);
+}
+
+TEST_CASE("Shift sweeps steepness too, because Control cannot on macOS",
+          "[timelinelayout][automation][tools][curve][slope]") {
+    // ImGui turns a left press made while Control is held into a RIGHT click,
+    // matching the OS convention — so on macOS "hold Control, then drag" never
+    // starts a drag at all. Shift is not hijacked and always works.
+    LayoutRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string track = rig.edit.addTrack("Dialog");
+    rig.settle();
+    const float tracksTop =
+        rig.origin.y + kRulerHeight + kMarkerLaneHeight;
+    const float automationTop = tracksTop + effectiveTrackHeight();
+    rig.clickTimelineAt(rig.origin.x + kBandCenterX,
+                        tracksTop + kTrackHeight * 0.5f);
+    rig.clickTimelineAt(rig.origin.x + automationToolCenter(2),
+                        automationTop + 16.0f);
+    REQUIRE(rig.view.automationTool == gui::AutomationTool::Curve);
+
+    auto volumeY = [&](double db) {
+        return automationTop + 8.0f +
+            static_cast<float>((document::kMaxVolumeAutomationDb - db) /
+                (document::kMaxVolumeAutomationDb -
+                 document::kMinVolumeAutomationDb)) *
+                (kAutomationLaneHeight - 16.0f);
+    };
+    const float x0 = rig.origin.x + kGutterWidth + 100.0f;
+    const float x1 = rig.origin.x + kGutterWidth + 300.0f;
+
+    rig.tick(x0, volumeY(-48.0), false);
+    rig.tick(x0, volumeY(-48.0), true);
+    rig.tick(x1, volumeY(0.0), true);
+    const double before = rig.view.automationDrawSteepness;
+
+    rig.holdShift(true);
+    rig.tick(x1, volumeY(0.0), true);
+    CHECK(rig.view.automationSteepnessLatched);
+    rig.tick(x1 + 140.0f, volumeY(0.0), true);
+    CHECK(rig.view.automationDrawSteepness > before);
+
+    rig.holdShift(false);
+    rig.tick(x1 + 140.0f, volumeY(0.0), true);
+    CHECK_FALSE(rig.view.automationSteepnessLatched);
+    rig.tick(x1, volumeY(0.0), false);
+}
+
+TEST_CASE("the curve shape keeps its endpoints at any steepness",
+          "[automation][curve]") {
+    // Whatever the exponent or the flip, a curve has to start and end where it
+    // was drawn — a shape that lifted its own endpoints would move the two
+    // points the user actually placed.
+    for (double steepness : {0.1, 0.5, 1.0, 2.0, 6.0, 12.0}) {
+        for (bool flipped : {false, true}) {
+            CHECK(gui::automationCurveShape(0.0, steepness, flipped) ==
+                  Catch::Approx(0.0).margin(1e-9));
+            CHECK(gui::automationCurveShape(1.0, steepness, flipped) ==
+                  Catch::Approx(1.0).margin(1e-9));
+        }
+    }
+    // Exponent 1 is a straight line.
+    CHECK(gui::automationCurveShape(0.5, 1.0, false) == Catch::Approx(0.5));
+    // The default parabola sits below the line at the midpoint, and flipping
+    // puts it above by the same amount.
+    CHECK(gui::automationCurveShape(0.5, 2.0, false) == Catch::Approx(0.25));
+    CHECK(gui::automationCurveShape(0.5, 2.0, true) == Catch::Approx(0.75));
+    // Out-of-range input is clamped rather than producing a NaN.
+    CHECK(gui::automationCurveShape(-1.0, 2.0, false) == Catch::Approx(0.0));
+    CHECK(gui::automationCurveShape(2.0, 2.0, false) == Catch::Approx(1.0));
+}
+
+TEST_CASE("a steepness drag is exponential and bounded", "[automation][curve]") {
+    // The same gesture has to feel the same at 0.3 as at 6; additive would
+    // jam against the floor.
+    CHECK(gui::automationSteepnessForDrag(2.0, 0.0) == Catch::Approx(2.0));
+    // 55 px per doubling: the whole useful range is a flick, not a reach.
+    CHECK(gui::automationSteepnessForDrag(2.0, 55.0) == Catch::Approx(4.0));
+    CHECK(gui::automationSteepnessForDrag(2.0, -55.0) == Catch::Approx(1.0));
+    CHECK(gui::automationSteepnessForDrag(0.5, 55.0) == Catch::Approx(1.0));
+    // Two doublings inside a short drag.
+    CHECK(gui::automationSteepnessForDrag(1.0, 110.0) == Catch::Approx(4.0));
+    // Bounded at both ends: a curve cannot become a step or an inverted one.
+    CHECK(gui::automationSteepnessForDrag(2.0, 5000.0) <= 12.0);
+    CHECK(gui::automationSteepnessForDrag(2.0, -5000.0) >= 0.1);
 }
 
 TEST_CASE("latest automation draw values use lane-specific readouts",
@@ -1562,4 +1685,92 @@ TEST_CASE("Option-clicking timeline pan and gain restores their defaults",
 
     CHECK(rig.edit.track(track)->pan == 0.0);
     CHECK(rig.edit.track(track)->gain == 1.0);
+}
+
+// The channel strip is opt-in, so the E button in a track header is how it
+// opens. The button shares the R/M/S row's geometry, which means adding it
+// shifted every one of those toggles 24 px left — a shift nothing else in the
+// suite covers, so probing for the button also guards that the row still lays
+// out from the gutter's right edge.
+TEST_CASE("the E button in a track header asks for that track's strip",
+          "[timelinelayout]") {
+    LayoutRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string first = rig.edit.addTrack("One");
+    const std::string second = rig.edit.addTrack("Two");
+
+    // One frame first, so origin is captured before any probe coordinate is
+    // derived from it.
+    rig.tick(-100.0f, -100.0f, false);
+    const float tracksTop =
+        rig.origin.y + kRulerHeight + kMarkerLaneHeight;
+    const float rowHeight = effectiveTrackHeight();
+
+    // Probe the header row from the right edge inward for the slot that asks
+    // for the strip. R/M/S sit to its right, so a hard-coded offset would stop
+    // matching the first time one of them is added or removed.
+    auto pressHeaderAt = [&](float fromRight, float rowCenterY) {
+        rig.view.requestChannelStripTrackId.clear();
+        rig.clickTimelineAt(rig.origin.x + kGutterWidth - fromRight, rowCenterY);
+        return rig.view.requestChannelStripTrackId;
+    };
+
+    // The toggle row sits in the header band at the top of a row, not at its
+    // vertical centre — the gain and pan sliders are below it.
+    const float firstRowY = tracksTop + 14.0f;
+    float stripOffset = -1.0f;
+    for (float fromRight = 12.0f; fromRight < 140.0f; fromRight += 2.0f) {
+        if (pressHeaderAt(fromRight, firstRowY) == first) {
+            stripOffset = fromRight;
+            break;
+        }
+    }
+    REQUIRE(stripOffset > 0.0f);
+
+    // The same slot on the next row asks for that row instead — the request
+    // carries a track id rather than relying on the selection being right.
+    CHECK(pressHeaderAt(stripOffset, tracksTop + rowHeight + 14.0f) == second);
+
+    // And a press away from the button asks for nothing at all.
+    CHECK(pressHeaderAt(kGutterWidth - kGutterContentX - 20.0f,
+                        firstRowY).empty());
+}
+
+// Option-click resets a gain or pan control to its default. The gesture is a
+// press with the modifier held — and the press is also the start of a drag, so
+// unless that drag is cancelled the control is pulled straight back to the
+// cursor on the following frame. The reset then only survives if the mouse is
+// released within a frame of pressing, which is why it felt unreliable.
+TEST_CASE("Option-clicking a gutter fader resets it and stays reset",
+          "[timelinelayout]") {
+    LayoutRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string t = rig.edit.addTrack("Audio");
+    rig.edit.track(t)->gain = 0.25;
+    rig.edit.track(t)->pan = -0.8;
+
+    rig.tick(-100.0f, -100.0f, false);
+    const float tracksTop = rig.origin.y + kRulerHeight + kMarkerLaneHeight;
+
+    // Probe the gutter's control column for the row that moves the gain.
+    auto altDragAt = [&](float y, float travel) {
+        rig.edit.track(t)->gain = 0.25;
+        const float x = rig.origin.x + kGutterContentX + 90.0f;
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Alt, true);
+        rig.tick(x, y, false);
+        rig.tick(x, y, true);            // press with Option held
+        rig.tick(x + travel, y, true);   // keep dragging
+        rig.tick(x + travel, y, true);
+        rig.tick(x + travel, y, false);
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Alt, false);
+        return rig.edit.track(t)->gain;
+    };
+
+    bool sawReset = false;
+    for (float y = tracksTop + 20.0f; y < tracksTop + 60.0f; y += 2.0f) {
+        const double gain = altDragAt(y, 40.0f);
+        if (gain == Catch::Approx(1.0).margin(1e-6)) { sawReset = true; break; }
+    }
+    // Unity, not "wherever the cursor ended up 40 px later".
+    CHECK(sawReset);
 }

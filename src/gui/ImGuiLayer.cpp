@@ -86,6 +86,7 @@ void ImGuiLayer::newFrame() {
 
 void ImGuiLayer::render() {
     ImGui::SetCurrentContext(context_);
+
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 

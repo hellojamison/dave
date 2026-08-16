@@ -18,6 +18,9 @@ struct EditorPreferences {
     // Meter source and bar body, shared by every meter (see LevelMeter.h).
     bool meterPreFader = false;
     bool meterRmsBody = true;
+    // Seconds the peak marker holds. Negative holds until cleared, which is
+    // the shipped behaviour and so the default.
+    float meterPeakHoldSeconds = -1.0f;
 
     bool operator==(const EditorPreferences&) const = default;
 };

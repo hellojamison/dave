@@ -66,34 +66,6 @@ void takeDateAndTime(std::string& date, std::string& time) {
     time = buffer;
 }
 
-struct CompensatedTakeRange {
-    int64_t timelineStart = 0;
-    int64_t sourceOffset = 0;
-    int64_t length = 0;
-    bool calibrationExceedsTake = false;
-};
-
-CompensatedTakeRange compensateTakeRange(int64_t takeStart,
-                                         int64_t capturedFrames,
-                                         int64_t requestedOffset) {
-    takeStart = std::max<int64_t>(0, takeStart);
-    capturedFrames = std::max<int64_t>(0, capturedFrames);
-    int64_t offset = std::max<int64_t>(0, requestedOffset);
-    bool calibrationExceedsTake = false;
-    if (offset > takeStart && offset - takeStart >= capturedFrames) {
-        // Keep a short but valid take audible instead of trimming it away.
-        // The caller reports this as a calibration warning when committing.
-        offset = takeStart;
-        calibrationExceedsTake = capturedFrames > 0;
-    }
-
-    const int64_t timelineStart = std::max<int64_t>(0, takeStart - offset);
-    const int64_t sourceOffset = std::max<int64_t>(0, offset - takeStart);
-    return {timelineStart, sourceOffset,
-            std::max<int64_t>(0, capturedFrames - sourceOffset),
-            calibrationExceedsTake};
-}
-
 bool drawCenteredEmptyState(const char* message, const char* detail,
                             const char* actionLabel) {
     const auto& pal = gui::theme::palette();
@@ -159,7 +131,8 @@ bool panelHeaderAction(const char* label, const char* actionLabel,
 } // namespace
 
 DaveApp::~DaveApp() {
-    if (recordingActive()) stopRecording();
+    // No frame loop left to notice the transport stopping, so close it here.
+    if (capturing()) endCapture();
     audio_.stop();
     audio_.setCompiledGraph(nullptr);
 }
@@ -229,8 +202,9 @@ bool DaveApp::init(bool startAudio) {
         navigateTimeline(gui::NavigationDirection::Previous, true);
     };
     platform::g_menuPlayStop     = [this](){
-        if (recordingActive()) stopRecording();
-        else audio_.transport().toggle();
+        // Stopping the transport ends the capture; nothing here has to know
+        // whether one is running.
+        audio_.transport().toggle();
     };
     platform::g_menuReturnToStart= [this](){ audio_.transport().seek(0); };
     // The native item is always present; with no picture loaded there is
@@ -260,6 +234,8 @@ bool DaveApp::init(bool startAudio) {
     view_.transientSensitivity = editorPreferences_.transientSensitivity;
     view_.meterOptions.preFader = editorPreferences_.meterPreFader;
     view_.meterOptions.rmsBody = editorPreferences_.meterRmsBody;
+    view_.meterOptions.peakHoldSeconds =
+        editorPreferences_.meterPeakHoldSeconds;
     if (startAudio) {
         refreshAudioDevices();
         if (!applyAudioPreferences(audioPreferences_, false)) {
@@ -292,7 +268,16 @@ bool DaveApp::init(bool startAudio) {
         imgui_.newFrame();
         handleShortcuts();
         drawUI();
+        // Last writer in the frame, so the backend's next NewFrame reads None
+        // and takes its hide path instead of putting the arrow back. Without
+        // this the two disagree every frame and the arrow flickers through.
+        if (view_.wantsHiddenCursor) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_None);
+        }
         imgui_.render();
+        // After render, so it lands after UpdatePlatformWindows — anything
+        // ImGui does to the cursor during the frame has already happened.
+        window_.setCursorHidden(view_.wantsHiddenCursor);
     });
     return true;
 }
@@ -326,8 +311,7 @@ void DaveApp::handleShortcuts() {
     } else
 #endif
     if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
-        if (recordingActive()) stopRecording();
-        else transport.toggle();
+        transport.toggle();
     } else if (ImGui::IsKeyPressed(ImGuiKey_Enter, false)) {
         // Return/Enter: jump playhead to start (standard DAW shortcut).
         transport.seek(0);
@@ -358,6 +342,12 @@ void DaveApp::handleShortcuts() {
         // Cmd+, — the macOS convention, and harmless elsewhere.
         showPreferences_ = true;
         preferencesJustOpened_ = true;
+    } else if (ImGui::IsKeyPressed(ImGuiKey_Delete, false) ||
+               ImGui::IsKeyPressed(ImGuiKey_Backspace, false)) {
+        // Delete clears automation inside the selection when a lane is open.
+        // It returns false when there is nothing to act on, which leaves the
+        // key free to mean something else here later.
+        gui::deleteAutomationInSelection(edit_, undo_, view_);
     } else if (primaryModifier && ImGui::IsKeyPressed(ImGuiKey_D, false)) {
         // Cmd+D duplicates the selected clip, audio or MIDI. The dispatch
         // lives in Timeline.cpp so a test can reach it — this file isn't in
@@ -552,6 +542,8 @@ void DaveApp::saveEditorPreferences() {
         std::clamp(view_.transientSensitivity, 0, 100);
     editorPreferences_.meterPreFader = view_.meterOptions.preFader;
     editorPreferences_.meterRmsBody = view_.meterOptions.rmsBody;
+    editorPreferences_.meterPeakHoldSeconds =
+        view_.meterOptions.peakHoldSeconds;
     if (!editorPreferencesStore_.save(editorPreferences_)) {
         showStatus("Could not save editor preferences", true);
     }
@@ -584,6 +576,62 @@ void DaveApp::drawPreferencesWindow() {
                          ImGuiWindowFlags_NoCollapse |
                          ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::BeginTabBar("##preferencesTabs");
+
+        // Sample rate and bit depth are set once when a session starts and
+        // then left alone, which is what a preference is — they spent toolbar
+        // width on a decision nobody revisits mid-edit. They belong to the
+        // document rather than to the app, so they lead the tabs rather than
+        // sitting among the machine settings.
+        if (ImGui::BeginTabItem("Session")) {
+            ImGui::Dummy(ImVec2(0.0f, 2.0f));
+            ImGui::BeginDisabled(recordingActive());
+
+            static constexpr int kRates[] = {44100, 48000, 88200, 96000,
+                                             176400, 192000};
+            static const char* kRateLabels[] = {
+                "44.1 kHz", "48 kHz", "88.2 kHz", "96 kHz", "176.4 kHz",
+                "192 kHz"};
+            int rateIdx = 1;
+            for (int i = 0; i < IM_ARRAYSIZE(kRates); ++i) {
+                if (kRates[i] == edit_.sampleRate()) rateIdx = i;
+            }
+            ImGui::SetNextItemWidth(200.0f);
+            if (ImGui::Combo("Sample rate", &rateIdx, kRateLabels,
+                             IM_ARRAYSIZE(kRateLabels))) {
+                edit_.setSampleRate(kRates[rateIdx]);
+                applySessionSampleRate();
+            }
+            ImGui::TextDisabled(
+                "Reopens the output device. Clip positions are stored as\n"
+                "samples and are not converted, so material recorded at\n"
+                "another rate plays at the wrong speed. Set this before\n"
+                "recording.");
+
+            ImGui::Dummy(ImVec2(0.0f, 6.0f));
+            static constexpr int kDepths[] = {16, 24, 32};
+            static const char* kDepthLabels[] = {"16-bit", "24-bit",
+                                                 "32-bit float"};
+            int depthIdx = 2;
+            for (int i = 0; i < IM_ARRAYSIZE(kDepths); ++i) {
+                if (kDepths[i] == edit_.bitDepth()) depthIdx = i;
+            }
+            ImGui::SetNextItemWidth(200.0f);
+            if (ImGui::Combo("Bit depth", &depthIdx, kDepthLabels,
+                             IM_ARRAYSIZE(kDepthLabels))) {
+                edit_.setBitDepth(kDepths[depthIdx]);
+            }
+            ImGui::TextDisabled(
+                "Bit depth for files this session writes. 32-bit float\n"
+                "cannot clip and a level set wrong stays recoverable.");
+
+            ImGui::EndDisabled();
+            if (recordingActive()) {
+                ImGui::TextColored(gui::theme::palette().warning,
+                                   "Locked while recording.");
+            }
+            ImGui::EndTabItem();
+        }
+
         if (ImGui::BeginTabItem("Recording")) {
         ImGui::Dummy(ImVec2(0.0f, 2.0f));
         ImGui::TextDisabled("Take file names");
@@ -647,6 +695,31 @@ void DaveApp::drawPreferencesWindow() {
             saveEditorPreferences();
         }
         ImGui::TextDisabled("Higher values include softer attacks.");
+
+        ImGui::Separator();
+        ImGui::TextUnformatted("Meters");
+        // The same choice the meter's own click menu offers — this is where
+        // you look for it, that is where you reach for it mid-mix.
+        int holdIndex = 0;
+        for (int i = 0; i < IM_ARRAYSIZE(gui::kMeterPeakHoldChoices); ++i) {
+            if (gui::kMeterPeakHoldChoices[i].seconds ==
+                view_.meterOptions.peakHoldSeconds) {
+                holdIndex = i;
+            }
+        }
+        const char* holdLabels[IM_ARRAYSIZE(gui::kMeterPeakHoldChoices)];
+        for (int i = 0; i < IM_ARRAYSIZE(gui::kMeterPeakHoldChoices); ++i) {
+            holdLabels[i] = gui::kMeterPeakHoldChoices[i].label;
+        }
+        ImGui::SetNextItemWidth(200.0f);
+        if (ImGui::Combo("Peak hold", &holdIndex, holdLabels,
+                         IM_ARRAYSIZE(holdLabels))) {
+            view_.meterOptions.peakHoldSeconds =
+                gui::kMeterPeakHoldChoices[holdIndex].seconds;
+            saveEditorPreferences();
+        }
+        ImGui::TextDisabled(
+            "How long the peak marker sits at its maximum before it falls.");
 
         ImGui::EndTabItem();
         }
@@ -763,8 +836,11 @@ void DaveApp::toggleTrackArm(const std::string& trackId) {
     edit_.notifyChanged();
 }
 
-bool DaveApp::startRecording() {
-    if (recordingActive()) return true;
+// Open a continuous capture. It does NOT roll the transport and it does NOT
+// mark anything to keep — capture runs for as long as the transport does, and
+// pressing Record decides which parts of it become regions.
+bool DaveApp::beginCapture() {
+    if (capturing()) return true;
     if (projectPath_.empty()) {
         showStatus("Save the project before recording", true);
         return false;
@@ -865,21 +941,70 @@ bool DaveApp::startRecording() {
         return false;
     }
 
-    session->takeStartSample =
-        audio_.transport().beginRecordingAndPlay();
+    // The capture anchors at wherever the transport already is. It is rolling
+    // by the time this runs, so the position is the truth rather than
+    // something this function gets to choose.
+    session->takeStartSample = audio_.transport().position();
     session->latencyOffsetSamples =
         std::max(0, audioPreferences_.recordLatencyOffsetSamples);
-    view_.recordingActive = true;
-    view_.recordingStartSample = std::max<int64_t>(
-        0, session->takeStartSample - session->latencyOffsetSamples);
-    view_.recordingEndSample = view_.recordingStartSample;
+    view_.recordingActive = false;
     recordingSession_ = std::move(session);
-    showStatus("Recording", false);
     return true;
 }
 
-void DaveApp::stopRecording() {
-    if (!recordingActive()) return;
+// Record while rolling: start a region here. Record again ends it, and the
+// capture underneath carries on either way.
+// Roll with armed tracks and the capture starts itself. A refusal here is
+// silent unless the user has asked for a region: playing back a session with
+// something left armed should not nag.
+void DaveApp::beginCaptureIfArmed() {
+    if (capturing()) return;
+    const bool anyArmed = std::any_of(
+        edit_.tracks().begin(), edit_.tracks().end(),
+        [](const document::Track& track) { return track.recordArm; });
+    if (!anyArmed) return;
+    if (!audio_.captureAvailable()) return;
+    beginCapture();
+}
+
+void DaveApp::punchIn() {
+    if (!capturing()) {
+        // Record from a standing start still means "roll and keep it", so the
+        // transport goes first and the capture anchors to it.
+        if (!audio_.transport().isPlaying()) {
+            audio_.transport().play();
+            transportWasRolling_ = true;
+        }
+        if (!beginCapture()) {
+            audio_.transport().stop();
+            transportWasRolling_ = false;
+            return;
+        }
+    }
+    audio_.transport().setRecording(true);
+    const int64_t at = audio_.transport().position();
+    recordingSession_->punches.push_back(application::PunchRange{at});
+    view_.recordingActive = true;
+    view_.recordingStartSample =
+        std::max<int64_t>(0, at - recordingSession_->latencyOffsetSamples);
+    view_.recordingEndSample = view_.recordingStartSample;
+    showStatus("Recording", false);
+}
+
+void DaveApp::punchOut() {
+    if (!capturing() || recordingSession_->punches.empty()) return;
+    auto& punch = recordingSession_->punches.back();
+    if (!punch.open()) return;
+    punch.out = std::max(punch.in, audio_.transport().position());
+    audio_.transport().setRecording(false);
+    view_.recordingActive = false;
+    showStatus("Punched out; still rolling", false);
+}
+
+// The transport has stopped: close the capture, cut every punch out of the
+// take file, and commit them.
+void DaveApp::endCapture() {
+    if (!capturing()) return;
 
     audio_.transport().setRecording(false);
     audio_.transport().stop();
@@ -905,6 +1030,11 @@ void DaveApp::stopRecording() {
         finished->takeStartSample = firstCapturedSample;
     }
     finished->writer.stop();
+
+    // Anything still open ends where the transport stopped, and a punch that
+    // captured nothing is dropped rather than committed as an empty region.
+    const auto punches = application::closePunches(
+        std::move(finished->punches), audio_.transport().position());
 
     int committed = 0;
     bool hadFailure = false;
@@ -932,21 +1062,33 @@ void DaveApp::stopRecording() {
         asset.channels = track->inputChannelCount;
         asset.lengthSamples = static_cast<int64_t>(stats.framesWritten);
 
-        const auto range = compensateTakeRange(
-            finished->takeStartSample, asset.lengthSamples,
-            finished->latencyOffsetSamples);
-        badLatencyCalibration =
-            badLatencyCalibration || range.calibrationExceedsTake;
-        document::AudioClip clip;
-        clip.asset = asset.id;
-        clip.timelineStart = range.timelineStart;
-        clip.sourceOffset = range.sourceOffset;
-        clip.length = range.length;
-        if (clip.length == 0) continue;
+        // One file, one region per punch. The asset is committed with the
+        // first region that uses it; the rest reference it.
+        bool assetCommitted = false;
+        for (const auto& punch : punches) {
+            const auto range = application::punchClipRange(
+                finished->takeStartSample, asset.lengthSamples, punch,
+                finished->latencyOffsetSamples);
+            badLatencyCalibration =
+                badLatencyCalibration || range.clampedToCapture;
+            if (range.length == 0) continue;
 
-        undo_.execute(std::make_unique<editing::CommitTakeCommand>(
-            track->id, std::move(asset), std::move(clip)));
-        ++committed;
+            document::AudioClip clip;
+            clip.asset = asset.id;
+            clip.timelineStart = range.timelineStart;
+            clip.sourceOffset = range.sourceOffset;
+            clip.length = range.length;
+
+            if (!assetCommitted) {
+                undo_.execute(std::make_unique<editing::CommitTakeCommand>(
+                    track->id, asset, std::move(clip)));
+                assetCommitted = true;
+            } else {
+                undo_.execute(std::make_unique<editing::AddClipCommand>(
+                    track->id, std::move(clip)));
+            }
+            ++committed;
+        }
     }
 
     if (!audio_.isRunning()) applyAudioPreferences(audioPreferences_, false);
@@ -959,7 +1101,12 @@ void DaveApp::stopRecording() {
         showStatus("Recording committed with dropout silence; check disk performance",
                    true);
     } else if (committed == 0) {
-        showStatus("Recording stopped before any audio was captured", true);
+        // Rolling with a track armed and never pressing Record is the normal
+        // way to rehearse, so it is not an error — only an actual attempt to
+        // keep something that produced nothing is.
+        if (!punches.empty()) {
+            showStatus("Recording stopped before any audio was captured", true);
+        }
     } else {
         showStatus(committed == 1 ? "Take committed to the timeline"
                                   : std::to_string(committed) +
@@ -968,8 +1115,8 @@ void DaveApp::stopRecording() {
 }
 
 void DaveApp::toggleRecording() {
-    if (recordingActive()) stopRecording();
-    else startRecording();
+    if (recordingActive()) punchOut();
+    else punchIn();
 }
 
 void DaveApp::setTimelineSamplesPerPixel(double samplesPerPixel) {
@@ -1189,6 +1336,24 @@ bool DaveApp::loadWavIntoNewTrack(const std::string& path) {
 void DaveApp::drawUI() {
     auto& transport = audio_.transport();
     const auto& pal = gui::theme::palette();
+    // Cleared before drawing and set by whichever tool draws its own cursor.
+    view_.wantsHiddenCursor = false;
+
+    // Capture follows the transport. Watching the edge here rather than
+    // hooking every place that can start or stop playback means Space, the
+    // menu, the toolbar and a script all behave the same — and that a punch
+    // is possible for as long as the transport is rolling, because the audio
+    // has been going to disk since it started.
+    {
+        const bool rolling = transport.isPlaying();
+        if (rolling && !transportWasRolling_) {
+            beginCaptureIfArmed();
+        } else if (!rolling && transportWasRolling_) {
+            endCapture();
+        }
+        transportWasRolling_ = rolling;
+    }
+
     if (builder_.latencyChangePending() && !recordingActive()) {
         // VST3 requires deactivation before its new latency is queried. Stop
         // the device first so the UI thread never mutates a processor while
@@ -1209,17 +1374,16 @@ void DaveApp::drawUI() {
         }
         if (latencyChanged) applyAudioPreferences(audioPreferences_, false);
     }
-    if (recordingSession_) {
-        const int64_t firstCaptured =
-            recordingSession_->controller.firstSamplePosition();
-        if (firstCaptured >= 0) {
-            const auto range = compensateTakeRange(
-                firstCaptured,
-                std::max<int64_t>(0, transport.position() - firstCaptured),
-                recordingSession_->latencyOffsetSamples);
-            view_.recordingStartSample = range.timelineStart;
-            view_.recordingEndSample = range.timelineStart + range.length;
-        }
+    // The growing region follows the open punch, not the capture. Capture
+    // has been running since the transport rolled; drawing from there would
+    // claim to be keeping audio the user never asked for.
+    if (recordingActive()) {
+        const auto& punch = recordingSession_->punches.back();
+        const int64_t offset = recordingSession_->latencyOffsetSamples;
+        view_.recordingStartSample = std::max<int64_t>(0, punch.in - offset);
+        view_.recordingEndSample = std::max(
+            view_.recordingStartSample,
+            std::max<int64_t>(0, transport.position() - offset));
     }
 
     // Pop-out toggles land here, at the frame boundary, so the sidebar split
@@ -1257,9 +1421,13 @@ void DaveApp::drawUI() {
     const float contentH = vp->WorkSize.y - toolbarH;
     constexpr float minEditorW = 320.0f;
     constexpr float minEditorH = 120.0f;
+    // Picture is opt-in and so is the strip; with neither showing there is no
+    // sidebar to size, and the timeline takes the whole window.
+    const bool sidebarVisible =
+        showChannelStrip_ || (!edit_.videoTracks().empty() && !videoPoppedOut_);
     const auto mainLayout = application::calculateMainEditorLayout(
         vp->WorkSize.x, contentH, splitterSize, sidebarWidth_, mixerHeight_,
-        showMixer_, minEditorW, minEditorH);
+        showMixer_, minEditorW, minEditorH, sidebarVisible);
     const float sidebarW = mainLayout.sidebarWidth;
     const float timelineW = mainLayout.editorWidth;
     const float sidebarX = baseX + timelineW + splitterSize;
@@ -1267,7 +1435,7 @@ void DaveApp::drawUI() {
         std::max(0.0f, vp->WorkSize.x - splitterSize);
     const float maxSidebarW =
         std::max(0.0f, availablePanelW - minEditorW);
-    const float minSidebarW = std::min(320.0f, maxSidebarW);
+    const float minSidebarW = std::min(220.0f, maxSidebarW);
 
     // Hardware I/O is global and always starts the sidebar stack. Its height
     // is responsive only within a narrow useful range; the document panels
@@ -1375,6 +1543,12 @@ void DaveApp::drawUI() {
         if (ImGui::BeginMenu("Window")) {
             if (ImGui::MenuItem("Mixer", "Ctrl+=", showMixer_))
                 showMixer_ = !showMixer_;
+            if (ImGui::MenuItem("Channel Strip", nullptr, showChannelStrip_)) {
+                showChannelStrip_ = !showChannelStrip_;
+                if (showChannelStrip_ && pluginHost_.descriptors().empty()) {
+                    pluginHost_.scan();
+                }
+            }
             if (ImGui::MenuItem("Audio I/O...")) {
                 showPreferences_ = true;
                 preferencesJustOpened_ = true;
@@ -1427,7 +1601,6 @@ void DaveApp::drawUI() {
         // it names, wider between separate controls.
         const float kGap = compactToolbar ? 5.0f : 8.0f;
         constexpr float kLabelGap = 6.0f;
-        const float kComboW = compactToolbar ? 94.0f : 118.0f;
         const float groupGap = compactToolbar ? 7.0f : 12.0f;
         // Labels sit on the text baseline by default, which floats them to
         // the top of a 30 px row.
@@ -1481,16 +1654,14 @@ void DaveApp::drawUI() {
                 ImVec2(controlH, controlH),
                 wasPlaying ? gui::theme::ButtonVariant::Primary
                            : gui::theme::ButtonVariant::Normal)) {
-            if (wasRecording) stopRecording();
-            else transport.toggle();
+            transport.toggle();
         }
 
         ImGui::SameLine(0.0f, kGap);
         if (gui::theme::iconButton(
                 "##transportRewind", gui::theme::TransportIcon::ReturnToStart,
                 "Stop and return to start (Return)", ImVec2(controlH, controlH))) {
-            if (wasRecording) stopRecording();
-            else transport.stop();
+            transport.stop();
             transport.seek(0);
         }
 
@@ -1529,7 +1700,10 @@ void DaveApp::drawUI() {
         int tcIdx = static_cast<int>(view_.tcMode);
         const float counterW = compactToolbar ? 132.0f : 150.0f;
         if (!view_.editingPosition) {
-            std::string tcStr = gui::formatTimecode(pos, view_.tcMode);
+            std::string tcStr = gui::formatTimecode(
+                pos, view_.tcMode, static_cast<double>(edit_.sampleRate()),
+                24.0, edit_.tempoBpm(), &edit_.meterMap(),
+                &edit_.tempoMap());
             const ImVec2 counterMin = ImGui::GetCursorScreenPos();
             ImGui::InvisibleButton("##positionCounter",
                                    ImVec2(counterW, controlH));
@@ -1583,11 +1757,25 @@ void DaveApp::drawUI() {
                         break;
                     }
                     case gui::TimecodeMode::BarsBeats: {
-                        int bars, beats, ticks;
-                        if (std::sscanf(view_.positionInput, "%d.%d.%d", &bars, &beats, &ticks) == 3) {
-                            double bpm = 120.0;
-                            double beatsTotal = (bars - 1) * 4 + (beats - 1) + ticks / 960.0;
-                            target = static_cast<int64_t>(beatsTotal * 60.0 / bpm * sr);
+                        int bars = 1;
+                        int beats = 1;
+                        int ticks = 0;
+                        // Both separators. The display uses pipes, but a dot
+                        // is what a numeric keypad can type without a
+                        // modifier, and refusing it would be pedantry.
+                        const bool parsed =
+                            std::sscanf(view_.positionInput, "%d|%d|%d",
+                                        &bars, &beats, &ticks) == 3 ||
+                            std::sscanf(view_.positionInput, "%d.%d.%d",
+                                        &bars, &beats, &ticks) == 3;
+                        if (parsed) {
+                            // Through the maps, so typing a bar goes where
+                            // the ruler says that bar is — the old arithmetic
+                            // assumed 120 bpm in 4/4 and would disagree with
+                            // the counter it was typed into.
+                            target = document::sampleAtBarsBeats(
+                                document::BarsBeats{bars, beats, ticks}, sr,
+                                edit_.tempoMap(), edit_.meterMap());
                         }
                         break;
                     }
@@ -1613,18 +1801,72 @@ void DaveApp::drawUI() {
             if (ImGui::IsKeyPressed(ImGuiKey_Escape))
                 view_.editingPosition = false;
         }
-        ImGui::SameLine(0.0f, kGap);
-        ImGui::SetNextItemWidth(kComboW);
-        if (ImGui::Combo("##tcmode", &tcIdx, tcModes, 5)) {
-            view_.tcMode = static_cast<gui::TimecodeMode>(tcIdx);
+        // The format is a property of the counter beside it, so it hangs off
+        // the counter as a disclosure arrow rather than restating the current
+        // format in a combo as wide as the readout itself. The counter
+        // already shows which format is in use — spelling it out twice was
+        // the widest thing in the toolbar.
+        // A caret, not a button. The counter beside it is a 20 px readout with
+        // no frame of its own; putting a boxed control against it made the
+        // format look like a second, equally important thing rather than a
+        // property of the number.
+        ImGui::SameLine(0.0f, 1.0f);
+        const float arrowW = 14.0f;
+        const ImVec2 caretMin = ImGui::GetCursorScreenPos();
+        ImGui::InvisibleButton("##tcmode", ImVec2(arrowW, controlH));
+        const bool caretHovered = ImGui::IsItemHovered();
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+            ImGui::OpenPopup("##tcmodeMenu");
+        }
+        {
+            const float cx = caretMin.x + arrowW * 0.5f;
+            // Sits on the counter's baseline rather than the control's centre,
+            // so it reads as attached to the digits.
+            const float cy = caretMin.y + controlH * 0.5f + 3.0f;
+            constexpr float half = 3.5f;
+            ImGui::GetWindowDrawList()->AddTriangleFilled(
+                ImVec2(cx - half, cy - half * 0.6f),
+                ImVec2(cx + half, cy - half * 0.6f),
+                ImVec2(cx, cy + half * 0.8f),
+                ImGui::GetColorU32(caretHovered ? pal.text : pal.textMuted));
+        }
+        if (caretHovered) {
+            ImGui::SetTooltip("Counter format (%s)", tcModes[tcIdx]);
+        }
+        // Tempo and meter live on the counter too, because they are what
+        // bars|beats MEANS — putting them in Preferences would separate the
+        // reading from the thing that decides it.
+        if (view_.tcMode == gui::TimecodeMode::BarsBeats) {
+            ImGui::SameLine(0.0f, kGap);
+            const auto& map = edit_.meterMap();
+            const auto atStart = document::signatureAtBar(map, 1);
+            char meterLabel[48];
+            std::snprintf(meterLabel, sizeof(meterLabel), "%.0f  %d/%d",
+                          edit_.tempoBpm(), atStart.numerator,
+                          atStart.denominator);
+            if (ImGui::Button(meterLabel, ImVec2(0.0f, controlH))) {
+                ImGui::OpenPopup("##meterMenu");
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Tempo and time signature");
+            }
+            if (ImGui::BeginPopup("##meterMenu")) {
+                drawMeterEditor();
+                ImGui::EndPopup();
+            }
+        }
+        if (ImGui::BeginPopup("##tcmodeMenu")) {
+            for (int i = 0; i < 5; ++i) {
+                if (ImGui::MenuItem(tcModes[i], nullptr, tcIdx == i)) {
+                    view_.tcMode = static_cast<gui::TimecodeMode>(i);
+                }
+            }
+            ImGui::EndPopup();
         }
         groupSeparator();
 
-        if (ImGui::Button("+Track", ImVec2(compactToolbar ? 64.0f : 76.0f,
-                                            controlH)))
-            undo_.execute(std::make_unique<editing::AddTrackCommand>("Track"));
-
-        ImGui::SameLine(0.0f, kGap);
+        // No +Track here: the timeline carries a + above its topmost row,
+        // which is where a track gets added and where the new one appears.
         ImGui::Checkbox("Snap", &view_.snapEnabled);
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Snap timeline edits to the current %s grid",
@@ -1685,53 +1927,7 @@ void DaveApp::drawUI() {
             }
             ImGui::EndPopup();
         }
-        groupSeparator();
 
-        // ─── Session format ──────────────────────────────────────────────
-        if (!compactToolbar) label("Session");
-        static constexpr int kRates[] = {44100, 48000, 88200, 96000,
-                                         176400, 192000};
-        static const char* kRateLabels[] = {"44.1 kHz", "48 kHz", "88.2 kHz",
-                                            "96 kHz", "176.4 kHz", "192 kHz"};
-        int rateIdx = 1;
-        for (int i = 0; i < IM_ARRAYSIZE(kRates); ++i) {
-            if (kRates[i] == edit_.sampleRate()) rateIdx = i;
-        }
-        ImGui::BeginDisabled(wasRecording);
-        ImGui::SetNextItemWidth(kComboW);
-        if (ImGui::Combo("##sessionRate", &rateIdx, kRateLabels,
-                         IM_ARRAYSIZE(kRateLabels))) {
-            edit_.setSampleRate(kRates[rateIdx]);
-            applySessionSampleRate();
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip(
-                "Session sample rate — reopens the output device.\n"
-                "Clip positions are stored as samples and are not converted, "
-                "so material recorded at another rate plays at the wrong "
-                "speed. Set this before recording.");
-        }
-
-        ImGui::SameLine(0.0f, kGap);
-        static constexpr int kDepths[] = {16, 24, 32};
-        static const char* kDepthLabels[] = {"16-bit", "24-bit",
-                                             "32-bit float"};
-        int depthIdx = 1;
-        for (int i = 0; i < IM_ARRAYSIZE(kDepths); ++i) {
-            if (kDepths[i] == edit_.bitDepth()) depthIdx = i;
-        }
-        ImGui::SetNextItemWidth(kComboW);
-        if (ImGui::Combo("##sessionDepth", &depthIdx, kDepthLabels,
-                         IM_ARRAYSIZE(kDepthLabels))) {
-            edit_.setBitDepth(kDepths[depthIdx]);
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip(
-                "Bit depth for files this session writes.\n"
-                "Stored with the project; nothing renders yet, so it has no "
-                "effect on playback.");
-        }
-        ImGui::EndDisabled();
         ImGui::PopStyleVar();   // FramePadding
     }
     ImGui::End();
@@ -1799,6 +1995,16 @@ void DaveApp::drawUI() {
         view_.meterOptionsChanged = false;
         saveEditorPreferences();
     }
+    // Pushed every frame rather than on change: the graph is rebuilt from the
+    // document on every edit, and a fresh node would otherwise come back with
+    // the default hold instead of the one the user chose.
+    const float hold = view_.meterOptions.peakHoldSeconds;
+    for (const auto& [id, node] : builder_.trackGains()) {
+        if (node) node->setPeakHoldSeconds(hold);
+    }
+    for (const auto& [id, node] : builder_.meterTaps()) {
+        if (node) node->setPeakHoldSeconds(hold);
+    }
     serviceViewRequests();
     // The loop follows the live selection, which the timeline has just
     // finished updating — so this runs every frame rather than only on
@@ -1825,16 +2031,25 @@ void DaveApp::drawUI() {
         ImGui::End();
     }
 
-    ImGui::SetNextWindowPos(
-        ImVec2(sidebarX,
-               videoDocked ? sidebarContentY + videoPanelH + splitterSize
-                           : sidebarContentY),
-        ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(sidebarW, pluginsH), ImGuiCond_Always);
-    ImGui::Begin("Plugins", nullptr, panelFlags);
-    gui::theme::panelHeader("Plugins");
-    drawPluginsPanelContent();
-    ImGui::End();
+    if (showChannelStrip_) {
+        ImGui::SetNextWindowPos(
+            ImVec2(sidebarX,
+                   videoDocked ? sidebarContentY + videoPanelH + splitterSize
+                               : sidebarContentY),
+            ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(sidebarW, pluginsH), ImGuiCond_Always);
+        ImGui::Begin("Channel Strip", nullptr, panelFlags);
+        // No panel header: the strip's own coloured header already names the
+        // track, and a second title above it said only what the panel is —
+        // which the E button that opened it had just answered. Closing is the
+        // same E button, or View > Channel Strip.
+        gui::drawChannelStrip(edit_, undo_, view_, channelStrip_,
+                              static_cast<int>(audio_.captureChannelCount()),
+                              static_cast<int>(audio_.playbackChannelCount()),
+                              recordingActive(), pluginHost_.descriptors(),
+                              &builder_.meterTaps(), &view_.meterOptions);
+        ImGui::End();
+    }
 
     const ImGuiWindowFlags splitterFlags =
         panelFlags | ImGuiWindowFlags_NoBackground |
@@ -1843,6 +2058,7 @@ void DaveApp::drawUI() {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
 
+    if (sidebarVisible) {
     ImGui::SetNextWindowPos(
         ImVec2(baseX + timelineW, contentY), ImGuiCond_Always);
     ImGui::SetNextWindowSize(
@@ -1869,6 +2085,7 @@ void DaveApp::drawUI() {
         ImGui::GetColorU32(sidebarSplitterHovered
             ? pal.accent : pal.borderStrong), 1.0f);
     ImGui::End();
+    }
 
     // Drag the timeline/mixer split. Absent when the mixer is hidden — there
     // is nothing to size.
@@ -2771,324 +2988,155 @@ void DaveApp::drawVideoPreviewContent() {
     }
 
     ImGui::TextDisabled("%s  frame %lld  %s",
-        gui::formatTimecode(playhead, view_.tcMode).c_str(),
+        gui::formatTimecode(playhead, view_.tcMode,
+                            static_cast<double>(edit_.sampleRate()), 24.0,
+                            edit_.tempoBpm(), &edit_.meterMap(),
+                            &edit_.tempoMap()).c_str(),
         static_cast<long long>(frameIndex),
         inRange ? "" : "(out of range)");
 }
 
-void DaveApp::drawPluginsPanel() { drawPluginsPanelContent(); }
-
-void DaveApp::drawMidiTrackPanel(const document::MidiTrack& track) {
-    ImGui::Text("MIDI Track: %s", track.name.c_str());
-    ImGui::Separator();
-
-    // Instrument first: the effect chain below it is meaningless until
-    // something is generating audio to run through it.
-    ImGui::TextUnformatted("Instrument");
-    if (track.instrument.uidString.empty()) {
-        if (ImGui::Button("Choose Instrument...")) {
-            openPluginBrowser(BrowserMode::MidiInstrument, track.id);
+// Tempo and the time signature map. Small enough to live in the popup that
+// opens it: a session has one tempo and usually one meter, and the list only
+// grows for the sessions that genuinely change.
+void DaveApp::drawMeterEditor() {
+    ImGui::TextDisabled("TEMPO");
+    const auto tempo = edit_.tempoMap();
+    int removeTempoBar = 0;
+    int removeTempoBeat = 0;
+    for (const auto& change : tempo) {
+        ImGui::PushID(change.bar * 1000 + change.beat);
+        ImGui::AlignTextToFramePadding();
+        if (change.bar == 1 && change.beat == 1) {
+            ImGui::TextUnformatted("Start");
+        } else {
+            ImGui::Text("%d|%d", change.bar, change.beat);
         }
-    } else {
-        ImGui::Text("%s", track.instrument.name.c_str());
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Edit##instrument")) {
-            openPluginEditor(track.instrument);
+        ImGui::SameLine(70.0f);
+        float bpm = static_cast<float>(change.bpm);
+        ImGui::SetNextItemWidth(110.0f);
+        if (ImGui::DragFloat("##bpm", &bpm, 0.1f, 20.0f, 300.0f, "%.2f bpm")) {
+            // Live while dragging so the ruler moves under the pointer; the
+            // undo entry lands once, on release.
+            edit_.setTempoChange(change.bar, change.beat,
+                                 static_cast<double>(bpm));
         }
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Replace##instrument")) {
-            openPluginBrowser(BrowserMode::MidiInstrument, track.id);
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            undo_.execute(std::make_unique<editing::SetTempoCommand>(
+                change.bar, change.beat, static_cast<double>(bpm)));
         }
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Clear##instrument")) {
-            editors_.erase(track.instrument.id);
-            undo_.execute(std::make_unique<editing::SetMidiInstrumentCommand>(
-                track.id, document::PluginSlot{}));
-            return;   // `track` may be reallocated by the command
+        if (change.bar != 1 || change.beat != 1) {
+            ImGui::SameLine(0.0f, 6.0f);
+            if (ImGui::SmallButton("\xc3\x97")) {
+                removeTempoBar = change.bar;
+                removeTempoBeat = change.beat;
+            }
         }
-    }
-
-    ImGui::Separator();
-    ImGui::TextUnformatted("Effects");
-    std::string removeSlotId;
-    int slotIdx = 0;
-    for (const auto& slot : track.plugins) {
-        ImGui::PushID(slotIdx);
-        bool bypass = slot.bypass;
-        if (ImGui::Checkbox("##bypass", &bypass)) {
-            const_cast<document::PluginSlot&>(slot).bypass = bypass;
-            edit_.notifyChanged();
-        }
-        ImGui::SameLine();
-        if (slot.bypass) ImGui::TextDisabled("%s", slot.name.c_str());
-        else             ImGui::Text("%s", slot.name.c_str());
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Edit")) openPluginEditor(slot);
-        ImGui::SameLine();
-        // Defer the mutation until the range-for completes; removing in place
-        // invalidates the current slot reference.
-        if (ImGui::SmallButton("Remove")) removeSlotId = slot.id;
         ImGui::PopID();
-        ++slotIdx;
     }
-    if (!removeSlotId.empty()) {
-        undo_.execute(std::make_unique<editing::RemovePluginCommand>(
-            track.id, removeSlotId));
-        editors_.erase(removeSlotId);
-        return;
+    if (removeTempoBar > 0) {
+        undo_.execute(std::make_unique<editing::RemoveTempoCommand>(
+            removeTempoBar, removeTempoBeat));
     }
-    if (ImGui::Button("Add Plugin")) {
-        openPluginBrowser(BrowserMode::MidiFx, track.id);
-    }
-}
 
-void DaveApp::drawPluginsPanelContent() {
-    // Operate on the currently-selected track (selectedTrackIndex in the view).
-    // The index spans both bands: audio rows first, then MIDI rows, which is
-    // the order they're drawn in on the timeline.
-    int sel = view_.selectedTrackIndex;
-    const int audioCount = static_cast<int>(edit_.tracks().size());
-    auto drawRouting = [&](const std::string& ownerId,
-                           document::RouteTarget& mainOutput,
-                           std::vector<document::AuxSend>& sends,
-                           document::Track* audioTrack) {
-        ImGui::TextUnformatted("Routing");
-        ImGui::Separator();
-        ImGui::BeginDisabled(recordingActive());
-        if (audioTrack) {
-            const auto input = audioTrack->hardwareInput;
-            const std::string inputLabel = input.channelCount == 2
-                ? "Input " + std::to_string(input.firstChannel + 1) + "-" +
-                      std::to_string(input.firstChannel + 2)
-                : "Input " + std::to_string(input.firstChannel + 1);
-            ImGui::SetNextItemWidth(150.0f);
-            if (ImGui::BeginCombo("##routingInput", inputLabel.c_str())) {
-                const int inputs = static_cast<int>(audio_.captureChannelCount());
-                for (int channel = 0; channel < inputs; ++channel) {
-                    const std::string label = "Input " + std::to_string(channel + 1);
-                    if (ImGui::Selectable(label.c_str(), input.firstChannel == channel &&
-                                                          input.channelCount == 1)) {
-                        gui::RoutingRequest request;
-                        request.kind = gui::RoutingRequest::Kind::SetHardwareInput;
-                        request.ownerId = ownerId;
-                        request.hardware = {channel, 1};
-                        view_.routing.request(std::move(request));
-                    }
-                }
-                for (int channel = 0; channel + 1 < inputs; channel += 2) {
-                    const std::string label = "Input " + std::to_string(channel + 1) +
-                        "-" + std::to_string(channel + 2);
-                    if (ImGui::Selectable(label.c_str(), input.firstChannel == channel &&
-                                                          input.channelCount == 2)) {
-                        gui::RoutingRequest request;
-                        request.kind = gui::RoutingRequest::Kind::SetHardwareInput;
-                        request.ownerId = ownerId;
-                        request.hardware = {channel, 2};
-                        view_.routing.request(std::move(request));
-                    }
-                }
-                ImGui::EndCombo();
-            }
-            ImGui::SameLine();
-            bool monitor = audioTrack->inputMonitor;
-            if (ImGui::Checkbox("Monitor", &monitor)) {
-                gui::RoutingRequest request;
-                request.kind = gui::RoutingRequest::Kind::SetInputMonitor;
-                request.ownerId = ownerId;
-                request.enabled = monitor;
-                view_.routing.request(std::move(request));
-            }
-        }
-        const std::string route = gui::routeTargetLabel(
-            edit_, mainOutput, static_cast<int>(audio_.playbackChannelCount()));
-        ImGui::SetNextItemWidth(190.0f);
-        if (ImGui::BeginCombo("Main Output", route.c_str())) {
-            const auto options = gui::routingTargetOptions(
-                edit_, ownerId, static_cast<int>(audio_.playbackChannelCount()),
-                false);
-            for (const auto& option : options) {
-                const bool selected = mainOutput == option.target;
-                if (ImGui::Selectable(option.label.c_str(), selected,
-                                      option.enabled ? ImGuiSelectableFlags_None
-                                                     : ImGuiSelectableFlags_Disabled)) {
-                    gui::RoutingRequest request;
-                    request.kind = gui::RoutingRequest::Kind::SetMainOutput;
-                    request.ownerId = ownerId;
-                    request.route = option.target;
-                    view_.routing.request(std::move(request));
-                }
-                if (!option.enabled &&
-                    ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-                    ImGui::SetTooltip("%s", option.disabledReason.c_str());
-                }
-            }
-            ImGui::EndCombo();
-        }
-        ImGui::TextDisabled("Incoming sources are derived from the route graph");
-        ImGui::Separator();
-        ImGui::TextUnformatted("Sends");
-        for (const auto& existing : sends) {
-            auto send = existing;
-            ImGui::PushID(send.id.c_str());
-            bool changed = false;
-            changed |= ImGui::Checkbox("##sendMute", &send.muted);
-            ImGui::SameLine();
-            const std::string sendTarget = gui::routeTargetLabel(
-                edit_, send.target, static_cast<int>(audio_.playbackChannelCount()));
-            ImGui::SetNextItemWidth(150.0f);
-            if (ImGui::BeginCombo("##sendTarget", sendTarget.c_str())) {
-                const auto options = gui::routingTargetOptions(
-                    edit_, ownerId,
-                    static_cast<int>(audio_.playbackChannelCount()), true);
-                for (const auto& option : options) {
-                    if (ImGui::Selectable(option.label.c_str(),
-                                          send.target == option.target,
-                                          option.enabled ? ImGuiSelectableFlags_None
-                                                         : ImGuiSelectableFlags_Disabled)) {
-                        send.target = option.target;
-                        changed = true;
-                    }
-                }
-                ImGui::EndCombo();
-            }
-            ImGui::SameLine();
-            bool pre = send.tap == document::SendTap::PreFader;
-            if (ImGui::Checkbox("Pre", &pre)) {
-                send.tap = pre ? document::SendTap::PreFader
-                               : document::SendTap::PostFader;
-                changed = true;
-            }
-            float db = send.gain <= 0.0 ? -60.0f
-                : 20.0f * std::log10(static_cast<float>(send.gain));
-            ImGui::SetNextItemWidth(120.0f);
-            if (ImGui::SliderFloat("##sendGain", &db, -60.0f, 6.0f, "%.1f dB")) {
-                send.gain = db <= -59.9f ? 0.0 : std::pow(10.0, db / 20.0);
-                changed = true;
-            }
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Remove")) {
-                gui::RoutingRequest request;
-                request.kind = gui::RoutingRequest::Kind::RemoveSend;
-                request.ownerId = ownerId;
-                request.send = existing;
-                view_.routing.request(std::move(request));
-            } else if (changed) {
-                gui::RoutingRequest request;
-                request.kind = gui::RoutingRequest::Kind::UpdateSend;
-                request.ownerId = ownerId;
-                request.send = std::move(send);
-                view_.routing.request(std::move(request));
-            }
-            ImGui::PopID();
-        }
-        if (ImGui::Button("Add Send")) {
-            document::AuxSend send;
-            send.target = ownerId == document::kMainBusId
-                ? document::RouteTarget::hardwareOutput(0,
-                      audio_.playbackChannelCount() == 1 ? 1 : 2)
-                : document::RouteTarget::bus();
-            gui::RoutingRequest request;
-            request.kind = gui::RoutingRequest::Kind::AddSend;
-            request.ownerId = ownerId;
-            request.send = std::move(send);
-            view_.routing.request(std::move(request));
+    {
+        // A new change defaults to the playhead's beat, which is where
+        // someone editing tempo is looking.
+        const auto at = document::barsBeatsAtSample(
+            audio_.transport().position(),
+            static_cast<double>(edit_.sampleRate()), edit_.tempoMap(),
+            edit_.meterMap());
+        char label[64];
+        std::snprintf(label, sizeof(label), "+ Tempo at %d|%d", at.bar,
+                      at.beat);
+        const bool atStart = at.bar == 1 && at.beat == 1;
+        ImGui::BeginDisabled(atStart);
+        if (ImGui::Button(label)) {
+            undo_.execute(std::make_unique<editing::SetTempoCommand>(
+                at.bar, at.beat,
+                document::bpmAt(edit_.tempoMap(), edit_.meterMap(), at.bar,
+                                at.beat)));
         }
         ImGui::EndDisabled();
-        ImGui::Separator();
-    };
-
-    if (sel >= 0 && sel < audioCount) {
-        auto& row = edit_.tracksMut()[static_cast<size_t>(sel)];
-        // A bus has no local source, so it gets routing only; a row with an
-        // instrument also gets the instrument and its post-instrument chain.
-        if (row.isMain) {
-            // Main has no local source, so routing is all there is.
-            drawRouting(row.id, row.mainOutput, row.sends, nullptr);
-            return;
-        }
-        if (!row.instrument.uidString.empty() || !row.midiClips.empty()) {
-            drawRouting(row.id, row.mainOutput, row.sends, nullptr);
-            drawMidiTrackPanel(row);
-            return;
+        if (atStart && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip("The playhead is at the start, which already "
+                              "has a tempo.");
         }
     }
-    if (sel < 0 || sel >= audioCount) {
-        if (edit_.tracks().empty()) {
-            if (drawCenteredEmptyState(
-                    "No track selected",
-                    "Create a track before building an effect chain.",
-                    "+ Add Track###pluginsEmptyTrack")) {
-                undo_.execute(std::make_unique<editing::AddTrackCommand>("Track"));
-                view_.selectedTrackIndex =
-                    static_cast<int>(edit_.tracks().size()) - 1;
-            }
-        } else if (drawCenteredEmptyState(
-                       "Select a track to manage plugins",
-                       "The plugin chain follows the selected timeline row.",
-                       "Select First Track###pluginsSelectTrack")) {
-            view_.selectedTrackIndex = 0;
-        }
-        return;
-    }
 
-    auto& track = edit_.tracksMut()[sel];
-    ImGui::Text("Track: %s", track.name.c_str());
-    ImGui::Separator();
+    ImGui::Dummy(ImVec2(0.0f, 4.0f));
+    ImGui::TextDisabled("TIME SIGNATURE");
 
-    drawRouting(track.id, track.mainOutput, track.sends, &track);
+    const auto map = edit_.meterMap();
+    int removeBar = 0;
+    for (const auto& signature : map) {
+        ImGui::PushID(signature.bar);
+        ImGui::AlignTextToFramePadding();
+        // Bar 1 is the session's meter rather than a change, so it is not
+        // editable as a position — moving it would leave earlier bars with
+        // no meter, and there are no earlier bars.
+        if (signature.bar == 1) {
+            ImGui::TextUnformatted("Bar 1");
+        } else {
+            ImGui::Text("Bar %d", signature.bar);
+        }
+        ImGui::SameLine(70.0f);
 
-    if (track.plugins.empty()) {
-        std::string message = "No plugins on " + track.name;
-        if (drawCenteredEmptyState(
-                message.c_str(),
-                "Add an effect to begin shaping this track.",
-                "Add Plugin###pluginsEmptyChain")) {
-            if (pluginHost_.descriptors().empty()) {
-                pluginHost_.scan();
-            }
-            openPluginBrowser(BrowserMode::AudioFx, track.id);
-        }
-        return;
-    }
+        int numerator = signature.numerator;
+        ImGui::SetNextItemWidth(46.0f);
+        const bool numeratorChanged =
+            ImGui::InputInt("##num", &numerator, 0, 0);
+        ImGui::SameLine(0.0f, 2.0f);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("/");
+        ImGui::SameLine(0.0f, 2.0f);
 
-    std::string removeSlotId;
-    int slotIdx = 0;
-    for (const auto& slot : track.plugins) {
-        ImGui::PushID(slotIdx);
-        // Bypass checkbox + name + Edit + Remove.
-        bool bypass = slot.bypass;
-        if (ImGui::Checkbox("##bypass", &bypass)) {
-            const_cast<document::PluginSlot&>(slot).bypass = bypass;
-            edit_.notifyChanged();
+        static constexpr int kDenominators[] = {1, 2, 4, 8, 16, 32};
+        static const char* kDenominatorLabels[] = {"1", "2", "4", "8", "16",
+                                                   "32"};
+        int denominatorIdx = 2;
+        for (int i = 0; i < IM_ARRAYSIZE(kDenominators); ++i) {
+            if (kDenominators[i] == signature.denominator) denominatorIdx = i;
         }
-        ImGui::SameLine();
-        if (slot.bypass) ImGui::TextDisabled("%s", slot.name.c_str());
-        else             ImGui::Text("%s", slot.name.c_str());
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Edit")) {
-            openPluginEditor(slot);
+        ImGui::SetNextItemWidth(58.0f);
+        const bool denominatorChanged = ImGui::Combo(
+            "##den", &denominatorIdx, kDenominatorLabels,
+            IM_ARRAYSIZE(kDenominatorLabels));
+
+        if (numeratorChanged || denominatorChanged) {
+            undo_.execute(std::make_unique<editing::SetTimeSignatureCommand>(
+                signature.bar, std::max(1, numerator),
+                kDenominators[denominatorIdx]));
         }
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Remove")) {
-            // Defer mutation until the range-for completes; removing in place
-            // invalidates the current slot reference.
-            removeSlotId = slot.id;
+        if (signature.bar != 1) {
+            ImGui::SameLine(0.0f, 6.0f);
+            if (ImGui::SmallButton("\xc3\x97")) removeBar = signature.bar;
         }
         ImGui::PopID();
-        ++slotIdx;
     }
-    if (!removeSlotId.empty()) {
-        undo_.execute(std::make_unique<editing::RemovePluginCommand>(
-            track.id, removeSlotId));
-        editors_.erase(removeSlotId);
+    if (removeBar > 0) {
+        undo_.execute(
+            std::make_unique<editing::RemoveTimeSignatureCommand>(removeBar));
     }
 
-    ImGui::Separator();
-    if (ImGui::Button("Add Plugin")) {
-        openPluginBrowser(BrowserMode::AudioFx, track.id);
+    ImGui::Dummy(ImVec2(0.0f, 4.0f));
+    // A new change defaults to the bar the playhead is on, which is where
+    // someone editing meter is almost always looking.
+    const auto here = document::barsBeatsAtSample(
+        audio_.transport().position(),
+        static_cast<double>(edit_.sampleRate()), edit_.tempoMap(),
+        edit_.meterMap());
+    const int newBar = std::max(2, here.bar);
+    char addLabel[48];
+    std::snprintf(addLabel, sizeof(addLabel), "+ Change at bar %d", newBar);
+    if (ImGui::Button(addLabel)) {
+        const auto current = document::signatureAtBar(edit_.meterMap(), newBar);
+        undo_.execute(std::make_unique<editing::SetTimeSignatureCommand>(
+            newBar, current.numerator, current.denominator));
     }
-
-
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Every bar line after this one moves.");
+    }
 }
 
 void DaveApp::openPluginBrowser(BrowserMode mode, std::string trackId) {
@@ -3175,6 +3223,30 @@ void DaveApp::serviceViewRequests() {
             openPluginEditor(*slot);
         }
         view_.requestPluginEditorSlotId.clear();
+    }
+    if (!view_.requestChannelStripTrackId.empty()) {
+        const std::string trackId =
+            std::move(view_.requestChannelStripTrackId);
+        view_.requestChannelStripTrackId.clear();
+        const auto& rows = edit_.tracks();
+        for (size_t i = 0; i < rows.size(); ++i) {
+            if (rows[i].id != trackId) continue;
+            // The strip follows the selection, so pressing E on a row both
+            // selects it and opens the panel — pressing E on the row that is
+            // already showing closes it, which is the only way the button can
+            // read as a toggle without holding state of its own.
+            const int row = static_cast<int>(i);
+            showChannelStrip_ =
+                !(showChannelStrip_ && view_.selectedTrackIndex == row);
+            // The strip's pickers list what has been scanned, and the scan is
+            // cached — so this runs once, the first time a strip is opened,
+            // instead of costing every session that never opens one.
+            if (showChannelStrip_ && pluginHost_.descriptors().empty()) {
+                pluginHost_.scan();
+            }
+            view_.selectedTrackIndex = row;
+            break;
+        }
     }
 }
 

@@ -33,6 +33,10 @@ struct Palette {
     ImVec4 recordArmed;
     ImVec4 success;
     ImVec4 warning;
+    // Float headroom above 0 dBFS. Not a warning: in a 32-bit float session
+    // going over is recoverable, so it reads as information rather than
+    // damage. The damage is at the other end of the meter, and it is red.
+    ImVec4 headroom;
 
     ImVec4 controlTop;
     ImVec4 controlBottom;
@@ -182,5 +186,21 @@ void drawCenteredControlLabel(ImDrawList* drawList, const Rect& rect,
 std::string formatPan(double pan);
 
 ImVec4 hex(uint32_t rgba);
+
+// Text that stays legible on `background`. Uses perceived luminance rather
+// than a plain average: a saturated green and a saturated blue of the same
+// average brightness are nothing like as bright to look at, and a track
+// colour picker offers both.
+ImVec4 readableTextOn(const ImVec4& background);
+
+// True when the item just submitted was Option/Alt-clicked — the convention
+// for "put this control back to its default".
+//
+// It also cancels the drag that click would otherwise have started. Without
+// that, a slider reset on the press frame is dragged straight back to wherever
+// the cursor is on the next one, so the reset only appears to work if the
+// mouse is released within a frame of pressing. That is why Option-click felt
+// unreliable rather than broken.
+bool altClickedReset();
 
 } // namespace dave::gui::theme

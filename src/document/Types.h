@@ -107,6 +107,30 @@ struct RouteTarget {
 
 enum class SendTap { PreFader, PostFader };
 
+// One position in a channel's signal chain.
+//
+// Inserts, sends, the meter and the fader all sit in ONE ordered list, because
+// they are all points on the same path: a send tapped before a compressor and
+// one tapped after it are different sends, and the only honest way to say
+// which is which is to put them in order with the compressor. Two parallel
+// lists could not express "send, then insert, then send".
+//
+// Insert and Send name an entry in Track::plugins or Track::sends; the payload
+// stays there and this says where it sits. Fader carries no id — there is
+// exactly one, and it is in the list so it can be moved through it like
+// anything else. A send below the Fader is a post-fader send; that is what
+// post-fader now means.
+//
+// The fader's row is drawn as the meter, because the level arriving at the
+// fader is the level worth watching and the fader's position is the one thing
+// the row has to communicate. The fader control itself is not in the list —
+// it sits at the bottom of the strip where it is always reachable.
+struct ChainSlot {
+    enum class Kind { Insert, Send, Fader };
+    Kind kind = Kind::Insert;
+    std::string id;
+};
+
 struct AuxSend {
     std::string id;
     RouteTarget target = RouteTarget::none();
@@ -294,7 +318,12 @@ struct Track {
     // goes to hardware. A flag rather than a type, so graph construction and
     // the mixer need no special DSP path.
     bool isMain = false;
-    std::vector<PluginSlot> plugins;  // effect chain, processed in order
+    std::vector<PluginSlot> plugins;
+    // The order everything above happens in. Holds one entry per plugin, one
+    // per send, one Meter and one Fader; `plugins` and `sends` are storage,
+    // this is sequence. Empty means "not built yet" and is filled in by
+    // Edit::normalizeChain_.
+    std::vector<ChainSlot> chain;  // effect chain, processed in order
 };
 
 // Constrains a saved input span to a live capture device without coupling the

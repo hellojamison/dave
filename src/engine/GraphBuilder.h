@@ -50,6 +50,13 @@ public:
     const std::unordered_map<std::string, std::shared_ptr<GainNode>>& trackGains() const {
         return trackGains_;
     }
+    // The chain-position meter taps, keyed by track id. One per track, wherever
+    // Track::meterTapIndex put it — read through its PRE bank, since a tap
+    // passes audio through and its "post" is the same signal.
+    const std::unordered_map<std::string, std::shared_ptr<GainNode>>&
+    meterTaps() const {
+        return meterTaps_;
+    }
     const std::unordered_map<std::string, std::shared_ptr<AudioClipNode>>& clipNodes() const {
         return clipNodes_;
     }
@@ -99,6 +106,7 @@ private:
 
     std::shared_ptr<GainNode> master_;
     std::unordered_map<std::string, std::shared_ptr<GainNode>> trackGains_;
+    std::unordered_map<std::string, std::shared_ptr<GainNode>> meterTaps_;
     std::unordered_map<std::string, std::shared_ptr<AudioClipNode>> clipNodes_;
     std::unordered_map<std::string, std::shared_ptr<InstrumentNode>> instrumentNodes_;
 };

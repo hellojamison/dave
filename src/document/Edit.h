@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "document/MusicalTime.h"
 #include "document/Types.h"
 
 #include <cstddef>
@@ -69,6 +70,13 @@ public:
     // addMidiPlugin had to exist; one track type closes that gap.)
     std::string addPlugin(const std::string& trackId, PluginSlot slot);
     bool removePlugin(const std::string& trackId, const std::string& slotId);
+    // Resolve a plugin slot by id alone, across every track's chain and every
+    // instrument. Slot ids are unique document-wide, and the callers that
+    // bypass or open one have the id without the track it belongs to.
+    const PluginSlot* pluginSlot(const std::string& slotId) const;
+    // Set a slot's bypass. Covers instruments as well as inserts: both are
+    // bypassable and both are addressed the same way.
+    bool setPluginBypass(const std::string& slotId, bool bypass);
 
     // --- Creating tracks for particular content ----------------------------
     // These differ only in the id prefix, the default name and — for a bus —
@@ -137,6 +145,23 @@ public:
         std::vector<PanAutomationPoint> points);
     std::string addSend(const std::string& ownerId, AuxSend send);
     bool restoreSend_(const std::string& ownerId, AuxSend send, size_t index);
+    // Reorder a send within its owner's list. Sends sum, so order is the
+    // user's arrangement rather than a signal-flow constraint — which is why
+    // it has to be preserved rather than derived.
+    bool moveSend(const std::string& ownerId, const std::string& sendId,
+                  size_t newIndex);
+    // Bring a track's chain into agreement with its plugins and sends: one
+    // entry per plugin and per send, exactly one Meter and one Fader, nothing
+    // naming something that no longer exists. Called after every mutation that
+    // could disturb it, and on load, so no other code has to remember to.
+    void normalizeChain_(Track& track);
+    // Same, by id — for callers that only hold one. Cheap and idempotent, so
+    // the strip calls it every frame rather than trying to guess when the
+    // chain might have gone stale.
+    void normalizeChainFor_(const std::string& trackId);
+    // Move one chain entry to another position. `from` and `to` index the
+    // track's chain directly.
+    bool moveChainSlot(const std::string& trackId, size_t from, size_t to);
     bool updateSend(const std::string& ownerId, const AuxSend& send);
     bool removeSend(const std::string& ownerId, const std::string& sendId);
 
@@ -209,6 +234,36 @@ public:
     }
     // Bits per sample for files this session writes. Nothing renders yet, so
     // today this is a stored preference waiting for an export path.
+    // --- Musical time -------------------------------------------------------
+    // Quarter notes per minute, which is what a tempo field means in every
+    // DAW regardless of meter. One value for the session: a tempo MAP would
+    // require re-conforming every clip when it changed, and is its own piece
+    // of work.
+    // The tempo at bar 1, which is what a session with no changes has. Kept
+    // as an accessor because most callers want exactly that.
+    double tempoBpm() const;
+    void setTempoBpm(double bpm);
+    // Tempo changes, anchored musically. Always normalized: sorted, one per
+    // position, one at bar 1 beat 1.
+    const std::vector<TempoChange>& tempoMap() const { return tempoMap_; }
+    void setTempoMap(std::vector<TempoChange> map);
+    // Set or replace the tempo at a position. Bar 1 beat 1 can be changed but
+    // not removed — the session would have no tempo before the first change.
+    bool setTempoChange(int bar, int beat, double bpm);
+    bool removeTempoChange(int bar, int beat);
+    // Time signature changes, always normalized: sorted, one per bar, one at
+    // bar 1. Readers can walk it without checking.
+    const std::vector<TimeSignature>& meterMap() const { return meterMap_; }
+    void setMeterMap(std::vector<TimeSignature> map);
+    // Set or replace the signature at a bar. Bar 1 can be changed but not
+    // removed — every bar before the first change would otherwise have no
+    // meter at all.
+    bool setTimeSignature(int bar, int numerator, int denominator);
+    bool removeTimeSignature(int bar);
+    // Load-time: no notification, no normalization guard.
+    void loadMusicalTime_(std::vector<TempoChange> tempo,
+                          std::vector<TimeSignature> map);
+
     int bitDepth() const { return bitDepth_; }
     void setBitDepth(int bits) {
         if (bits <= 0 || bits == bitDepth_) return;
@@ -228,7 +283,12 @@ public:
     void clearVideoTracks_() { videoTracks_.clear(); }
     void loadVideoTrack_(VideoTrack vt) { videoTracks_.push_back(std::move(vt)); }
     void clearTracks_() { tracks_.clear(); }
-    void loadTrack_(Track t) { tracks_.push_back(std::move(t)); }
+    void loadTrack_(Track t) {
+        tracks_.push_back(std::move(t));
+        // A file written before the chain existed, or one hand-edited, still
+        // arrives with a usable one.
+        normalizeChain_(tracks_.back());
+    }
     void ensureMainBus_();
     std::unordered_map<AssetId, AudioAsset>& assets() { return assets_; }
 
@@ -252,7 +312,12 @@ private:
     ChangeCallback onChange_;
     uint64_t idCounter_ = 0;
     int sampleRate_ = 48000;
-    int bitDepth_ = 24;
+    // 32-bit float. Nothing clips internally and a level set wrong is
+    // recoverable exactly, which is worth more than the disk space a fixed
+    // depth saves. Sessions that need 16 or 24 say so.
+    int bitDepth_ = 32;
+    std::vector<TempoChange> tempoMap_{TempoChange{1, 1, 120.0}};
+    std::vector<TimeSignature> meterMap_{TimeSignature{1, 4, 4}};
 };
 
 } // namespace dave::document

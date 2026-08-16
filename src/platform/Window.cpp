@@ -252,4 +252,22 @@ void Window::run() {
     }
 }
 
+void Window::setCursorHidden(bool hidden) {
+    if (window_ == nullptr) return;
+    // Left alone if something has taken the cursor outright, which is not a
+    // state this should be flipping in and out of.
+    const int mode = glfwGetInputMode(window_, GLFW_CURSOR);
+    if (mode == GLFW_CURSOR_DISABLED) return;
+
+    // Reasserted every frame rather than only on change. ImGui's GLFW backend
+    // rewrites this mode from its own NewFrame, and it is not the only thing
+    // that can: a focus change, a platform window appearing for a viewport, or
+    // any glfwSetCursor call can put the arrow back. Caching "already hidden"
+    // made the fix one-shot — it worked until something else wrote the mode,
+    // and then never corrected itself.
+    const int want = hidden ? GLFW_CURSOR_HIDDEN : GLFW_CURSOR_NORMAL;
+    if (mode != want) glfwSetInputMode(window_, GLFW_CURSOR, want);
+    cursorHidden_ = hidden;
+}
+
 } // namespace dave::platform

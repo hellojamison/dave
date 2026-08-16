@@ -56,6 +56,7 @@ void Edit::ensureMainBus_() {
     main.isMain = true;
     main.mainOutput = RouteTarget::hardwareOutput(0, 2);
     tracks_.push_back(std::move(main));
+    normalizeChain_(tracks_.back());
 }
 
 std::string Edit::newId(const char* prefix) const {
@@ -127,6 +128,9 @@ std::string Edit::addTrack(const std::string& name) {
     t.name = name.empty() ? "Track " + std::to_string(idCounter_) : name;
     const std::string id = t.id;
     tracks_.insert(mainRow_(), std::move(t));
+    // Every track has a chain from the moment it exists — a meter and a fader
+    // at minimum — so nothing downstream has to handle an empty one.
+    normalizeChainFor_(id);
     notifyChanged();
     return id;
 }
@@ -495,8 +499,33 @@ std::string Edit::addPlugin(const std::string& trackId, PluginSlot slot) {
     slot.id = newId("plugin_");
     ++idCounter_;
     plugins->push_back(std::move(slot));
+    // The chain is repaired here rather than by callers: every mutation that
+    // can disturb it goes through one of these functions, and one that forgot
+    // would leave an insert with no position in the signal path.
+    normalizeChainFor_(trackId);
     notifyChanged();
     return plugins->back().id;
+}
+
+const PluginSlot* Edit::pluginSlot(const std::string& slotId) const {
+    if (slotId.empty()) return nullptr;
+    for (const auto& track : tracks_) {
+        if (track.instrument.id == slotId) return &track.instrument;
+        for (const auto& slot : track.plugins) {
+            if (slot.id == slotId) return &slot;
+        }
+    }
+    return nullptr;
+}
+
+bool Edit::setPluginBypass(const std::string& slotId, bool bypass) {
+    const auto* found = pluginSlot(slotId);
+    if (found == nullptr) return false;
+    auto* mutableSlot = const_cast<PluginSlot*>(found);
+    if (mutableSlot->bypass == bypass) return false;
+    mutableSlot->bypass = bypass;
+    notifyChanged();
+    return true;
 }
 
 bool Edit::removePlugin(const std::string& trackId, const std::string& slotId) {
@@ -506,6 +535,7 @@ bool Edit::removePlugin(const std::string& trackId, const std::string& slotId) {
     for (auto it = plugins->begin(); it != plugins->end(); ++it) {
         if (it->id == slotId) {
             plugins->erase(it);
+            normalizeChainFor_(trackId);
             notifyChanged();
             return true;
         }
@@ -558,6 +588,7 @@ bool Edit::restoreTrack_(Track restored, size_t index) {
         tracks_.erase(tracks_.begin() + static_cast<ptrdiff_t>(index));
         return false;
     }
+    normalizeChain_(tracks_[index]);
     notifyChanged();
     return true;
 }
@@ -747,8 +778,226 @@ std::string Edit::addSend(const std::string& ownerId, AuxSend send) {
         list->pop_back();
         return {};
     }
+    normalizeChainFor_(ownerId);
     notifyChanged();
     return list->back().id;
+}
+
+double Edit::tempoBpm() const {
+    return tempoMap_.empty() ? 120.0 : tempoMap_.front().bpm;
+}
+
+void Edit::setTempoBpm(double bpm) {
+    setTempoChange(1, 1, bpm);
+}
+
+void Edit::setTempoMap(std::vector<TempoChange> map) {
+    auto normalized = normalizeTempoMap(std::move(map));
+    if (normalized == tempoMap_) return;
+    tempoMap_ = std::move(normalized);
+    notifyChanged();
+}
+
+bool Edit::setTempoChange(int bar, int beat, double bpm) {
+    // Refused rather than repaired here: normalizeTempoMap would silently
+    // substitute 120, and a UI that sent 0 would look like it had worked.
+    if (bar < 1 || beat < 1 || !(bpm > 0.0) || bpm > 999.0) return false;
+    auto map = tempoMap_;
+    map.push_back(TempoChange{bar, beat, bpm});
+    auto normalized = normalizeTempoMap(std::move(map));
+    if (normalized == tempoMap_) return false;
+    tempoMap_ = std::move(normalized);
+    notifyChanged();
+    return true;
+}
+
+bool Edit::removeTempoChange(int bar, int beat) {
+    // Bar 1 beat 1 is the session's tempo, not a change.
+    if (bar <= 1 && beat <= 1) return false;
+    auto map = tempoMap_;
+    const auto before = map.size();
+    map.erase(std::remove_if(map.begin(), map.end(),
+                             [&](const TempoChange& c) {
+                                 return c.bar == bar && c.beat == beat;
+                             }),
+              map.end());
+    if (map.size() == before) return false;
+    tempoMap_ = normalizeTempoMap(std::move(map));
+    notifyChanged();
+    return true;
+}
+
+void Edit::setMeterMap(std::vector<TimeSignature> map) {
+    auto normalized = normalizeMeterMap(std::move(map));
+    if (normalized == meterMap_) return;
+    meterMap_ = std::move(normalized);
+    notifyChanged();
+}
+
+bool Edit::setTimeSignature(int bar, int numerator, int denominator) {
+    if (bar < 1 || numerator < 1) return false;
+    auto map = meterMap_;
+    map.push_back(TimeSignature{bar, numerator, denominator});
+    // normalizeMeterMap keeps the last entry for a bar, so this replaces an
+    // existing change rather than sitting beside it.
+    auto normalized = normalizeMeterMap(std::move(map));
+    if (normalized == meterMap_) return false;
+    meterMap_ = std::move(normalized);
+    notifyChanged();
+    return true;
+}
+
+bool Edit::removeTimeSignature(int bar) {
+    // Bar 1 is the session's meter, not a change: removing it would leave
+    // every bar before the next change with no meter at all.
+    if (bar <= 1) return false;
+    auto map = meterMap_;
+    const auto before = map.size();
+    map.erase(std::remove_if(map.begin(), map.end(),
+                             [&](const TimeSignature& s) {
+                                 return s.bar == bar;
+                             }),
+              map.end());
+    if (map.size() == before) return false;
+    meterMap_ = normalizeMeterMap(std::move(map));
+    notifyChanged();
+    return true;
+}
+
+void Edit::loadMusicalTime_(std::vector<TempoChange> tempo,
+                            std::vector<TimeSignature> map) {
+    tempoMap_ = normalizeTempoMap(std::move(tempo));
+    meterMap_ = normalizeMeterMap(std::move(map));
+}
+
+void Edit::normalizeChain_(Track& track) {
+    std::vector<ChainSlot> rebuilt;
+    rebuilt.reserve(track.plugins.size() + track.sends.size() + 1);
+
+    const auto stillExists = [&](const ChainSlot& slot) {
+        switch (slot.kind) {
+            case ChainSlot::Kind::Insert:
+                return std::any_of(track.plugins.begin(), track.plugins.end(),
+                                   [&](const PluginSlot& p) {
+                                       return p.id == slot.id;
+                                   });
+            case ChainSlot::Kind::Send:
+                return std::any_of(track.sends.begin(), track.sends.end(),
+                                   [&](const AuxSend& s) {
+                                       return s.id == slot.id;
+                                   });
+            case ChainSlot::Kind::Fader:
+                return true;
+        }
+        return false;
+    };
+
+    // Keep the order the user arranged, dropping anything that has gone and
+    // collapsing a duplicated Meter or Fader to the first of each.
+    bool haveFader = false;
+    for (const auto& slot : track.chain) {
+        if (!stillExists(slot)) continue;
+        if (slot.kind == ChainSlot::Kind::Fader) {
+            if (haveFader) continue;
+            haveFader = true;
+        }
+        if (slot.kind == ChainSlot::Kind::Insert ||
+            slot.kind == ChainSlot::Kind::Send) {
+            const bool already =
+                std::any_of(rebuilt.begin(), rebuilt.end(),
+                            [&](const ChainSlot& existing) {
+                                return existing.kind == slot.kind &&
+                                       existing.id == slot.id;
+                            });
+            if (already) continue;
+        }
+        rebuilt.push_back(slot);
+    }
+
+    const auto insertBeforeFader = [&](ChainSlot slot) {
+        const auto fader = std::find_if(
+            rebuilt.begin(), rebuilt.end(), [](const ChainSlot& s) {
+                return s.kind == ChainSlot::Kind::Fader;
+            });
+        rebuilt.insert(fader, std::move(slot));
+    };
+    if (!haveFader) rebuilt.push_back({ChainSlot::Kind::Fader, {}});
+
+    // A new insert goes at the end of the inserts — not merely ahead of the
+    // fader, which would drop it past a meter parked there and quietly stop
+    // the meter reading the whole chain. If the meter has been dragged
+    // somewhere deliberate, this leaves it where it was put.
+    const auto appendInsert = [&](ChainSlot slot) {
+        auto at = rebuilt.begin();
+        bool sawInsert = false;
+        for (auto it = rebuilt.begin(); it != rebuilt.end(); ++it) {
+            if (it->kind == ChainSlot::Kind::Insert) {
+                at = it + 1;
+                sawInsert = true;
+            }
+        }
+        if (!sawInsert) at = rebuilt.begin();
+        rebuilt.insert(at, std::move(slot));
+    };
+    for (const auto& plugin : track.plugins) {
+        const bool present = std::any_of(
+            rebuilt.begin(), rebuilt.end(), [&](const ChainSlot& s) {
+                return s.kind == ChainSlot::Kind::Insert && s.id == plugin.id;
+            });
+        if (!present) appendInsert({ChainSlot::Kind::Insert, plugin.id});
+    }
+    // Where a NEW send starts. AuxSend::tap is the placement hint and nothing
+    // more: once the send is in the chain its position is the truth, which is
+    // why the strip moves the row instead of offering a Pre button.
+    for (const auto& send : track.sends) {
+        const bool present = std::any_of(
+            rebuilt.begin(), rebuilt.end(), [&](const ChainSlot& s) {
+                return s.kind == ChainSlot::Kind::Send && s.id == send.id;
+            });
+        if (present) continue;
+        if (send.tap == SendTap::PreFader) {
+            insertBeforeFader({ChainSlot::Kind::Send, send.id});
+        } else {
+            rebuilt.push_back({ChainSlot::Kind::Send, send.id});
+        }
+    }
+    track.chain = std::move(rebuilt);
+}
+
+void Edit::normalizeChainFor_(const std::string& trackId) {
+    if (Track* t = track(trackId)) normalizeChain_(*t);
+}
+
+bool Edit::moveChainSlot(const std::string& trackId, size_t from, size_t to) {
+    Track* t = track(trackId);
+    if (t == nullptr) return false;
+    normalizeChain_(*t);
+    if (from >= t->chain.size()) return false;
+    const size_t target = std::min(to, t->chain.size() - 1);
+    if (from == target) return false;
+    ChainSlot moved = t->chain[from];
+    t->chain.erase(t->chain.begin() + static_cast<ptrdiff_t>(from));
+    t->chain.insert(t->chain.begin() + static_cast<ptrdiff_t>(target),
+                    std::move(moved));
+    notifyChanged();
+    return true;
+}
+
+bool Edit::moveSend(const std::string& ownerId, const std::string& sendId,
+                    size_t newIndex) {
+    auto* list = sendsFor(*this, ownerId);
+    if (!list || list->empty()) return false;
+    const auto it = std::find_if(list->begin(), list->end(),
+                                 [&](const AuxSend& s) { return s.id == sendId; });
+    if (it == list->end()) return false;
+    const size_t from = static_cast<size_t>(std::distance(list->begin(), it));
+    const size_t to = std::min(newIndex, list->size() - 1);
+    if (from == to) return false;
+    AuxSend moved = std::move(*it);
+    list->erase(it);
+    list->insert(list->begin() + static_cast<ptrdiff_t>(to), std::move(moved));
+    notifyChanged();
+    return true;
 }
 
 bool Edit::restoreSend_(const std::string& ownerId, AuxSend send, size_t index) {
@@ -763,6 +1012,7 @@ bool Edit::restoreSend_(const std::string& ownerId, AuxSend send, size_t index) 
         list->erase(list->begin() + static_cast<ptrdiff_t>(at));
         return false;
     }
+    normalizeChainFor_(ownerId);
     notifyChanged();
     return true;
 }
@@ -790,6 +1040,7 @@ bool Edit::removeSend(const std::string& ownerId, const std::string& sendId) {
     for (auto it = list->begin(); it != list->end(); ++it) {
         if (it->id != sendId) continue;
         list->erase(it);
+        normalizeChainFor_(ownerId);
         notifyChanged();
         return true;
     }

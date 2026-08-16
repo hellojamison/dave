@@ -48,6 +48,10 @@ Palette makePalette() {
     // ochre preserve clear status semantics without leaving the warm register.
     p.success           = hex(0x91b394ff);
     p.warning           = hex(0xd2ad7eff);
+    // A cool slate blue: the one place the palette leaves its warm register on
+    // purpose, so headroom cannot be mistaken for the ochre warning band or
+    // the red above it.
+    p.headroom          = hex(0x7f9dc4ff);
 
     p.controlTop            = hex(0x5c5855ff);
     p.controlBottom         = hex(0x474340ff);
@@ -622,6 +626,35 @@ void drawCenteredControlLabel(ImDrawList* drawList, const Rect& rect,
     }
 
     drawList->AddText(position, textColor, label);
+}
+
+ImVec4 readableTextOn(const ImVec4& background) {
+    // W3C relative luminance: linearize sRGB, then weight by how bright each
+    // primary actually looks. Averaging the channels instead would put a
+    // saturated green and a saturated blue of equal mean on the same side of
+    // this decision, and they are nowhere near equally bright.
+    const auto linear = [](float channel) {
+        channel = std::clamp(channel, 0.0f, 1.0f);
+        return channel <= 0.04045f
+            ? channel / 12.92f
+            : std::pow((channel + 0.055f) / 1.055f, 2.4f);
+    };
+    const float luminance = 0.2126f * linear(background.x) +
+                            0.7152f * linear(background.y) +
+                            0.0722f * linear(background.z);
+    // 0.179 is where contrast against white and against black are equal, so
+    // it is the crossover rather than a number picked by eye.
+    return luminance > 0.179f ? ImVec4(0.10f, 0.09f, 0.08f, 1.0f)
+                              : ImVec4(0.98f, 0.97f, 0.96f, 1.0f);
+}
+
+bool altClickedReset() {
+    if (!ImGui::IsItemClicked(ImGuiMouseButton_Left)) return false;
+    if (!ImGui::GetIO().KeyAlt) return false;
+    // The control has already taken ActiveId on this press; releasing it stops
+    // the same gesture from continuing as a drag.
+    ImGui::ClearActiveID();
+    return true;
 }
 
 } // namespace dave::gui::theme

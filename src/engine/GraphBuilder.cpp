@@ -67,6 +67,7 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit,
     auto graph = std::make_unique<Graph>();
     master_.reset();
     trackGains_.clear();
+    meterTaps_.clear();
     clipNodes_.clear();
     instrumentNodes_.clear();
 
@@ -156,18 +157,81 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit,
     };
     for (const auto& track : edit.tracks()) if (track.solo) activateSolo(track.id);
 
-    auto addPluginChain = [&](NodeId source,
-                              const std::vector<document::PluginSlot>& plugins) {
-        for (const auto& slot : plugins) {
-            if (slot.bypass) continue;
-            auto instance = instanceForSlot(slot, sampleRate);
-            if (!instance) continue;
-            const NodeId plugin = graph->addNode(
-                std::make_shared<PluginNode>(std::move(instance)));
-            graph->connect(source, 0, plugin, 0);
-            source = plugin;
+    // The meter tap is a node in the chain, so it reads exactly what reaches
+    // that point — including inserts that changed the level. It passes audio
+    // through untouched; see GainNode::setMeterTapOnly.
+    auto addMeterTap = [&](const std::string& ownerId, NodeId source) {
+        auto tap = std::make_shared<GainNode>();
+        tap->setMeterTapOnly(true);
+        const NodeId tapId = graph->addNode(tap);
+        graph->connect(source, 0, tapId, 0);
+        meterTaps_[ownerId] = tap;
+        return tapId;
+    };
+
+    // Where each send taps, filled as the chain is walked: a send's position
+    // in the chain IS its tap point, which is the whole reason the chain is
+    // one list. A send before an insert hears the signal without it.
+    std::unordered_map<std::string, NodeId> sendTaps;
+
+    auto addPluginChain = [&](const document::Track& track, NodeId source,
+                              const std::function<NodeId(NodeId)>& addFader) {
+        NodeId faderOut = 0;
+        std::vector<document::ChainSlot> chain = track.chain;
+        if (chain.empty()) {
+            for (const auto& plugin : track.plugins) {
+                chain.push_back({document::ChainSlot::Kind::Insert, plugin.id});
+            }
+            for (const auto& send : track.sends) {
+                if (send.tap == document::SendTap::PreFader) {
+                    chain.push_back({document::ChainSlot::Kind::Send, send.id});
+                }
+            }
+            chain.push_back({document::ChainSlot::Kind::Fader, {}});
+            for (const auto& send : track.sends) {
+                if (send.tap != document::SendTap::PreFader) {
+                    chain.push_back({document::ChainSlot::Kind::Send, send.id});
+                }
+            }
         }
-        return source;
+        for (const auto& slot : chain) {
+            switch (slot.kind) {
+                case document::ChainSlot::Kind::Insert: {
+                    const auto found = std::find_if(
+                        track.plugins.begin(), track.plugins.end(),
+                        [&](const document::PluginSlot& p) {
+                            return p.id == slot.id;
+                        });
+                    if (found == track.plugins.end() || found->bypass) break;
+                    auto instance = instanceForSlot(*found, sampleRate);
+                    if (!instance) break;
+                    const NodeId plugin = graph->addNode(
+                        std::make_shared<PluginNode>(std::move(instance)));
+                    graph->connect(source, 0, plugin, 0);
+                    source = plugin;
+                    break;
+                }
+                case document::ChainSlot::Kind::Send:
+                    sendTaps[slot.id] = source;
+                    break;
+                case document::ChainSlot::Kind::Fader:
+                    // The tap goes immediately ahead of the fader: the level
+                    // arriving at it is what the row's meter shows, and it is
+                    // the level you set the fader against.
+                    source = addMeterTap(track.id, source);
+                    source = addFader(source);
+                    faderOut = source;
+                    break;
+            }
+        }
+        // A chain with no Fader entry cannot happen once normalizeChain_ has
+        // run, but a graph that silently produced no output would be a very
+        // quiet way to find out otherwise.
+        if (faderOut == 0) {
+            source = addMeterTap(track.id, source);
+            faderOut = addFader(source);
+        }
+        return faderOut;
     };
 
     auto addGain = [&](const auto& channel, NodeId preFader) {
@@ -274,8 +338,12 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit,
                 std::make_shared<HardwareInputNode>(first, count));
             graph->connect(hardware, 0, input, 0);
         }
-        const NodeId pre = addPluginChain(input, track.plugins);
-        const NodeId post = addGain(track, pre);
+        NodeId preFaderPoint = input;
+        const NodeId post = addPluginChain(
+            track, input, [&](NodeId in) {
+                preFaderPoint = in;
+                return addGain(track, in);
+            });
         channels[track.id].input = input;
         channels[track.id].postFader = post;
         if (track.id == document::kMainBusId) master_ = trackGains_[track.id];
@@ -318,8 +386,12 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit,
         if (found == channels.end()) return;
         connectTarget(channel.id, found->second.postFader, channel.mainOutput);
         for (const auto& send : channel.sends) {
-            const NodeId tap = send.tap == document::SendTap::PreFader
-                ? found->second.preFader : found->second.postFader;
+            // The chain says where this send taps. Pre/post-fader is no longer
+            // a property of the send — it is whether the send sits before or
+            // after the Fader entry, which is the same fact stated once.
+            const auto tapped = sendTaps.find(send.id);
+            const NodeId tap = tapped != sendTaps.end()
+                ? tapped->second : found->second.postFader;
             const double sendGain = send.muted ? 0.0 : send.gain;
             const NodeId level = graph->addNode(
                 std::make_shared<SendLevelNode>(sendGain));

@@ -144,20 +144,22 @@ TEST_CASE("stop and rewind still lands at zero", "[transport]") {
 TEST_CASE("session sample rate and bit depth round-trip through the project",
           "[session]") {
     document::Edit edit;
-    // Defaults match what pre-existing projects meant.
+    // A new session is 32-bit float: nothing clips internally and a level set
+    // wrong is recoverable exactly. A file that predates the field is a
+    // separate question, and the case below covers it.
     CHECK(edit.sampleRate() == 48000);
-    CHECK(edit.bitDepth() == 24);
+    CHECK(edit.bitDepth() == 32);
 
     edit.addTrack("Audio 1");
     edit.setSampleRate(96000);
-    edit.setBitDepth(32);
+    edit.setBitDepth(24);
 
     const std::string text = document::serializeEdit(edit);
     document::Edit reloaded;
     const auto r = document::deserializeEdit(text, reloaded);
     REQUIRE(r.ok);
     CHECK(reloaded.sampleRate() == 96000);
-    CHECK(reloaded.bitDepth() == 32);
+    CHECK(reloaded.bitDepth() == 24);
 }
 
 TEST_CASE("a project written before the session format existed still loads",

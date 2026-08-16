@@ -31,3 +31,20 @@ TEST_CASE("temporary safety clamps do not produce negative editor geometry",
     CHECK(constrained.sidebarWidth >= 0.0f);
     CHECK(constrained.mixerHeight >= 0.0f);
 }
+
+TEST_CASE("a hidden sidebar gives the editor the whole width") {
+    // Including the splitter: with no panel on the right there is nothing to
+    // drag, so reserving six pixels for a divider would leave a visible gap
+    // against the window edge.
+    const auto hidden = calculateMainEditorLayout(
+        1600.0f, 900.0f, 6.0f, 260.0f, 200.0f, false, 320.0f, 120.0f, false);
+    CHECK(hidden.sidebarWidth == 0.0f);
+    CHECK(hidden.editorWidth == 1600.0f);
+
+    // Showing it again restores the requested width and the splitter, and the
+    // remembered width is untouched by having been hidden.
+    const auto shown = calculateMainEditorLayout(
+        1600.0f, 900.0f, 6.0f, 260.0f, 200.0f, false, 320.0f, 120.0f, true);
+    CHECK(shown.sidebarWidth == 260.0f);
+    CHECK(shown.editorWidth == 1334.0f);
+}

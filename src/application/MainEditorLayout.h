@@ -20,13 +20,18 @@ inline MainEditorLayout calculateMainEditorLayout(
     float windowWidth, float contentHeight, float splitterSize,
     float requestedSidebarWidth, float requestedMixerHeight, bool showMixer,
     float minimumEditorWidth = 320.0f,
-    float minimumEditorHeight = 120.0f) noexcept {
+    float minimumEditorHeight = 120.0f,
+    bool showSidebar = true) noexcept {
+    // A hidden sidebar costs nothing, splitter included: the arrangement
+    // editor takes the whole width rather than leaving a six-pixel gutter
+    // against a panel that isn't there.
     const float availableWidth =
-        std::max(0.0f, windowWidth - splitterSize);
+        std::max(0.0f, windowWidth - (showSidebar ? splitterSize : 0.0f));
     const float maximumSidebarWidth =
         std::max(0.0f, availableWidth - minimumEditorWidth);
     const float sidebarWidth =
-        std::clamp(requestedSidebarWidth, 0.0f, maximumSidebarWidth);
+        showSidebar ? std::clamp(requestedSidebarWidth, 0.0f, maximumSidebarWidth)
+                    : 0.0f;
 
     float mixerHeight = 0.0f;
     if (showMixer) {

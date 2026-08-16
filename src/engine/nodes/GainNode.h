@@ -24,6 +24,17 @@ public:
         float peak = 0.0f;
         float rms = 0.0f;
         bool clipped = false;
+        // The peak-hold marker: the highest peak within the hold window,
+        // which sits still while the bar underneath it falls. A meter whose
+        // marker chases the bar cannot answer "what did that transient
+        // actually reach", which is the only reason to read a peak.
+        float holdPeak = 0.0f;
+        // The highest peak since the last clip clear, undecayed. The decaying
+        // peak answers "how loud now"; this answers "how far over did it go",
+        // which is the question a 32-bit float session actually needs — the
+        // cost of running hot is paid at the bottom of the range, long after
+        // the transient that caused it has gone.
+        float maxPeak = 0.0f;
     };
 
     struct AutomationPoint {
@@ -41,6 +52,28 @@ public:
     int numInputPins() const override { return 1; }
     int numOutputPins() const override { return 1; }
     int channelsPerPin() const override { return 2; }
+
+    // A tap node: metering only, audio passed through untouched. Reusing
+    // GainNode rather than adding a second metering node is deliberate — the
+    // ballistics, the clip latch and the pre/post banks are all here, and a
+    // second implementation of them would drift from this one and put two
+    // meters that disagree next to each other.
+    // How long the peak marker sits at its maximum before it falls back.
+    // Zero lets it follow the bar; a negative or non-finite value holds it
+    // until the clip latch is cleared, which is the default.
+    void setPeakHoldSeconds(float seconds) {
+        peakHoldSeconds_.store(seconds, std::memory_order_relaxed);
+    }
+    float peakHoldSeconds() const {
+        return peakHoldSeconds_.load(std::memory_order_relaxed);
+    }
+
+    void setMeterTapOnly(bool tapOnly) {
+        tapOnly_.store(tapOnly, std::memory_order_relaxed);
+    }
+    bool meterTapOnly() const {
+        return tapOnly_.load(std::memory_order_relaxed);
+    }
 
     void setGain(double g) { targetGain_.store(g, std::memory_order_relaxed); }
     double gain() const { return targetGain_.load(std::memory_order_relaxed); }
@@ -80,6 +113,9 @@ public:
             meter.peak.store(0.0f, std::memory_order_relaxed);
             meter.rms.store(0.0f, std::memory_order_relaxed);
             meter.clipped.store(0, std::memory_order_relaxed);
+            meter.maxPeak.store(0.0f, std::memory_order_relaxed);
+            meter.holdPeak.store(0.0f, std::memory_order_relaxed);
+            meter.holdFrames = 0;
         }
         }
     }
@@ -95,15 +131,22 @@ public:
             : meters_[static_cast<size_t>(channel)];
         return {state.peak.load(std::memory_order_relaxed),
                 state.rms.load(std::memory_order_relaxed),
-                state.clipped.load(std::memory_order_acquire) != 0};
+                state.clipped.load(std::memory_order_acquire) != 0,
+                state.holdPeak.load(std::memory_order_relaxed),
+                state.maxPeak.load(std::memory_order_relaxed)};
     }
 
     void clearMeterClips() noexcept {
-        for (auto& meter : meters_) {
-            meter.clipped.store(0, std::memory_order_release);
-        }
-        for (auto& meter : preMeters_) {
-            meter.clipped.store(0, std::memory_order_release);
+        // The over-hold clears with the clip latch. They answer the same
+        // question — "did this go over, and how far" — so resetting one and
+        // not the other leaves the meter contradicting itself.
+        for (auto* bank : {&meters_, &preMeters_}) {
+            for (auto& meter : *bank) {
+                meter.maxPeak.store(0.0f, std::memory_order_relaxed);
+                meter.holdPeak.store(0.0f, std::memory_order_relaxed);
+                meter.holdFrames = 0;
+                meter.clipped.store(0, std::memory_order_release);
+            }
         }
     }
 
@@ -115,6 +158,7 @@ public:
         const double coef = 0.999;
         double g = currentGain_;
         double p = currentPan_;
+        const bool tapOnly = tapOnly_.load(std::memory_order_relaxed);
         std::array<float, 2> blockPeak{};
         std::array<double, 2> squareSum{};
         std::array<bool, 2> blockClipped{};
@@ -188,10 +232,12 @@ public:
                 }
             }
             // Constant-power pan law: L gain = cos((p+1)*pi/4), R = sin(...).
+            // A tap bypasses it entirely: at centre the law is 0.707 a side,
+            // so even a unity-gain pass would quietly cost the chain 3 dB.
             double angle = (automatedPan + 1.0) * 0.7853981633974483;
-            const double effectiveGain = g * automationGain;
-            double lGain = effectiveGain * std::cos(angle);
-            double rGain = effectiveGain * std::sin(angle);
+            const double effectiveGain = tapOnly ? 1.0 : g * automationGain;
+            double lGain = tapOnly ? 1.0 : effectiveGain * std::cos(angle);
+            double rGain = tapOnly ? 1.0 : effectiveGain * std::sin(angle);
             if (chans >= 2) {
                 accumulateMeterSample(0, ctx.inputs[0].channels[0][i],
                                       preBlockPeak, preSquareSum,
@@ -232,6 +278,11 @@ private:
         std::atomic<float> peak{0.0f};
         std::atomic<float> rms{0.0f};
         std::atomic<std::uint32_t> clipped{0};
+        std::atomic<float> maxPeak{0.0f};
+        std::atomic<float> holdPeak{0.0f};
+        // Frames since the marker was last renewed. RT-thread only; the UI
+        // never reads it, so it needs no atomicity of its own.
+        int holdFrames = 0;
     };
 
     static void accumulateMeterSample(
@@ -250,12 +301,42 @@ private:
         blockClipped[channel] = blockClipped[channel] || magnitude >= 1.0f;
     }
 
+    // The marker renews on any new maximum, sits still for the hold window,
+    // and then falls to whatever the bar is showing — rather than decaying on
+    // its own, which would leave it hanging in mid-air below a peak that has
+    // already gone.
+    static void updatePeakHold(MeterState& state, float blockPeak, int frames,
+                               float holdFrames) noexcept {
+        const float held = state.holdPeak.load(std::memory_order_relaxed);
+        if (blockPeak >= held) {
+            state.holdPeak.store(blockPeak, std::memory_order_relaxed);
+            state.holdFrames = 0;
+            return;
+        }
+        // Negative or non-finite means hold until cleared.
+        if (!(holdFrames >= 0.0f)) return;
+        state.holdFrames += frames;
+        if (static_cast<float>(state.holdFrames) >= holdFrames) {
+            state.holdPeak.store(state.peak.load(std::memory_order_relaxed),
+                                 std::memory_order_relaxed);
+            // Pinned at the threshold rather than reset: once the window has
+            // expired the marker rides the bar down until a new maximum
+            // renews it. Resetting would make it hold again at the lower
+            // value and stagger downwards in steps.
+            state.holdFrames = static_cast<int>(holdFrames);
+        }
+    }
+
     void publishMeters(
         int frames, int channels, const std::array<float, 2>& blockPeak,
         const std::array<double, 2>& squareSum,
         const std::array<bool, 2>& blockClipped,
         std::array<MeterState, 2>& target) noexcept {
         if (frames <= 0) return;
+        const float holdSetting =
+            peakHoldSeconds_.load(std::memory_order_relaxed);
+        const float holdSeconds = std::isfinite(holdSetting)
+            ? holdSetting * meterSampleRate_ : -1.0f;
         constexpr float peakDecaySeconds = 0.75f;
         constexpr float rmsDecaySeconds = 0.30f;
         const float peakRelease = std::max(
@@ -280,6 +361,15 @@ private:
                 std::memory_order_relaxed);
             state.rms.store(std::max(blockRms, releasedRms),
                             std::memory_order_relaxed);
+            if (active) {
+                const float held =
+                    state.maxPeak.load(std::memory_order_relaxed);
+                if (blockPeak[channel] > held) {
+                    state.maxPeak.store(blockPeak[channel],
+                                        std::memory_order_relaxed);
+                }
+                updatePeakHold(state, blockPeak[channel], frames, holdSeconds);
+            }
             if (active && blockClipped[channel]) {
                 state.clipped.store(1, std::memory_order_release);
             }
@@ -293,6 +383,10 @@ private:
 
     std::atomic<double> targetGain_{1.0};
     std::atomic<double> targetPan_{0.0};
+    std::atomic<bool> tapOnly_{false};
+    // Negative: hold until cleared. Matches the shipped behaviour, so a
+    // preference nobody sets changes nothing.
+    std::atomic<float> peakHoldSeconds_{-1.0f};
     // Copied into the node before the graph is published. The RT thread only
     // reads this immutable storage; edits build and publish a new graph.
     std::vector<AutomationPoint> automation_;

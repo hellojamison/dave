@@ -26,6 +26,24 @@ struct LevelMeterOptions {
     // The bar body. RMS tracks loudness, linear peak tracks the sample values
     // that will clip. The peak line is drawn either way.
     bool rmsBody = true;
+    // How long the peak marker sits at its maximum, in seconds. Negative holds
+    // it until the clip latch is cleared; zero lets it follow the bar. The
+    // choices the menu offers are kMeterPeakHoldChoices below.
+    float peakHoldSeconds = -1.0f;
+};
+
+// The hold times the meter menu and Preferences offer. Infinite is last
+// because it is the default and reads as "off" for the falling behaviour.
+struct MeterPeakHoldChoice {
+    const char* label;
+    float seconds;
+};
+inline constexpr MeterPeakHoldChoice kMeterPeakHoldChoices[] = {
+    {"Follow bar", 0.0f},
+    {"1 second", 1.0f},
+    {"2 seconds", 2.0f},
+    {"5 seconds", 5.0f},
+    {"Until cleared", -1.0f},
 };
 
 struct LevelMeterStyle {
@@ -44,6 +62,29 @@ float levelMeterWidth(const LevelMeterStyle& style, int channels = 2);
 // scale marks with the bars.
 float amplitudeToMeterY(float amplitude, float top, float bottom);
 
+// 32-bit is float in this document; 16 and 24 are fixed point. Written once
+// because three separate meters ask the question and a fourth will.
+inline bool sessionHasFloatHeadroom(int bitDepth) { return bitDepth >= 32; }
+
+// The meter's dB scale. Named because the headroom band's arithmetic depends
+// on both ends of it and a mismatch would silently mis-size the warning.
+inline constexpr float kMeterFloorDb = -60.0f;
+inline constexpr float kMeterCeilingDb = 6.0f;
+
+// How far a held peak went above 0 dBFS, or 0 when it never did.
+//
+// In a 32-bit float session this is not damage — nothing clipped, and pulling
+// the fader down recovers it exactly. What it costs is at the OTHER end: the
+// same amount of quiet detail is pushed below what the session's fixed-point
+// render can represent, and that part is gone for good. So the over reads as
+// information and the loss it implies reads as damage.
+float meterOverDb(float heldPeak);
+
+// The height of the doomed noise floor as a fraction of the meter, given that
+// much over. Clamped to the meter's own span: 66 dB over does not mean the
+// whole scale is lost twice.
+float noiseFloorLossFraction(float overDb);
+
 // Draws `channels` bars at `pos`. `node` may be null — a track with no live
 // graph node meters as silence rather than disappearing, so the row keeps its
 // shape. Clicking clears the latched clip indicator.
@@ -53,8 +94,12 @@ float amplitudeToMeterY(float amplitude, float top, float bottom);
 // Clicking opens a menu that edits `options` in place, so every meter sharing
 // that instance changes together. Returns true when the user changed
 // something, so the caller can persist it.
+// `floatHeadroom` says the session renders 32-bit float, which is the only
+// case where going above 0 dBFS is worth showing as headroom rather than as a
+// clip. Fixed-point sessions keep the old red.
 bool drawLevelMeter(engine::GainNode* node, ImVec2 pos, float height,
                     LevelMeterOptions& options, int channels = 2,
-                    const LevelMeterStyle& style = LevelMeterStyle{});
+                    const LevelMeterStyle& style = LevelMeterStyle{},
+                    bool floatHeadroom = false);
 
 } // namespace dave::gui

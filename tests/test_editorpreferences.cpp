@@ -66,3 +66,23 @@ TEST_CASE("editor preference sensitivity is clamped on load and save",
     REQUIRE(store.save(preferences));
     REQUIRE(store.load().transientSensitivity == 100);
 }
+
+TEST_CASE("the meter peak hold round-trips through preferences",
+          "[preferences]") {
+    TemporaryPreferences temporary;
+    application::EditorPreferencesStore store(temporary.path);
+
+    application::EditorPreferences preferences;
+    // A user who never opens the preference keeps the shipped behaviour.
+    CHECK(preferences.meterPeakHoldSeconds < 0.0f);
+
+    preferences.meterPeakHoldSeconds = 2.0f;
+    REQUIRE(store.save(preferences));
+    CHECK(store.load().meterPeakHoldSeconds == 2.0f);
+
+    // Including the sentinel — a "hold until cleared" that came back as zero
+    // would silently turn every marker into a second peak line.
+    preferences.meterPeakHoldSeconds = -1.0f;
+    REQUIRE(store.save(preferences));
+    CHECK(store.load().meterPeakHoldSeconds == -1.0f);
+}

@@ -57,6 +57,15 @@ public:
 
     GLFWwindow* handle() { return window_; }
 
+    // Hide or show the system cursor over this window's content.
+    //
+    // Deliberately not routed through ImGui's per-frame cursor. That value is
+    // arbitrated between every widget in the frame and then applied by a
+    // backend that shares one "last cursor" across all viewports, so a request
+    // to hide reached the screen only some of the time. The code that knows
+    // the pointer is over a drawing tool says so directly.
+    void setCursorHidden(bool hidden);
+
 private:
     static void glfwFileDropCallback(GLFWwindow* window, int count, const char** paths);
     static void glfwWindowRefreshCallback(GLFWwindow* window);
@@ -67,6 +76,7 @@ private:
     void renderFrame();
 
     GLFWwindow* window_ = nullptr;
+    bool cursorHidden_ = false;
     FrameCallback frameCallback_;
     FileDropCallback fileDropCallback_;
     CloseGuard closeGuard_;

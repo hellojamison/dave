@@ -74,6 +74,25 @@ std::string formatAutomationDrawValue(AutomationParameter parameter,
 
 namespace {
 
+// How wide a clip's trim handles are, and which gesture a press inside a clip
+// starts. Capped at a third of the clip so a very short one stays draggable
+// rather than being nothing but handle.
+constexpr float kTrimHandlePx = 6.0f;
+
+TimelineViewState::DragKind clipGestureAt(float mouseX, float clipLeft,
+                                          float clipRight) {
+    const float handle = std::min(kTrimHandlePx, (clipRight - clipLeft) / 3.0f);
+    if (mouseX <= clipLeft + handle) {
+        return TimelineViewState::DragKind::TrimStart;
+    }
+    if (mouseX >= clipRight - handle) {
+        return TimelineViewState::DragKind::TrimEnd;
+    }
+    // None means "not an edge" — the caller substitutes its own move kind.
+    return TimelineViewState::DragKind::None;
+}
+
+
 // The divisions a format counts in, ascending, in samples. One definition
 // serves both the grid lines and the snap increment, so a selection edge can
 // never land somewhere the grid says is not a division.
@@ -1897,11 +1916,20 @@ void drawTimeline(const document::Edit& edit,
             const bool clipIsDragging =
                 view.isDragging(TimelineViewState::DragKind::MidiClip) &&
                 view.selectedClipId == clip.id;
-            const int64_t drawStart =
-                clipIsDragging ? view.dragPreviewStart : clip.timelineStart;
+            // A trim previews length and source offset as well as position,
+            // and one row carries both clip vectors now — so the preview has
+            // to check the dragged clip's kind, not just its id.
+            const bool clipIsTrimming = view.isTrimming() &&
+                view.dragClipIsMidi && view.selectedClipId == clip.id;
+            const int64_t drawStart = (clipIsDragging || clipIsTrimming)
+                ? view.dragPreviewStart : clip.timelineStart;
+            const int64_t drawLength =
+                clipIsTrimming ? view.dragPreviewLength : clip.length;
+            const int64_t drawOffset =
+                clipIsTrimming ? view.dragPreviewOffset : clip.sourceOffset;
             double clipX = origin.x + gutterWidth +
                 (drawStart - view.scrollSamples) / view.samplesPerPixel;
-            double clipW = static_cast<double>(clip.length) / view.samplesPerPixel;
+            double clipW = static_cast<double>(drawLength) / view.samplesPerPixel;
             if (clipW < 2) clipW = 2;
             if (clipX + clipW < origin.x + gutterWidth) continue;
             if (clipX > origin.x + totalWidth) continue;
@@ -1952,8 +1980,8 @@ void drawTimeline(const document::Edit& edit,
                 // Only the notes inside the clip's trim window sound, and only
                 // the ones on screen are worth drawing — a dense part is tens
                 // of thousands of notes and this runs every frame.
-                const int64_t winStart = clip.sourceOffset;
-                const int64_t winEnd = clip.sourceOffset + clip.length;
+                const int64_t winStart = drawOffset;
+                const int64_t winEnd = drawOffset + drawLength;
                 for (const auto& n : clip.notes) {
                     if (n.startSample < winStart || n.startSample >= winEnd) continue;
                     const double nx = clipX +
@@ -1976,14 +2004,28 @@ void drawTimeline(const document::Edit& edit,
             const bool clipHovered =
                 mouse.x >= clipMin.x && mouse.x <= clipMax.x &&
                 mouse.y >= clipMin.y && mouse.y <= clipMax.y;
+            const auto midiGesture =
+                clipGestureAt(mouse.x, clipMin.x, clipMax.x);
+            if (areaHovered && clipHovered &&
+                midiGesture != TimelineViewState::DragKind::None) {
+                ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+            }
             if (areaHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
                 clipHovered) {
                 view.selectedClipId = clip.id;
                 view.selectedTrackIndex = static_cast<int>(ti);
                 view.dragClipOriginalStart = clip.timelineStart;
                 view.dragPreviewStart = clip.timelineStart;
+                view.dragClipOriginalOffset = clip.sourceOffset;
+                view.dragPreviewOffset = clip.sourceOffset;
+                view.dragClipOriginalLength = clip.length;
+                view.dragPreviewLength = clip.length;
                 view.dragOriginalTrackId = track.id;
-                view.dragKind = TimelineViewState::DragKind::MidiClip;
+                view.dragClipIsMidi = true;
+                view.dragKind =
+                    midiGesture == TimelineViewState::DragKind::None
+                        ? TimelineViewState::DragKind::MidiClip
+                        : midiGesture;
             }
             if (areaHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right) &&
                 clipHovered) {
@@ -2048,11 +2090,17 @@ void drawTimeline(const document::Edit& edit,
             const bool clipIsDragging =
                 view.isDragging(TimelineViewState::DragKind::AudioClip) &&
                 view.selectedClipId == clip.id;
-            const int64_t drawStart =
-                clipIsDragging ? view.dragPreviewStart : clip.timelineStart;
+            const bool clipIsTrimming = view.isTrimming() &&
+                !view.dragClipIsMidi && view.selectedClipId == clip.id;
+            const int64_t drawStart = (clipIsDragging || clipIsTrimming)
+                ? view.dragPreviewStart : clip.timelineStart;
+            const int64_t drawLength =
+                clipIsTrimming ? view.dragPreviewLength : clip.length;
+            const int64_t drawOffset =
+                clipIsTrimming ? view.dragPreviewOffset : clip.sourceOffset;
             double clipX = origin.x + gutterWidth +
                 (drawStart - view.scrollSamples) / view.samplesPerPixel;
-            double clipW = static_cast<double>(clip.length) / view.samplesPerPixel;
+            double clipW = static_cast<double>(drawLength) / view.samplesPerPixel;
             if (clipW < 2) clipW = 2;
             if (clipX + clipW < origin.x + gutterWidth) continue;
             if (clipX > origin.x + totalWidth) continue;
@@ -2112,9 +2160,9 @@ void drawTimeline(const document::Edit& edit,
                 int64_t numDraw = static_cast<int64_t>(clipW);
                 ImU32 waveCol = C(pal.clipAudioBorder);
                 for (int64_t px = 0; px < numDraw; ++px) {
-                    const int64_t sourceStart = clip.sourceOffset +
+                    const int64_t sourceStart = drawOffset +
                         static_cast<int64_t>(std::floor(px * view.samplesPerPixel));
-                    const int64_t sourceEnd = clip.sourceOffset +
+                    const int64_t sourceEnd = drawOffset +
                         static_cast<int64_t>(std::ceil((px + 1) * view.samplesPerPixel));
                     const int64_t firstBucket = sourceStart / level.bucketSize;
                     const int64_t lastBucket = std::max(firstBucket,
@@ -2138,14 +2186,27 @@ void drawTimeline(const document::Edit& edit,
 
             // Interaction: drag to move.
             const bool clipHovered = clipRect.contains(mouse);
+            const auto audioGesture =
+                clipGestureAt(mouse.x, clipRect.min.x, clipRect.max.x);
+            if (areaHovered && clipHovered &&
+                audioGesture != TimelineViewState::DragKind::None) {
+                ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+            }
             if (areaHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && clipHovered) {
                 view.selectedClipId = clip.id;
                 view.selectedTrackIndex = static_cast<int>(ti);
                 view.dragClipOriginalStart = clip.timelineStart;
                 // Seed the preview so a click without movement draws in place.
                 view.dragPreviewStart = clip.timelineStart;
+                view.dragClipOriginalOffset = clip.sourceOffset;
+                view.dragPreviewOffset = clip.sourceOffset;
+                view.dragClipOriginalLength = clip.length;
+                view.dragPreviewLength = clip.length;
                 view.dragOriginalTrackId = track.id;
-                view.dragKind = TimelineViewState::DragKind::AudioClip;
+                view.dragClipIsMidi = false;
+                view.dragKind = audioGesture == TimelineViewState::DragKind::None
+                    ? TimelineViewState::DragKind::AudioClip
+                    : audioGesture;
             }
             // Right-click: context menu (split, delete).
             if (areaHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right) && clipHovered) {
@@ -2234,6 +2295,10 @@ void drawTimeline(const document::Edit& edit,
                     undo.execute(std::make_unique<editing::SplitClipCommand>(
                         trk.id, view.selectedClipId, playhead));
                 }
+                if (ImGui::MenuItem("Duplicate", "Cmd+D")) {
+                    undo.execute(std::make_unique<editing::DuplicateClipCommand>(
+                        trk.id, view.selectedClipId));
+                }
                 ImGui::Separator();
                 if (ImGui::MenuItem("Delete Clip")) {
                     undo.execute(std::make_unique<editing::RemoveClipCommand>(
@@ -2257,7 +2322,7 @@ void drawTimeline(const document::Edit& edit,
                 undo.execute(std::make_unique<editing::SplitMidiClipCommand>(
                     trackId, view.selectedClipId, transport.position()));
             }
-            if (ImGui::MenuItem("Duplicate")) {
+            if (ImGui::MenuItem("Duplicate", "Cmd+D")) {
                 undo.execute(std::make_unique<editing::DuplicateMidiClipCommand>(
                     trackId, view.selectedClipId));
             }
@@ -2332,6 +2397,95 @@ void drawTimeline(const document::Edit& edit,
             }
             view.dragKind = TimelineViewState::DragKind::None;
             view.selectedClipId.clear();
+            view.dragOriginalTrackId.clear();
+        }
+    }
+
+    // Trim drag: preview the whole (start, sourceOffset, length) triple and
+    // commit one command on release, for the same reason the move drag does —
+    // the command has to be able to snapshot a genuine "before".
+    if (view.isTrimming() && !view.selectedClipId.empty()) {
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            view.dragStartMouseX = mouse.x;
+            view.dragStartMouseY = mouse.y;
+        }
+        const int64_t origStart = view.dragClipOriginalStart;
+        const int64_t origOffset = view.dragClipOriginalOffset;
+        const int64_t origLength = view.dragClipOriginalLength;
+        const int64_t origEnd = origStart + origLength;
+        // A clip has to keep some width, or it becomes something the user can
+        // neither see nor grab back.
+        constexpr int64_t kMinLength = 64;
+
+        // Move the edge BY the mouse's travel, not TO the mouse. Grabbing a
+        // handle six pixels inside the edge must not snap the edge to the
+        // cursor the instant the button goes down.
+        const int64_t dxSamples = static_cast<int64_t>(
+            (mouse.x - view.dragStartMouseX) * view.samplesPerPixel);
+
+        // How much source lies either side of the current window. Trimming
+        // past it asks for audio the file doesn't contain, so the box stops
+        // where the source does. An unknown asset (no length recorded, or a
+        // MIDI clip) means no ceiling — only the floor at offset zero applies.
+        int64_t headroom = origOffset;
+        int64_t tailroom = std::numeric_limits<int64_t>::max();
+        if (!view.dragClipIsMidi) {
+            if (const auto* trk = edit.track(view.dragOriginalTrackId)) {
+                for (const auto& c : trk->clips) {
+                    if (c.id != view.selectedClipId) continue;
+                    if (const auto* a = edit.asset(c.asset)) {
+                        if (a->lengthSamples > 0) {
+                            tailroom = std::max<int64_t>(
+                                0, a->lengthSamples - (origOffset + origLength));
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        if (view.dragKind == TimelineViewState::DragKind::TrimStart) {
+            // The head moves start and offset together: the box shrinks from
+            // the left and the audio inside it stays put on the timeline.
+            const int64_t newStart = std::clamp(
+                snapPosition(std::max<int64_t>(0, origStart + dxSamples)),
+                std::max<int64_t>(0, origStart - headroom),
+                origEnd - kMinLength);
+            const int64_t delta = newStart - origStart;
+            view.dragPreviewStart = newStart;
+            view.dragPreviewOffset = origOffset + delta;
+            view.dragPreviewLength = origLength - delta;
+        } else {
+            const int64_t newEnd = std::clamp(
+                snapPosition(std::max<int64_t>(0, origEnd + dxSamples)),
+                origStart + kMinLength,
+                tailroom == std::numeric_limits<int64_t>::max()
+                    ? std::numeric_limits<int64_t>::max()
+                    : origEnd + tailroom);
+            view.dragPreviewStart = origStart;
+            view.dragPreviewOffset = origOffset;
+            view.dragPreviewLength = newEnd - origStart;
+        }
+
+        if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+            // A press that never moved must not push an undo entry that
+            // replays as a no-op.
+            const bool trimmed = view.dragPreviewStart != origStart ||
+                                 view.dragPreviewLength != origLength;
+            if (trimmed) {
+                if (view.dragClipIsMidi) {
+                    undo.execute(std::make_unique<editing::TrimMidiClipCommand>(
+                        view.dragOriginalTrackId, view.selectedClipId,
+                        view.dragPreviewStart, view.dragPreviewOffset,
+                        view.dragPreviewLength));
+                } else {
+                    undo.execute(std::make_unique<editing::TrimClipCommand>(
+                        view.dragOriginalTrackId, view.selectedClipId,
+                        view.dragPreviewStart, view.dragPreviewOffset,
+                        view.dragPreviewLength));
+                }
+            }
+            view.dragKind = TimelineViewState::DragKind::None;
             view.dragOriginalTrackId.clear();
         }
     }
@@ -2608,6 +2762,32 @@ const char* markerKindLabel(document::MarkerKind k) {
 }
 
 } // namespace
+
+bool duplicateSelectedClip(const document::Edit& edit,
+                           editing::UndoStack& undo,
+                           TimelineViewState& view) {
+    if (view.selectedClipId.empty() || view.selectedTrackIndex < 0) return false;
+    const auto& tracks = edit.tracks();
+    if (view.selectedTrackIndex >= static_cast<int>(tracks.size())) return false;
+    const auto& track = tracks[static_cast<size_t>(view.selectedTrackIndex)];
+
+    // Which vector holds it is a question about the id, not about the row: a
+    // track carries audio and MIDI clips at the same time, so asking the row
+    // what kind it is would be asking a question it no longer answers.
+    for (const auto& clip : track.clips) {
+        if (clip.id != view.selectedClipId) continue;
+        undo.execute(std::make_unique<editing::DuplicateClipCommand>(
+            track.id, view.selectedClipId));
+        return true;
+    }
+    for (const auto& clip : track.midiClips) {
+        if (clip.id != view.selectedClipId) continue;
+        undo.execute(std::make_unique<editing::DuplicateMidiClipCommand>(
+            track.id, view.selectedClipId));
+        return true;
+    }
+    return false;
+}
 
 float drawMarkerLane(const document::Edit& edit,
                      editing::UndoStack& undo,

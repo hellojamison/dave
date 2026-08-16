@@ -39,6 +39,11 @@ namespace {
 constexpr float kTrackHeight = 58.0f;
 constexpr double kSamplesPerPixel = 500.0;
 constexpr float kGutterWidth = 260.0f;
+// drawTimeline lays the gutter out from the window's content origin, not from
+// the window's left edge, so the timeline's x=0 sits one WindowPadding in.
+// The move tests only ever asserted on deltas and so never noticed; the trim
+// tests press on a specific pixel and do.
+constexpr float kWindowOriginX = 14.0f;
 
 // drawTimeline needs a peak cache and an asset-buffer map it can look nothing
 // up in; neither carries state a drag test cares about.
@@ -66,7 +71,7 @@ struct TimelineRig : ImGuiRig {
     // arithmetic; if they drift, the probes stop landing on clips and the
     // tests fail loudly rather than silently passing.
     float xOfSample(int64_t sample) const {
-        return kGutterWidth +
+        return kWindowOriginX + kGutterWidth +
                static_cast<float>((sample - view.scrollSamples) / view.samplesPerPixel);
     }
 
@@ -223,4 +228,123 @@ TEST_CASE("a clip drag leaves markers alone", "[timelinedrag]") {
     REQUIRE(rig.edit.markerTracks().size() == 1);
     REQUIRE(rig.edit.markerTracks()[0].markers.size() == 1);
     CHECK(rig.edit.markerTracks()[0].markers[0].position == 240000);
+}
+
+// Trim gestures, driven through the real drawTimeline for the same reason the
+// move gestures are: the command is easy to unit-test and was never the part
+// that broke. What breaks is the wiring — which edge zone the press landed in,
+// whether the drag belongs to this handler, and whether mouse-up commits.
+TEST_CASE("dragging a clip's right edge trims its tail", "[timelinedrag]") {
+    TimelineRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string t = rig.edit.addTrack("Audio");
+    document::AudioClip clip;
+    clip.timelineStart = 0;
+    clip.length = 480000;   // 960 px at 500 samples/px
+    const std::string c = rig.edit.addClip(t, clip);
+
+    const float midX = rig.xOfSample(240000);
+    const float rowCenterY =
+        rig.findRowY(midX, gui::TimelineViewState::DragKind::AudioClip);
+    REQUIRE(rowCenterY > 0.0f);
+
+    // Land inside the 6 px handle at the clip's right edge.
+    const float edgeX = rig.xOfSample(480000) - 2.0f;
+    rig.dragFrom(ImVec2(edgeX, rowCenterY), ImVec2(edgeX - 100.0f, rowCenterY));
+
+    const auto* trimmed = rig.edit.clip(t, c);
+    REQUIRE(trimmed != nullptr);
+    // 100 px shorter is 50,000 samples. A tail trim moves nothing else.
+    CHECK(trimmed->length == 430'000);
+    CHECK(trimmed->timelineStart == 0);
+    CHECK(trimmed->sourceOffset == 0);
+
+    rig.undo.undo();
+    CHECK(rig.edit.clip(t, c)->length == 480'000);
+}
+
+TEST_CASE("dragging a clip's left edge trims its head", "[timelinedrag]") {
+    TimelineRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string t = rig.edit.addTrack("Audio");
+    document::AudioClip clip;
+    clip.timelineStart = 240000;
+    clip.length = 480000;
+    clip.sourceOffset = 240000;   // room to trim backwards as well as forwards
+    const std::string c = rig.edit.addClip(t, clip);
+
+    const float midX = rig.xOfSample(480000);
+    const float rowCenterY =
+        rig.findRowY(midX, gui::TimelineViewState::DragKind::AudioClip);
+    REQUIRE(rowCenterY > 0.0f);
+
+    const float edgeX = rig.xOfSample(240000) + 2.0f;
+    rig.dragFrom(ImVec2(edgeX, rowCenterY), ImVec2(edgeX + 100.0f, rowCenterY));
+
+    const auto* trimmed = rig.edit.clip(t, c);
+    REQUIRE(trimmed != nullptr);
+    // The box shrinks from the left by 50,000 samples and the audio inside it
+    // stays where it was on the timeline, which takes all three values moving
+    // together.
+    CHECK(trimmed->timelineStart == 290'000);
+    CHECK(trimmed->sourceOffset == 290'000);
+    CHECK(trimmed->length == 430'000);
+
+    rig.undo.undo();
+    const auto* restored = rig.edit.clip(t, c);
+    CHECK(restored->timelineStart == 240'000);
+    CHECK(restored->sourceOffset == 240'000);
+    CHECK(restored->length == 480'000);
+}
+
+TEST_CASE("a head trim stops at the start of the source", "[timelinedrag]") {
+    // Dragging the head left past the file's own beginning would ask for audio
+    // that does not exist. The clip's box has to stop where its source does.
+    TimelineRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string t = rig.edit.addTrack("Audio");
+    document::AudioClip clip;
+    clip.timelineStart = 240000;
+    clip.length = 480000;
+    clip.sourceOffset = 48000;   // only 48,000 samples of head available
+    const std::string c = rig.edit.addClip(t, clip);
+
+    const float midX = rig.xOfSample(480000);
+    const float rowCenterY =
+        rig.findRowY(midX, gui::TimelineViewState::DragKind::AudioClip);
+    REQUIRE(rowCenterY > 0.0f);
+
+    const float edgeX = rig.xOfSample(240000) + 2.0f;
+    // 400 px left is 200,000 samples — far more head than the source has.
+    rig.dragFrom(ImVec2(edgeX, rowCenterY), ImVec2(edgeX - 400.0f, rowCenterY));
+
+    const auto* trimmed = rig.edit.clip(t, c);
+    REQUIRE(trimmed != nullptr);
+    CHECK(trimmed->sourceOffset == 0);
+    CHECK(trimmed->timelineStart == 192'000);   // 240,000 - 48,000
+    CHECK(trimmed->length == 528'000);          // 480,000 + 48,000
+}
+
+TEST_CASE("grabbing the middle of a clip still moves it", "[timelinedrag]") {
+    // The trim handles must not eat the move gesture. A clip narrow enough
+    // that two 6 px handles would meet keeps a grabbable middle third.
+    TimelineRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string t = rig.edit.addTrack("Audio");
+    document::AudioClip clip;
+    clip.timelineStart = 0;
+    clip.length = 9000;   // 18 px wide
+    const std::string c = rig.edit.addClip(t, clip);
+
+    const float midX = rig.xOfSample(4500);
+    const float rowCenterY =
+        rig.findRowY(midX, gui::TimelineViewState::DragKind::AudioClip);
+    REQUIRE(rowCenterY > 0.0f);
+
+    rig.dragFrom(ImVec2(midX, rowCenterY), ImVec2(midX + 100.0f, rowCenterY));
+
+    const auto* moved = rig.edit.clip(t, c);
+    REQUIRE(moved != nullptr);
+    CHECK(moved->timelineStart == 50'000);
+    CHECK(moved->length == 9000);   // moved, not trimmed
 }

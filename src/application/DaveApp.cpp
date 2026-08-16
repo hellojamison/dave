@@ -358,6 +358,11 @@ void DaveApp::handleShortcuts() {
         // Cmd+, — the macOS convention, and harmless elsewhere.
         showPreferences_ = true;
         preferencesJustOpened_ = true;
+    } else if (primaryModifier && ImGui::IsKeyPressed(ImGuiKey_D, false)) {
+        // Cmd+D duplicates the selected clip, audio or MIDI. The dispatch
+        // lives in Timeline.cpp so a test can reach it — this file isn't in
+        // the test target.
+        gui::duplicateSelectedClip(edit_, undo_, view_);
     } else if (primaryModifier && ImGui::IsKeyPressed(ImGuiKey_Q, false)) {
         window_.close();
     } else if (primaryModifier && !shift && ImGui::IsKeyPressed(ImGuiKey_R, false)) {

@@ -295,6 +295,78 @@ private:
     std::string rightId_;
 };
 
+// Trim an audio clip's head or tail. The caller supplies the resulting
+// (timelineStart, sourceOffset, length) triple; undo restores all three, since
+// a head trim moves two of them together and restoring only one would slide
+// the clip's contents relative to its box.
+//
+// Bounds are the gesture's business, not this command's: the timeline clamps
+// the drag so a trim can't invert the clip or run past its source, and a
+// scripted caller that wants a specific triple gets exactly that triple.
+class TrimClipCommand : public Command {
+public:
+    TrimClipCommand(std::string trackId, std::string clipId,
+                    int64_t newStart, int64_t newSourceOffset, int64_t newLength)
+        : trackId_(std::move(trackId)), clipId_(std::move(clipId)),
+          newStart_(newStart), newSourceOffset_(newSourceOffset),
+          newLength_(newLength) {}
+    void perform(document::Edit& e) override {
+        auto* c = e.clip(trackId_, clipId_);
+        if (c == nullptr) return;
+        oldStart_ = c->timelineStart;
+        oldSourceOffset_ = c->sourceOffset;
+        oldLength_ = c->length;
+        c->timelineStart = newStart_;
+        c->sourceOffset = newSourceOffset_;
+        c->length = newLength_;
+        e.notifyChanged();
+    }
+    void undo(document::Edit& e) override {
+        auto* c = e.clip(trackId_, clipId_);
+        if (c == nullptr) return;
+        c->timelineStart = oldStart_;
+        c->sourceOffset = oldSourceOffset_;
+        c->length = oldLength_;
+        e.notifyChanged();
+    }
+    std::string name() const override { return "Trim Clip"; }
+private:
+    std::string trackId_;
+    std::string clipId_;
+    int64_t newStart_, newSourceOffset_, newLength_;
+    int64_t oldStart_ = 0, oldSourceOffset_ = 0, oldLength_ = 0;
+};
+
+// Duplicate an audio clip, placing the copy immediately after the original so
+// a repeated Cmd+D lays down a run of clips end to end.
+class DuplicateClipCommand : public Command {
+public:
+    DuplicateClipCommand(std::string trackId, std::string clipId)
+        : trackId_(std::move(trackId)), clipId_(std::move(clipId)) {}
+
+    void perform(document::Edit& e) override {
+        const auto* source = e.clip(trackId_, clipId_);
+        if (source == nullptr) return;
+        document::AudioClip copy = *source;
+        copy.timelineStart = source->timelineStart + source->length;
+        const std::string minted = e.addClip(trackId_, copy);
+        if (copyId_.empty()) copyId_ = minted;
+        else if (auto* c = e.clip(trackId_, minted)) c->id = copyId_;
+    }
+
+    void undo(document::Edit& e) override {
+        if (!copyId_.empty()) e.removeClip(trackId_, copyId_);
+    }
+
+    std::string name() const override { return "Duplicate Clip"; }
+    const std::string& copyId() const { return copyId_; }
+
+private:
+    std::string trackId_;
+    std::string clipId_;
+    std::string copyId_;
+};
+
 // RemovePlugin: deletes a plugin slot. Undo restores it.
 class RemovePluginCommand : public Command {
 public:

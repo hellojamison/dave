@@ -99,6 +99,16 @@ struct TimelineViewState {
     // the audio engine never rebuilds against an uncommitted position.
     int64_t dragPreviewStart = 0;
     std::string dragOriginalTrackId;  // track the clip came from
+    // Trim state. A head trim moves timelineStart, sourceOffset and length
+    // together, so all three have to be previewed together — restoring only
+    // the start would slide the clip's contents inside its own box.
+    int64_t dragClipOriginalOffset = 0;
+    int64_t dragClipOriginalLength = 0;
+    int64_t dragPreviewOffset = 0;
+    int64_t dragPreviewLength = 0;
+    // A trim drag can act on either clip vector, and the row alone no longer
+    // says which — a track holds both kinds at once now.
+    bool dragClipIsMidi = false;
     // What is being dragged.
     //
     // This must be explicit, not a bare bool. The marker lane, the track rows
@@ -111,13 +121,15 @@ struct TimelineViewState {
     //
     // Every handler now checks its own kind, so a drag belongs to exactly one
     // of them.
-    enum class DragKind { None, AudioClip, MidiClip, Marker, VideoClip };
+    enum class DragKind { None, AudioClip, MidiClip, Marker, VideoClip,
+                          TrimStart, TrimEnd };
     DragKind dragKind = DragKind::None;
 
     bool isDragging() const { return dragKind != DragKind::None; }
     bool isDragging(DragKind kind) const { return dragKind == kind; }
-    // The MIDI track whose clip opened the context menu (selectedTrackIndex is
-    // a row index across both bands, which the popup can't resolve on its own
+    bool isTrimming() const {
+        return dragKind == DragKind::TrimStart || dragKind == DragKind::TrimEnd;
+    }
 
     // ─── Requests back to the application ──────────────────────────────────
     // Widgets draw into an existing window and can't open a modal or a
@@ -302,6 +314,18 @@ void drawTimeline(const document::Edit& edit,
                   // meters at silence rather than omitting them, so the header
                   // keeps its shape whether or not a graph is live.
                   const TrackGainNodes* gainNodes = nullptr);
+
+// Duplicate whatever clip the timeline currently has selected, placing the
+// copy immediately after it. Dispatches on which clip vector actually holds
+// the selected id: a track carries audio and MIDI clips at once now, so the
+// row cannot answer that on its own.
+//
+// This lives here rather than in the key handler because DaveApp is not in the
+// test target — the dispatch is the part that can be got wrong, so it belongs
+// somewhere a test can reach it. Returns false when nothing is selected.
+bool duplicateSelectedClip(const document::Edit& edit,
+                           editing::UndoStack& undo,
+                           TimelineViewState& view);
 
 // Draw the marker lane (a strip above the track rows showing markers as flags
 // and regions). Returns the height it consumed (caller reserves that much

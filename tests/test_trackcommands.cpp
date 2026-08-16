@@ -15,6 +15,7 @@
 #include "document/Edit.h"
 #include "editing/Command.h"
 #include "editing/Commands.h"
+#include "gui/Timeline.h"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -254,4 +255,121 @@ TEST_CASE("splitting an audio clip is exactly reversible and replayable",
     CHECK(raw->rightId() == right);
     CHECK(edit.clip(t, right) != nullptr);
     CHECK(edit.clip(t, right)->length == 36000);
+}
+
+// ─── Trim and duplicate for audio ──────────────────────────────────────────
+//
+// Both existed for MIDI and had no audio counterpart at all; the type merge
+// exposed the gap rather than closing it, so it is closed here.
+
+TEST_CASE("a tail trim changes only the length",
+          "[trackcommands][clipcommands]") {
+    document::Edit edit;
+    editing::UndoStack undo{edit};
+    const std::string t = edit.addTrack("Audio");
+    document::AudioClip c = audioClip(48000, 96000);
+    c.sourceOffset = 24000;
+    const std::string id = edit.addClip(t, c);
+
+    undo.execute(std::make_unique<editing::TrimClipCommand>(
+        t, id, 48000, 24000, 60000));
+
+    CHECK(edit.clip(t, id)->timelineStart == 48000);
+    CHECK(edit.clip(t, id)->sourceOffset == 24000);
+    CHECK(edit.clip(t, id)->length == 60000);
+}
+
+TEST_CASE("undoing a head trim restores all three values",
+          "[trackcommands][clipcommands]") {
+    document::Edit edit;
+    editing::UndoStack undo{edit};
+    const std::string t = edit.addTrack("Audio");
+    document::AudioClip c = audioClip(48000, 96000);
+    c.sourceOffset = 24000;
+    const std::string id = edit.addClip(t, c);
+
+    // A head trim moves start and sourceOffset together so the audio stays
+    // put on the timeline while the box shrinks.
+    undo.execute(std::make_unique<editing::TrimClipCommand>(
+        t, id, 72000, 48000, 72000));
+    REQUIRE(edit.clip(t, id)->sourceOffset == 48000);
+
+    undo.undo();
+
+    // Restoring only the start would leave the offset trimmed and slide the
+    // clip's contents inside its own box — audible, and invisible in the UI.
+    CHECK(edit.clip(t, id)->timelineStart == 48000);
+    CHECK(edit.clip(t, id)->sourceOffset == 24000);
+    CHECK(edit.clip(t, id)->length == 96000);
+}
+
+TEST_CASE("a duplicated audio clip lands immediately after the original",
+          "[trackcommands][clipcommands]") {
+    document::Edit edit;
+    editing::UndoStack undo{edit};
+    const std::string t = edit.addTrack("Audio");
+    document::AudioClip c = audioClip(48000, 96000);
+    c.sourceOffset = 12000;
+    const std::string id = edit.addClip(t, c);
+
+    auto cmd = std::make_unique<editing::DuplicateClipCommand>(t, id);
+    auto* raw = cmd.get();
+    undo.execute(std::move(cmd));
+
+    REQUIRE(edit.track(t)->clips.size() == 2);
+    const std::string copy = raw->copyId();
+    REQUIRE_FALSE(copy.empty());
+    CHECK(copy != id);
+    // End to end, so a repeated Cmd+D lays down a run.
+    CHECK(edit.clip(t, copy)->timelineStart == 144000);
+    CHECK(edit.clip(t, copy)->length == 96000);
+    CHECK(edit.clip(t, copy)->sourceOffset == 12000);
+    CHECK(edit.clip(t, id)->timelineStart == 48000);
+
+    undo.undo();
+    REQUIRE(edit.track(t)->clips.size() == 1);
+    CHECK(edit.clip(t, id) != nullptr);
+
+    undo.redo();
+    REQUIRE(edit.track(t)->clips.size() == 2);
+    CHECK(raw->copyId() == copy);
+    CHECK(edit.clip(t, copy) != nullptr);
+}
+
+TEST_CASE("Cmd+D duplicates whichever kind of clip is selected",
+          "[trackcommands][clipcommands]") {
+    // The row cannot answer "audio or MIDI?" any more — a track holds both at
+    // once — so the dispatch has to go by the selected id.
+    document::Edit edit;
+    editing::UndoStack undo{edit};
+    gui::TimelineViewState view;
+
+    const std::string t = edit.addTrack("Both");
+    const std::string audio = edit.addClip(t, audioClip(0, 48000));
+    document::MidiClip mc;
+    mc.timelineStart = 96000;
+    mc.length = 48000;
+    const std::string midi = edit.addMidiClip(t, mc);
+
+    const int row = static_cast<int>(edit.tracks().size()) - 2;  // before Main
+    REQUIRE(edit.tracks()[static_cast<size_t>(row)].id == t);
+    view.selectedTrackIndex = row;
+
+    view.selectedClipId = audio;
+    REQUIRE(gui::duplicateSelectedClip(edit, undo, view));
+    CHECK(edit.track(t)->clips.size() == 2);
+    CHECK(edit.track(t)->midiClips.size() == 1);
+
+    view.selectedClipId = midi;
+    REQUIRE(gui::duplicateSelectedClip(edit, undo, view));
+    CHECK(edit.track(t)->clips.size() == 2);
+    CHECK(edit.track(t)->midiClips.size() == 2);
+
+    // Nothing selected, nothing happens — and no undo entry either.
+    view.selectedClipId.clear();
+    CHECK_FALSE(gui::duplicateSelectedClip(edit, undo, view));
+    view.selectedClipId = "clip_nonexistent";
+    CHECK_FALSE(gui::duplicateSelectedClip(edit, undo, view));
+    CHECK(edit.track(t)->clips.size() == 2);
+    CHECK(edit.track(t)->midiClips.size() == 2);
 }

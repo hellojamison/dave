@@ -6,6 +6,17 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+namespace {
+// Main is a row in the one track list now, so a test asking "how many tracks
+// did I make?" has to say so. Counting user rows keeps the intent visible
+// rather than burying a +1 in every expectation.
+inline size_t userTracks(const dave::document::Edit& e) {
+    size_t n = 0;
+    for (const auto& t : e.tracks()) if (!t.isMain) ++n;
+    return n;
+}
+} // namespace
+
 using namespace dave;
 
 TEST_CASE("track colors validate and round-trip for every channel type",
@@ -23,8 +34,8 @@ TEST_CASE("track colors validate and round-trip for every channel type",
     document::Edit loaded;
     REQUIRE(document::deserializeEdit(document::serializeEdit(edit), loaded).ok);
     CHECK(loaded.track(audio)->color == "#c96f72");
-    CHECK(loaded.midiTrack(midi)->color == "#68a0aa");
-    CHECK(loaded.bus(bus)->color == "#8d79a8");
+    CHECK(loaded.track(midi)->color == "#68a0aa");
+    CHECK(loaded.track(bus)->color == "#8d79a8");
 }
 
 TEST_CASE("track color changes undo and restore the type default",

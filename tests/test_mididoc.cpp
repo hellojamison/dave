@@ -9,6 +9,17 @@
 #include <memory>
 #include <string>
 
+namespace {
+// Main is a row in the one track list now, so a test asking "how many tracks
+// did I make?" has to say so. Counting user rows keeps the intent visible
+// rather than burying a +1 in every expectation.
+inline size_t userTracks(const dave::document::Edit& e) {
+    size_t n = 0;
+    for (const auto& t : e.tracks()) if (!t.isMain) ++n;
+    return n;
+}
+} // namespace
+
 using namespace dave;
 
 namespace {
@@ -70,12 +81,12 @@ bool sameSlot(const document::PluginSlot& a, const document::PluginSlot& b) {
 // "nothing changed" without spelling out every field at every call site.
 std::string fingerprint(const document::Edit& e) {
     std::string s;
-    for (const auto& mt : e.midiTracks()) {
+    for (const auto& mt : e.tracks()) {
         s += mt.id + "|" + mt.name + "|" + std::to_string(mt.gain) + "|" +
              std::to_string(mt.pan) + "|" + (mt.mute ? "M" : "-") +
              (mt.solo ? "S" : "-") + "|" + mt.instrument.id + ":" +
              mt.instrument.uidString + "|";
-        for (const auto& c : mt.clips) {
+        for (const auto& c : mt.midiClips) {
             s += c.id + "@" + std::to_string(c.timelineStart) + "+" +
                  std::to_string(c.sourceOffset) + "/" + std::to_string(c.length) +
                  "#" + std::to_string(c.notes.size()) + ";";
@@ -93,12 +104,12 @@ std::string fingerprint(const document::Edit& e) {
 TEST_CASE("a MIDI track can be added, found, and removed", "[mididoc]") {
     document::Edit e;
     const std::string id = e.addMidiTrack("Strings");
-    REQUIRE(e.midiTracks().size() == 1);
-    REQUIRE(e.midiTrack(id) != nullptr);
-    CHECK(e.midiTrack(id)->name == "Strings");
-    CHECK(e.removeMidiTrack(id));
-    CHECK(e.midiTracks().empty());
-    CHECK(e.midiTrack(id) == nullptr);
+    REQUIRE(userTracks(e) == 1);
+    REQUIRE(e.track(id) != nullptr);
+    CHECK(e.track(id)->name == "Strings");
+    CHECK(e.removeTrack(id));
+    CHECK((userTracks(e) == 0));
+    CHECK(e.track(id) == nullptr);
 }
 
 TEST_CASE("MIDI clips get unique ids and can be removed", "[mididoc]") {
@@ -111,7 +122,7 @@ TEST_CASE("MIDI clips get unique ids and can be removed", "[mididoc]") {
     REQUIRE(e.midiClip(t, a) != nullptr);
     CHECK(e.midiClip(t, a)->notes.size() == 3);
     CHECK(e.removeMidiClip(t, a));
-    CHECK(e.midiTrack(t)->clips.size() == 1);
+    CHECK(e.track(t)->midiClips.size() == 1);
 }
 
 TEST_CASE("adding a clip to a missing track fails instead of crashing",
@@ -129,11 +140,11 @@ TEST_CASE("an instrument slot gets an id only when it names a plugin",
     // A default-constructed slot means "no instrument" and must not be given
     // an id — an id with no uid would look like a live slot to the GraphBuilder.
     CHECK(e.setMidiInstrument(t, document::PluginSlot{}));
-    CHECK(e.midiTrack(t)->instrument.id.empty());
+    CHECK(e.track(t)->instrument.id.empty());
 
     CHECK(e.setMidiInstrument(t, instrumentSlot()));
-    CHECK_FALSE(e.midiTrack(t)->instrument.id.empty());
-    CHECK(e.midiTrack(t)->instrument.name == "Surge XT");
+    CHECK_FALSE(e.track(t)->instrument.id.empty());
+    CHECK(e.track(t)->instrument.name == "Surge XT");
 }
 
 TEST_CASE("content end spans MIDI clips as well as audio ones", "[mididoc]") {
@@ -150,12 +161,12 @@ TEST_CASE("solo on a MIDI track is visible to the global solo scan",
     const std::string midi = e.addMidiTrack("Keys");
     CHECK_FALSE(e.anySoloed());
 
-    e.midiTrack(midi)->solo = true;
+    e.track(midi)->solo = true;
     // The whole point of the scan living on the Edit: soloing a MIDI track has
     // to silence AUDIO tracks too, which only works if both lists are scanned.
     CHECK(e.anySoloed());
     CHECK_FALSE(document::trackAudible(*e.track(audio), e.anySoloed()));
-    CHECK(document::trackAudible(*e.midiTrack(midi), e.anySoloed()));
+    CHECK(document::trackAudible(*e.track(midi), e.anySoloed()));
 }
 
 // ─── Persistence ────────────────────────────────────────────────────────────
@@ -163,23 +174,23 @@ TEST_CASE("solo on a MIDI track is visible to the global solo scan",
 TEST_CASE("a MIDI track round-trips through JSON", "[mididoc][json]") {
     document::Edit e;
     const std::string t = e.addMidiTrack("Keys");
-    e.midiTrack(t)->gain = 0.75;
-    e.midiTrack(t)->pan = -0.25;
-    e.midiTrack(t)->mute = true;
+    e.track(t)->gain = 0.75;
+    e.track(t)->pan = -0.25;
+    e.track(t)->mute = true;
     e.setMidiInstrument(t, instrumentSlot());
     document::PluginSlot fx;
     fx.name = "Pro-Q";
     fx.uidString = "FEDCBA9876543210FEDCBA9876543210";
-    e.addMidiPlugin(t, fx);
+    e.addPlugin(t, fx);
     e.addMidiClip(t, clipWithNotes(24000, 48000));
 
     document::Edit loaded;
     auto r = document::deserializeEdit(document::serializeEdit(e), loaded);
     REQUIRE(r.ok);
 
-    REQUIRE(loaded.midiTracks().size() == 1);
-    const auto& before = e.midiTracks()[0];
-    const auto& after = loaded.midiTracks()[0];
+    REQUIRE(userTracks(loaded) == 1);
+    const auto& before = e.tracks()[0];
+    const auto& after = loaded.tracks()[0];
     CHECK(after.id == before.id);
     CHECK(after.name == before.name);
     CHECK(after.gain == before.gain);
@@ -190,13 +201,13 @@ TEST_CASE("a MIDI track round-trips through JSON", "[mididoc][json]") {
     REQUIRE(after.plugins.size() == 1);
     CHECK(sameSlot(after.plugins[0], before.plugins[0]));
 
-    REQUIRE(after.clips.size() == 1);
-    CHECK(after.clips[0].id == before.clips[0].id);
-    CHECK(after.clips[0].name == before.clips[0].name);
-    CHECK(after.clips[0].timelineStart == before.clips[0].timelineStart);
-    CHECK(after.clips[0].sourceOffset == before.clips[0].sourceOffset);
-    CHECK(after.clips[0].length == before.clips[0].length);
-    CHECK(sameNotes(after.clips[0].notes, before.clips[0].notes));
+    REQUIRE(after.midiClips.size() == 1);
+    CHECK(after.midiClips[0].id == before.midiClips[0].id);
+    CHECK(after.midiClips[0].name == before.midiClips[0].name);
+    CHECK(after.midiClips[0].timelineStart == before.midiClips[0].timelineStart);
+    CHECK(after.midiClips[0].sourceOffset == before.midiClips[0].sourceOffset);
+    CHECK(after.midiClips[0].length == before.midiClips[0].length);
+    CHECK(sameNotes(after.midiClips[0].notes, before.midiClips[0].notes));
 }
 
 TEST_CASE("clip provenance survives the round trip", "[mididoc][json]") {
@@ -210,7 +221,7 @@ TEST_CASE("clip provenance survives the round trip", "[mididoc][json]") {
     document::Edit loaded;
     REQUIRE(document::deserializeEdit(document::serializeEdit(e), loaded).ok);
 
-    const auto& c = loaded.midiTracks()[0].clips[0];
+    const auto& c = loaded.tracks()[0].midiClips[0];
     CHECK(c.sourcePath == "/tmp/fixture.mid");
     CHECK(c.sourcePpq == 960);
     REQUIRE(c.sourceTempi.size() == 2);
@@ -232,8 +243,9 @@ TEST_CASE("a project written before MIDI existed still loads", "[mididoc][json]"
     document::Edit e;
     auto r = document::deserializeEdit(legacy, e);
     REQUIRE(r.ok);
-    CHECK(e.tracks().size() == 1);
-    CHECK(e.midiTracks().empty());
+    // One audio row survives, and it carries no MIDI content.
+    CHECK(userTracks(e) == 1);
+    CHECK(e.tracks()[0].midiClips.empty());
 }
 
 TEST_CASE("loading replaces MIDI tracks rather than appending to them",
@@ -242,7 +254,7 @@ TEST_CASE("loading replaces MIDI tracks rather than appending to them",
     e.addMidiTrack("Stale");
     const std::string legacy = R"({"format":"dave.doc/v1","midiTracks":[]})";
     REQUIRE(document::deserializeEdit(legacy, e).ok);
-    CHECK(e.midiTracks().empty());
+    CHECK((userTracks(e) == 0));
 }
 
 TEST_CASE("a malformed note is skipped without losing the project",
@@ -258,8 +270,8 @@ TEST_CASE("a malformed note is skipped without losing the project",
     document::Edit e;
     auto r = document::deserializeEdit(doc, e);
     REQUIRE(r.ok);
-    REQUIRE(e.midiTracks().size() == 1);
-    CHECK(e.midiTracks()[0].clips[0].notes.size() == 2);
+    REQUIRE(userTracks(e) == 1);
+    CHECK(e.tracks()[0].midiClips[0].notes.size() == 2);
 }
 
 // ─── Undo / redo ────────────────────────────────────────────────────────────
@@ -269,8 +281,8 @@ TEST_CASE("adding a MIDI track undoes and redoes", "[mididoc][undo]") {
     editing::UndoStack undo{e};
     const std::string before = fingerprint(e);
 
-    undo.execute(std::make_unique<editing::AddMidiTrackCommand>("Keys"));
-    REQUIRE(e.midiTracks().size() == 1);
+    undo.execute(std::make_unique<editing::AddTrackCommand>("Keys"));
+    REQUIRE(userTracks(e) == 1);
     const std::string after = fingerprint(e);
 
     undo.undo();
@@ -289,15 +301,15 @@ TEST_CASE("removing a MIDI track restores it in place", "[mididoc][undo]") {
     e.addMidiClip(second, clipWithNotes(0, 48000));
     const std::string before = fingerprint(e);
 
-    undo.execute(std::make_unique<editing::RemoveMidiTrackCommand>(second));
-    REQUIRE(e.midiTracks().size() == 2);
+    undo.execute(std::make_unique<editing::RemoveTrackCommand>(second));
+    REQUIRE(userTracks(e) == 2);
 
     undo.undo();
     // Position matters: the track list order is the row order on screen, so
     // restoring "Second" after "Third" would be a visible regression.
-    REQUIRE(e.midiTracks().size() == 3);
-    CHECK(e.midiTracks()[1].name == "Second");
-    CHECK(e.midiTracks()[1].clips.size() == 1);
+    REQUIRE(userTracks(e) == 3);
+    CHECK(e.tracks()[1].name == "Second");
+    CHECK(e.tracks()[1].midiClips.size() == 1);
     CHECK(fingerprint(e) == before);
 }
 
@@ -310,15 +322,15 @@ TEST_CASE("importing a MIDI file undoes as one action", "[mididoc][undo]") {
     for (int i = 0; i < 3; ++i) {
         document::MidiTrack mt;
         mt.name = "Part " + std::to_string(i + 1);
-        mt.clips.push_back(clipWithNotes(0, 48000));
+        mt.midiClips.push_back(clipWithNotes(0, 48000));
         parsed.push_back(std::move(mt));
     }
     undo.execute(std::make_unique<editing::ImportMidiFileCommand>(parsed, "song.mid"));
 
-    REQUIRE(e.midiTracks().size() == 3);
-    CHECK(e.midiTracks()[2].name == "Part 3");
-    CHECK(e.midiTracks()[0].clips.size() == 1);
-    CHECK(e.midiTracks()[0].clips[0].notes.size() == 3);
+    REQUIRE(userTracks(e) == 3);
+    CHECK(e.tracks()[2].name == "Part 3");
+    CHECK(e.tracks()[0].midiClips.size() == 1);
+    CHECK(e.tracks()[0].midiClips[0].notes.size() == 3);
     // One import is one undo step, however many tracks the file held.
     CHECK(undo.undoDepth() == 1);
 
@@ -358,7 +370,7 @@ TEST_CASE("moving a MIDI clip to another track keeps its id and notes",
     const std::string before = fingerprint(e);
 
     undo.execute(std::make_unique<editing::MoveMidiClipCommand>(a, c, 24000, b));
-    CHECK(e.midiTrack(a)->clips.empty());
+    CHECK(e.track(a)->midiClips.empty());
     REQUIRE(e.midiClip(b, c) != nullptr);
     CHECK(e.midiClip(b, c)->timelineStart == 24000);
     CHECK(e.midiClip(b, c)->notes.size() == 3);
@@ -366,7 +378,7 @@ TEST_CASE("moving a MIDI clip to another track keeps its id and notes",
     undo.undo();
     REQUIRE(e.midiClip(a, c) != nullptr);
     CHECK(e.midiClip(a, c)->timelineStart == 0);
-    CHECK(e.midiTrack(b)->clips.empty());
+    CHECK(e.track(b)->midiClips.empty());
     CHECK(fingerprint(e) == before);
 
     undo.redo();
@@ -404,7 +416,7 @@ TEST_CASE("removing a MIDI clip restores its notes and id", "[mididoc][undo]") {
     const std::string before = fingerprint(e);
 
     undo.execute(std::make_unique<editing::RemoveMidiClipCommand>(t, c));
-    CHECK(e.midiTrack(t)->clips.empty());
+    CHECK(e.track(t)->midiClips.empty());
 
     undo.undo();
     REQUIRE(e.midiClip(t, c) != nullptr);
@@ -420,29 +432,29 @@ TEST_CASE("swapping an instrument restores the previous one with its state",
     const std::string t = e.addMidiTrack("Keys");
     undo.execute(std::make_unique<editing::SetMidiInstrumentCommand>(
         t, instrumentSlot()));
-    const std::string firstId = e.midiTrack(t)->instrument.id;
+    const std::string firstId = e.track(t)->instrument.id;
 
     document::PluginSlot other;
     other.name = "Dexed";
     other.uidString = "11111111222222223333333344444444";
     undo.execute(std::make_unique<editing::SetMidiInstrumentCommand>(t, other));
-    CHECK(e.midiTrack(t)->instrument.name == "Dexed");
+    CHECK(e.track(t)->instrument.name == "Dexed");
 
     undo.undo();
-    CHECK(e.midiTrack(t)->instrument.name == "Surge XT");
-    CHECK(e.midiTrack(t)->instrument.id == firstId);
+    CHECK(e.track(t)->instrument.name == "Surge XT");
+    CHECK(e.track(t)->instrument.id == firstId);
     // The saved plugin state has to come back too; losing it on undo would
     // silently reset a synth the user had dialled in.
-    CHECK(e.midiTrack(t)->instrument.stateBase64 == "AAECAwQ=");
+    CHECK(e.track(t)->instrument.stateBase64 == "AAECAwQ=");
 
     undo.redo();
-    CHECK(e.midiTrack(t)->instrument.name == "Dexed");
+    CHECK(e.track(t)->instrument.name == "Dexed");
     // Redo must reuse the id minted the first time, or the GraphBuilder cache
     // and any open editor window stop resolving.
-    const std::string redoneId = e.midiTrack(t)->instrument.id;
+    const std::string redoneId = e.track(t)->instrument.id;
     undo.undo();
     undo.redo();
-    CHECK(e.midiTrack(t)->instrument.id == redoneId);
+    CHECK(e.track(t)->instrument.id == redoneId);
 }
 
 TEST_CASE("undoing the first instrument leaves the track with none",
@@ -453,8 +465,8 @@ TEST_CASE("undoing the first instrument leaves the track with none",
     undo.execute(std::make_unique<editing::SetMidiInstrumentCommand>(
         t, instrumentSlot()));
     undo.undo();
-    CHECK(e.midiTrack(t)->instrument.uidString.empty());
-    CHECK(e.midiTrack(t)->instrument.id.empty());
+    CHECK(e.track(t)->instrument.uidString.empty());
+    CHECK(e.track(t)->instrument.id.empty());
 }
 
 TEST_CASE("MIDI effect plugins add and remove with undo", "[mididoc][undo]") {
@@ -465,22 +477,22 @@ TEST_CASE("MIDI effect plugins add and remove with undo", "[mididoc][undo]") {
     fx.name = "Pro-Q";
     fx.uidString = "FEDCBA9876543210FEDCBA9876543210";
 
-    auto add = std::make_unique<editing::AddMidiPluginCommand>(t, fx);
+    auto add = std::make_unique<editing::AddPluginCommand>(t, fx);
     auto* addPtr = add.get();
     undo.execute(std::move(add));
     const std::string slotId = addPtr->slotId();
-    REQUIRE(e.midiTrack(t)->plugins.size() == 1);
+    REQUIRE(e.track(t)->plugins.size() == 1);
 
-    undo.execute(std::make_unique<editing::RemoveMidiPluginCommand>(t, slotId));
-    CHECK(e.midiTrack(t)->plugins.empty());
-
-    undo.undo();
-    REQUIRE(e.midiTrack(t)->plugins.size() == 1);
-    CHECK(e.midiTrack(t)->plugins[0].id == slotId);
-    CHECK(e.midiTrack(t)->plugins[0].name == "Pro-Q");
+    undo.execute(std::make_unique<editing::RemovePluginCommand>(t, slotId));
+    CHECK(e.track(t)->plugins.empty());
 
     undo.undo();
-    CHECK(e.midiTrack(t)->plugins.empty());
+    REQUIRE(e.track(t)->plugins.size() == 1);
+    CHECK(e.track(t)->plugins[0].id == slotId);
+    CHECK(e.track(t)->plugins[0].name == "Pro-Q");
+
+    undo.undo();
+    CHECK(e.track(t)->plugins.empty());
 }
 
 TEST_CASE("splitting a MIDI clip covers the same span in two", "[mididoc][undo]") {
@@ -490,9 +502,9 @@ TEST_CASE("splitting a MIDI clip covers the same span in two", "[mididoc][undo]"
     const std::string c = e.addMidiClip(t, clipWithNotes(0, 48000));
 
     undo.execute(std::make_unique<editing::SplitMidiClipCommand>(t, c, 12000));
-    REQUIRE(e.midiTrack(t)->clips.size() == 2);
-    const auto& left = e.midiTrack(t)->clips[0];
-    const auto& right = e.midiTrack(t)->clips[1];
+    REQUIRE(e.track(t)->midiClips.size() == 2);
+    const auto& left = e.track(t)->midiClips[0];
+    const auto& right = e.track(t)->midiClips[1];
     CHECK(left.timelineStart == 0);
     CHECK(left.length == 12000);
     CHECK(right.timelineStart == 12000);
@@ -512,7 +524,7 @@ TEST_CASE("undoing a MIDI split restores the original length exactly",
 
     undo.execute(std::make_unique<editing::SplitMidiClipCommand>(t, c, 12000));
     undo.undo();
-    REQUIRE(e.midiTrack(t)->clips.size() == 1);
+    REQUIRE(e.track(t)->midiClips.size() == 1);
     CHECK(e.midiClip(t, c)->length == 48000);
     CHECK(fingerprint(e) == before);
 
@@ -536,7 +548,7 @@ TEST_CASE("a split outside the clip's bounds does nothing", "[mididoc][undo]") {
     // zero-length half behind.
     for (int64_t at : {int64_t(0), int64_t(48000), int64_t(96000), int64_t(150000)}) {
         undo.execute(std::make_unique<editing::SplitMidiClipCommand>(t, c, at));
-        CHECK(e.midiTrack(t)->clips.size() == 1);
+        CHECK(e.track(t)->midiClips.size() == 1);
         CHECK(e.midiClip(t, c)->length == 48000);
     }
 }
@@ -550,8 +562,8 @@ TEST_CASE("duplicating a MIDI clip places the copy after the original",
     const std::string before = fingerprint(e);
 
     undo.execute(std::make_unique<editing::DuplicateMidiClipCommand>(t, c));
-    REQUIRE(e.midiTrack(t)->clips.size() == 2);
-    const auto& copy = e.midiTrack(t)->clips[1];
+    REQUIRE(e.track(t)->midiClips.size() == 2);
+    const auto& copy = e.track(t)->midiClips[1];
     CHECK(copy.timelineStart == 72000);   // butts up against the original
     CHECK(copy.length == 48000);
     CHECK(copy.notes.size() == 3);
@@ -565,13 +577,13 @@ TEST_CASE("a full edit session round-trips through JSON unchanged",
           "[mididoc][json][undo]") {
     document::Edit e;
     editing::UndoStack undo{e};
-    undo.execute(std::make_unique<editing::AddMidiTrackCommand>("Keys"));
-    const std::string t = e.midiTracks()[0].id;
+    undo.execute(std::make_unique<editing::AddTrackCommand>("Keys"));
+    const std::string t = e.tracks()[0].id;
     undo.execute(std::make_unique<editing::SetMidiInstrumentCommand>(
         t, instrumentSlot()));
     undo.execute(std::make_unique<editing::AddMidiClipCommand>(
         t, clipWithNotes(0, 48000)));
-    const std::string c = e.midiTracks()[0].clips[0].id;
+    const std::string c = e.tracks()[0].midiClips[0].id;
     undo.execute(std::make_unique<editing::MoveMidiClipCommand>(t, c, 96000));
 
     document::Edit loaded;

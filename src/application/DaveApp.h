@@ -95,10 +95,9 @@ private:
     void servicePendingTransientNavigation();
     void toggleTransientNavigation();
     void saveEditorPreferences();
+    void drawPreferencesWindow();
     // Targets of the M / S shortcuts; null when nothing is selected.
     document::Track* selectedTrack();
-    document::MidiTrack* selectedMidiTrack();
-    document::BusTrack* selectedBus();
     void toggleSelectedTrackMute();
     void toggleSelectedTrackSolo();
     void toggleSelectedTrackArm();
@@ -166,11 +165,13 @@ private:
     float sidebarWidth_ = 360.0f;
     float videoHeight_ = 322.0f;
 
-    // Global hardware controls live above the document-specific sidebar.
-    // The selection itself is stored in the per-user preferences file, never
-    // in a .dave project.
-    bool showIoPanel_ = true;
+
     bool openTransientOptions_ = false;
+    // Preferences is a real window rather than a popup: it is reached from the
+    // app menu and Cmd+, like any Mac app, and a popup closes the moment the
+    // pointer leaves it.
+    bool showPreferences_ = false;
+    bool preferencesJustOpened_ = false;
 
     // ─── Mixer ──────────────────────────────────────────────────────────────
     // The mixer sits under the timeline, spanning its full width: strips are

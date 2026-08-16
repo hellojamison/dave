@@ -37,6 +37,7 @@
         case 20: if (g_menuPreviousLandmark) g_menuPreviousLandmark(); break;
         case 21: if (g_menuExtendNextLandmark) g_menuExtendNextLandmark(); break;
         case 22: if (g_menuExtendPreviousLandmark) g_menuExtendPreviousLandmark(); break;
+        case 23: if (g_menuOpenPreferences) g_menuOpenPreferences(); break;
     }
 }
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)app {
@@ -69,6 +70,7 @@ std::function<void()> g_menuReturnToStart;
 std::function<void()> g_menuToggleVideoWindow;
 std::function<void()> g_menuToggleIoPanel;
 std::function<void()> g_menuImportMidi;
+std::function<void()> g_menuOpenPreferences;
 std::function<void()> g_menuQuit;
 
 static DaveMenuItemTarget* g_target = nil;
@@ -100,6 +102,11 @@ void setupMacMenuBar() {
     NSMenuItem* appMenuItem = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
     NSMenu* appMenu = [[NSMenu alloc] initWithTitle:@""];
     [appMenu addItemWithTitle:@"About Dave" action:nil keyEquivalent:@""];
+    [appMenu addItem:[NSMenuItem separatorItem]];
+    // Cmd+, in the app menu, where every Mac app puts it. macOS 13 renamed
+    // this item to "Settings…"; matching the system wording is the point of
+    // putting it here at all.
+    [appMenu addItem:makeItem(@"Settings…", 23, @",")];
     [appMenu addItem:[NSMenuItem separatorItem]];
     [appMenu addItem:makeItem(@"Hide Dave", 0, @"h")];
     [appMenu addItem:makeItem(@"Quit Dave", 13, @"q")];

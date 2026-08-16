@@ -15,6 +15,17 @@
 #include <memory>
 #include <vector>
 
+namespace {
+// Main is a row in the one track list now, so a test asking "how many tracks
+// did I make?" has to say so. Counting user rows keeps the intent visible
+// rather than burying a +1 in every expectation.
+inline size_t userTracks(const dave::document::Edit& e) {
+    size_t n = 0;
+    for (const auto& t : e.tracks()) if (!t.isMain) ++n;
+    return n;
+}
+} // namespace
+
 using namespace dave;
 
 namespace {
@@ -79,7 +90,10 @@ std::vector<std::vector<float>> render(engine::CompiledGraph& graph, int channel
 
 TEST_CASE("new edits own a permanent Main bus", "[routing][document]") {
     document::Edit edit;
-    REQUIRE(edit.buses().size() == 1);
+    // Main is the only row a new edit owns, and it is a track like any
+    // other — the permanence is the flag, not a separate list.
+    REQUIRE(edit.tracks().size() == 1);
+    REQUIRE(userTracks(edit) == 0);
     REQUIRE(edit.mainBus() != nullptr);
     CHECK(edit.mainBus()->isMain);
     CHECK(edit.mainBus()->mainOutput == document::RouteTarget::hardwareOutput(0, 2));
@@ -87,8 +101,8 @@ TEST_CASE("new edits own a permanent Main bus", "[routing][document]") {
     const auto audio = edit.addTrack("DX");
     const auto midi = edit.addMidiTrack("Score");
     CHECK(edit.track(audio)->mainOutput == document::RouteTarget::bus());
-    CHECK(edit.midiTrack(midi)->mainOutput == document::RouteTarget::bus());
-    CHECK_FALSE(edit.removeBus(document::kMainBusId));
+    CHECK(edit.track(midi)->mainOutput == document::RouteTarget::bus());
+    CHECK_FALSE(edit.removeTrack(document::kMainBusId));
 }
 
 TEST_CASE("v1 projects migrate routing without enabling input monitoring",
@@ -104,7 +118,7 @@ TEST_CASE("v1 projects migrate routing without enabling input monitoring",
     CHECK(edit.track("a")->hardwareInput == document::HardwareChannelSpan{3, 2});
     CHECK_FALSE(edit.track("a")->inputMonitor);
     CHECK(edit.track("a")->mainOutput == document::RouteTarget::bus());
-    CHECK(edit.midiTrack("m")->mainOutput == document::RouteTarget::bus());
+    CHECK(edit.track("m")->mainOutput == document::RouteTarget::bus());
 }
 
 TEST_CASE("current documents preserve unavailable routes, buses, and muted sends",
@@ -120,7 +134,7 @@ TEST_CASE("current documents preserve unavailable routes, buses, and muted sends
     REQUIRE_FALSE(sendId.empty());
 
     const std::string text = document::serializeEdit(edit);
-    CHECK(text.find("dave.doc/v3") != std::string::npos);
+    CHECK(text.find("dave.doc/v4") != std::string::npos);
     document::Edit loaded;
     REQUIRE(document::deserializeEdit(text, loaded).ok);
     CHECK(loaded.track(track)->hardwareInput == document::HardwareChannelSpan{31, 2});
@@ -141,7 +155,7 @@ TEST_CASE("routing rejects cycles, self routes, and referenced deletion",
     CHECK_FALSE(edit.setMainOutput(b, document::RouteTarget::audioTrack(a)));
     CHECK_FALSE(edit.setMainOutput(a, document::RouteTarget::audioTrack(a)));
     REQUIRE(edit.setMainOutput(b, document::RouteTarget::bus(bus)));
-    CHECK_FALSE(edit.removeBus(bus));
+    CHECK_FALSE(edit.removeTrack(bus));
     CHECK_FALSE(edit.removeTrack(b));
     CHECK(edit.validateRouting().ok);
 }
@@ -151,15 +165,15 @@ TEST_CASE("bus and send commands preserve stable ids across undo redo",
     document::Edit edit;
     editing::UndoStack undo(edit);
     const auto track = edit.addTrack("A");
-    auto addBus = std::make_unique<editing::AddBusCommand>("Stem");
+    auto addBus = std::make_unique<editing::AddTrackCommand>("Stem");
     auto* addBusPointer = addBus.get();
     undo.execute(std::move(addBus));
     const std::string busId = addBusPointer->busId();
-    REQUIRE(edit.bus(busId) != nullptr);
+    REQUIRE(edit.track(busId) != nullptr);
     undo.undo();
-    CHECK(edit.bus(busId) == nullptr);
+    CHECK(edit.track(busId) == nullptr);
     undo.redo();
-    REQUIRE(edit.bus(busId) != nullptr);
+    REQUIRE(edit.track(busId) != nullptr);
 
     document::AuxSend send;
     send.target = document::RouteTarget::bus(busId);
@@ -416,7 +430,7 @@ TEST_CASE("solo-in-place keeps the required path and silences sibling routes",
     cue.gain = 1.0;
     cue.muted = false;
     REQUIRE_FALSE(edit.addSend(trackId, cue).empty());
-    edit.bus(document::kMainBusId)->solo = true;
+    edit.track(document::kMainBusId)->solo = true;
 
     engine::GraphBuilder builder;
     auto graph = builder.build(edit, 48000.0, 4);
@@ -429,4 +443,82 @@ TEST_CASE("solo-in-place keeps the required path and silences sibling routes",
     CHECK(output[1][0] > 0.0f);
     CHECK(output[2][0] == 0.0f);
     CHECK(output[3][0] == 0.0f);
+}
+
+TEST_CASE("a v3 project folds its three bands into one ordered list",
+          "[routing][document][migration]") {
+    // The failure this guards is the one that would silently damage real
+    // sessions: rows arriving in the wrong order, Main not last, or a bus
+    // losing its hardware output because readChannelRouting defaults every
+    // channel to Main.
+    const std::string v3 = R"({
+        "format": "dave.doc/v3",
+        "sampleRate": 48000,
+        "bitDepth": 24,
+        "tracks": [{"id":"track_1","name":"Dialog"},
+                   {"id":"track_2","name":"FX"}],
+        "midiTracks": [{"id":"miditrack_1","name":"Keys"}],
+        "buses": [{"id":"bus_9","name":"Print"},
+                  {"id":"bus_main","name":"Main","isMain":true}]
+    })";
+    document::Edit edit;
+    REQUIRE(document::deserializeEdit(v3, edit).ok);
+
+    // Audio band, then MIDI, then buses — the order the user saw.
+    REQUIRE(edit.tracks().size() == 5);
+    CHECK(edit.tracks()[0].id == "track_1");
+    CHECK(edit.tracks()[1].id == "track_2");
+    CHECK(edit.tracks()[2].id == "miditrack_1");
+    CHECK(edit.tracks()[3].id == "bus_9");
+    CHECK(edit.tracks()[4].id == "bus_main");
+
+    // Main is last, permanent, and still routed to hardware rather than to
+    // itself.
+    CHECK(edit.tracks().back().isMain);
+    REQUIRE(edit.mainBus() != nullptr);
+    CHECK(edit.mainBus()->mainOutput.kind ==
+          document::RouteTarget::Kind::HardwareOutput);
+    // isMain is derived from the id, never trusted from the file.
+    CHECK_FALSE(edit.tracks()[3].isMain);
+
+    // And it re-saves as v4 with one array.
+    const std::string saved = document::serializeEdit(edit);
+    CHECK(saved.find("dave.doc/v4") != std::string::npos);
+    CHECK(saved.find("\"midiTracks\"") == std::string::npos);
+    CHECK(saved.find("\"buses\"") == std::string::npos);
+}
+
+TEST_CASE("removing a track a send points at is refused, whatever it holds",
+          "[routing][document]") {
+    // removeMidiTrack had no routeReferences guard, so deleting a MIDI track
+    // a send referenced left a dangling route. One track type, one guard.
+    document::Edit edit;
+    const std::string keys = edit.addMidiTrack("Keys");
+    const std::string source = edit.addTrack("Dialog");
+    document::AuxSend send;
+    send.target = document::RouteTarget::audioTrack(keys);
+    REQUIRE_FALSE(edit.addSend(source, send).empty());
+
+    CHECK_FALSE(edit.removeTrack(keys));
+    CHECK(edit.track(keys) != nullptr);
+
+    // Main is permanent regardless of references.
+    CHECK_FALSE(edit.removeTrack(document::kMainBusId));
+    CHECK(edit.mainBus() != nullptr);
+}
+
+TEST_CASE("plugins can be added to any track, including one made for MIDI",
+          "[routing][document]") {
+    // addPlugin resolved track-or-bus and silently missed MIDI tracks, which
+    // is the entire reason addMidiPlugin existed.
+    document::Edit edit;
+    const std::string keys = edit.addMidiTrack("Keys");
+    document::PluginSlot slot;
+    slot.name = "EQ";
+    slot.uidString = "uid-eq";
+    const std::string id = edit.addPlugin(keys, slot);
+    REQUIRE_FALSE(id.empty());
+    REQUIRE(edit.track(keys)->plugins.size() == 1);
+    CHECK(edit.removePlugin(keys, id));
+    CHECK(edit.track(keys)->plugins.empty());
 }

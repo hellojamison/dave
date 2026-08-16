@@ -11,6 +11,7 @@ add_executable(dave_tests
     test_markers.cpp
     test_mixer.cpp
     test_clipmove.cpp
+    test_trackcommands.cpp
     test_smf.cpp
     test_mididoc.cpp
     test_instrument.cpp
@@ -31,6 +32,7 @@ add_executable(dave_tests
     test_audiodeviceconfig.cpp
     test_audiopreferences.cpp
     test_editorpreferences.cpp
+    test_takenaming.cpp
     test_transientdetector.cpp
     test_transientcache.cpp
     test_transientnavigation.cpp
@@ -45,6 +47,7 @@ add_executable(dave_tests
     # Sources under test.
     "${CMAKE_SOURCE_DIR}/src/document/Sha256.cpp"
     "${CMAKE_SOURCE_DIR}/src/application/AudioPreferences.cpp"
+    "${CMAKE_SOURCE_DIR}/src/application/TakeNaming.cpp"
     "${CMAKE_SOURCE_DIR}/src/application/EditorPreferences.cpp"
     "${CMAKE_SOURCE_DIR}/src/audio/TransientDetector.cpp"
     "${CMAKE_SOURCE_DIR}/src/audio/TransientAnalysisCache.cpp"
@@ -67,6 +70,7 @@ add_executable(dave_tests
     # so imgui is linked to satisfy them — no ImGui context is ever created.
     "${CMAKE_SOURCE_DIR}/src/gui/Timeline.cpp"
     "${CMAKE_SOURCE_DIR}/src/gui/TransientNavigation.cpp"
+    "${CMAKE_SOURCE_DIR}/src/gui/LevelMeter.cpp"
     "${CMAKE_SOURCE_DIR}/src/gui/Mixer.cpp"
     "${CMAKE_SOURCE_DIR}/src/gui/Theme.cpp"
     "${CMAKE_SOURCE_DIR}/src/gui/IoPanel.cpp"

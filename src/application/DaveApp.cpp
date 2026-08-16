@@ -49,20 +49,9 @@ int firstNameIndex(const std::vector<std::string>& names,
         : static_cast<int>(std::distance(names.begin(), found));
 }
 
-std::string safeTakeName(const std::string& name) {
-    std::string safe;
-    safe.reserve(name.size());
-    for (unsigned char c : name) {
-        if (std::isalnum(c) || c == '-' || c == '_') {
-            safe.push_back(static_cast<char>(c));
-        } else if (std::isspace(c)) {
-            safe.push_back('_');
-        }
-    }
-    return safe.empty() ? "Track" : safe;
-}
-
-std::string takeTimestamp() {
+// Split rather than one stamp: the pattern exposes {date} and {time}
+// separately, so a user can group takes by day without the seconds.
+void takeDateAndTime(std::string& date, std::string& time) {
     const std::time_t now = std::time(nullptr);
     std::tm local{};
 #if defined(_WIN32)
@@ -71,24 +60,10 @@ std::string takeTimestamp() {
     localtime_r(&now, &local);
 #endif
     char buffer[32]{};
-    std::strftime(buffer, sizeof(buffer), "%Y%m%d-%H%M%S", &local);
-    return buffer;
-}
-
-std::filesystem::path uniqueTakePath(
-    const std::filesystem::path& directory, const std::string& trackName,
-    const std::string& timestamp, std::unordered_set<std::string>& reserved) {
-    const std::string base = safeTakeName(trackName) + "_" + timestamp;
-    for (int suffix = 0;; ++suffix) {
-        const std::string filename =
-            base + (suffix == 0 ? "" : ("_" + std::to_string(suffix + 1))) +
-            ".wav";
-        const auto candidate = directory / filename;
-        const std::string key = candidate.lexically_normal().string();
-        if (!std::filesystem::exists(candidate) && reserved.insert(key).second) {
-            return candidate;
-        }
-    }
+    std::strftime(buffer, sizeof(buffer), "%Y%m%d", &local);
+    date = buffer;
+    std::strftime(buffer, sizeof(buffer), "%H%M%S", &local);
+    time = buffer;
 }
 
 struct CompensatedTakeRange {
@@ -264,7 +239,16 @@ bool DaveApp::init(bool startAudio) {
     platform::g_menuToggleVideoWindow = [this](){
         if (!edit_.videoTracks().empty()) setVideoPoppedOut(!videoPoppedOut_);
     };
-    platform::g_menuToggleIoPanel = [this](){ showIoPanel_ = !showIoPanel_; };
+    // The panel is a Preferences tab now; the menu item opens it there rather
+    // than toggling a window that no longer exists.
+    platform::g_menuToggleIoPanel = [this]() {
+        showPreferences_ = true;
+        preferencesJustOpened_ = true;
+    };
+    platform::g_menuOpenPreferences = [this]() {
+        showPreferences_ = true;
+        preferencesJustOpened_ = true;
+    };
     platform::g_menuQuit         = [this](){ window_.close(); };
     platform::setupMacMenuBar();
 #endif
@@ -274,13 +258,15 @@ bool DaveApp::init(bool startAudio) {
         editorPreferences_.transientNavigationEnabled;
     view_.showTransientTicks = editorPreferences_.showTransientTicks;
     view_.transientSensitivity = editorPreferences_.transientSensitivity;
+    view_.meterOptions.preFader = editorPreferences_.meterPreFader;
+    view_.meterOptions.rmsBody = editorPreferences_.meterRmsBody;
     if (startAudio) {
         refreshAudioDevices();
         if (!applyAudioPreferences(audioPreferences_, false)) {
             std::fprintf(stderr, "Dave: audio engine failed to start\n");
         }
         if (audio_.playbackChannelCount() == 1) {
-            edit_.bus(document::kMainBusId)->mainOutput =
+            edit_.track(document::kMainBusId)->mainOutput =
                 document::RouteTarget::hardwareOutput(0, 1);
         }
     }
@@ -367,6 +353,11 @@ void DaveApp::handleShortcuts() {
         undo_.execute(std::make_unique<editing::AddTrackCommand>("Track"));
     } else if (primaryModifier && ImGui::IsKeyPressed(ImGuiKey_N, false)) {
         newProject();
+    } else if (primaryModifier &&
+               ImGui::IsKeyPressed(ImGuiKey_Comma, false)) {
+        // Cmd+, — the macOS convention, and harmless elsewhere.
+        showPreferences_ = true;
+        preferencesJustOpened_ = true;
     } else if (primaryModifier && ImGui::IsKeyPressed(ImGuiKey_Q, false)) {
         window_.close();
     } else if (primaryModifier && !shift && ImGui::IsKeyPressed(ImGuiKey_R, false)) {
@@ -401,10 +392,9 @@ void DaveApp::handleShortcuts() {
     } else if (!primaryModifier && shift && ImGui::IsKeyPressed(ImGuiKey_S, false)) {
         toggleSelectedTrackSolo();
     } else if (primaryModifier && shift && ImGui::IsKeyPressed(ImGuiKey_B, false)) {
-        undo_.execute(std::make_unique<editing::AddBusCommand>("Bus"));
+        undo_.execute(std::make_unique<editing::AddTrackCommand>("Bus", editing::AddTrackCommand::Flavour::Bus));
         view_.selectedTrackIndex = static_cast<int>(
-            edit_.tracks().size() + edit_.midiTracks().size() +
-            edit_.buses().size() - 2);
+            edit_.tracks().size() - 2);
     } else if (primaryModifier && shift && ImGui::IsKeyPressed(ImGuiKey_V, false)) {
         // Pop the picture in or out of its own window. macOS reaches the same
         // action through the native Window menu's Cmd+Shift+V. With no video
@@ -555,9 +545,128 @@ void DaveApp::saveEditorPreferences() {
     editorPreferences_.showTransientTicks = view_.showTransientTicks;
     editorPreferences_.transientSensitivity =
         std::clamp(view_.transientSensitivity, 0, 100);
+    editorPreferences_.meterPreFader = view_.meterOptions.preFader;
+    editorPreferences_.meterRmsBody = view_.meterOptions.rmsBody;
     if (!editorPreferencesStore_.save(editorPreferences_)) {
         showStatus("Could not save editor preferences", true);
     }
+}
+
+// Preferences gathers the per-user settings that were previously reachable
+// only by right-clicking the control they affected — discoverable by accident
+// at best. Everything here is stored outside the .dave project, in
+// editor-preferences.json.
+void DaveApp::drawPreferencesWindow() {
+    if (!showPreferences_) return;
+    const auto& pal = gui::theme::palette();
+
+    if (preferencesJustOpened_) {
+        // Centred on first open only. Reopening should return it to wherever
+        // the user last dragged it.
+        const ImGuiViewport* vp = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(
+            ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f,
+                   vp->WorkPos.y + vp->WorkSize.y * 0.5f),
+            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowFocus();
+        preferencesJustOpened_ = false;
+    }
+    ImGui::SetNextWindowSize(ImVec2(460.0f, 0.0f), ImGuiCond_Always);
+
+    bool open = showPreferences_;
+    if (ImGui::Begin("Preferences", &open,
+                     ImGuiWindowFlags_NoDocking |
+                         ImGuiWindowFlags_NoCollapse |
+                         ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::BeginTabBar("##preferencesTabs");
+        if (ImGui::BeginTabItem("Recording")) {
+        ImGui::Dummy(ImVec2(0.0f, 2.0f));
+        ImGui::TextDisabled("Take file names");
+
+        char pattern[128]{};
+        std::strncpy(pattern, editorPreferences_.takeNamePattern.c_str(),
+                     sizeof(pattern) - 1);
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::InputText("##takePattern", pattern, sizeof(pattern))) {
+            editorPreferences_.takeNamePattern = pattern;
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            // An empty or unusable pattern would name every take the same
+            // thing, so it snaps back rather than being saved.
+            if (expandTakeNamePattern(editorPreferences_.takeNamePattern,
+                                      TakeNameContext{}).empty()) {
+                editorPreferences_.takeNamePattern = kDefaultTakeNamePattern;
+            }
+            saveEditorPreferences();
+        }
+
+        // A live preview against the selected track, so the tokens do not have
+        // to be understood in the abstract.
+        TakeNameContext preview;
+        takeDateAndTime(preview.date, preview.time);
+        preview.projectName = std::filesystem::path(projectPath_).stem().string();
+        const auto* selected = selectedTrack();
+        preview.trackName = selected != nullptr ? selected->name : "Audio 1";
+        preview.takeNumber = 1;
+        ImGui::TextDisabled(
+            "%s.wav", expandTakeNamePattern(editorPreferences_.takeNamePattern,
+                                            preview).c_str());
+        if (!takeNamePatternIsUnique(editorPreferences_.takeNamePattern)) {
+            ImGui::TextColored(pal.warning,
+                               "No {take} — later takes get a numeric suffix.");
+        }
+        ImGui::TextDisabled("{track} {take} {date} {time} {project}");
+        if (ImGui::SmallButton("Restore default##take")) {
+            editorPreferences_.takeNamePattern = kDefaultTakeNamePattern;
+            saveEditorPreferences();
+        }
+
+        ImGui::EndTabItem();
+        }
+
+        if (ImGui::BeginTabItem("Editing")) {
+        ImGui::Dummy(ImVec2(0.0f, 2.0f));
+        bool navigation = view_.transientNavigationEnabled;
+        if (ImGui::Checkbox("Transient navigation", &navigation)) {
+            toggleTransientNavigation();
+        }
+        bool ticks = view_.showTransientTicks;
+        if (ImGui::Checkbox("Show transient ticks", &ticks)) {
+            view_.showTransientTicks = ticks;
+            saveEditorPreferences();
+        }
+        ImGui::SetNextItemWidth(200.0f);
+        ImGui::SliderInt("Sensitivity", &view_.transientSensitivity, 0, 100,
+                         "%d");
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            saveEditorPreferences();
+        }
+        ImGui::TextDisabled("Higher values include softer attacks.");
+
+        ImGui::EndTabItem();
+        }
+
+        // Device selection lives here rather than in the arrangement window:
+        // it is machine configuration, not part of the document, and it is set
+        // once and then left alone. The input meters come with it — they are
+        // how you confirm a device choice actually works.
+        if (ImGui::BeginTabItem("Audio I/O")) {
+            ImGui::Dummy(ImVec2(0.0f, 2.0f));
+            syncIoPanelState();
+            gui::drawIoPanel(ioPanel_);
+            serviceIoPanelRequests();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+
+        ImGui::Dummy(ImVec2(0.0f, 6.0f));
+        ImGui::Separator();
+        ImGui::TextDisabled("%s",
+                            editorPreferencesStore_.path().string().c_str());
+    }
+    ImGui::End();
+
+    if (!open) showPreferences_ = false;
 }
 
 // Both toggles operate on the selected track. With no selection there is no
@@ -575,46 +684,16 @@ document::Track* DaveApp::selectedTrack() {
 // MIDI rows sit below the audio rows in one index space, so M and S have to
 // reach them too — a shortcut that works on some rows and silently does nothing
 // on others is worse than one that doesn't exist.
-document::MidiTrack* DaveApp::selectedMidiTrack() {
-    const int sel = view_.selectedTrackIndex;
-    const int audioCount = static_cast<int>(edit_.tracks().size());
-    const int midiIndex = sel - audioCount;
-    if (midiIndex < 0 || midiIndex >= static_cast<int>(edit_.midiTracks().size())) {
-        return nullptr;
-    }
-    return &edit_.midiTracksMut()[static_cast<size_t>(midiIndex)];
-}
-
-document::BusTrack* DaveApp::selectedBus() {
-    const int first = static_cast<int>(edit_.tracks().size() +
-                                       edit_.midiTracks().size());
-    const int index = view_.selectedTrackIndex - first;
-    if (index < 0 || index >= static_cast<int>(edit_.buses().size())) return nullptr;
-    return &edit_.busesMut()[static_cast<size_t>(index)];
-}
-
 void DaveApp::toggleSelectedTrackMute() {
-    if (document::Track* track = selectedTrack()) {
-        track->mute = !track->mute;
-        edit_.notifyChanged();
-    } else if (document::MidiTrack* midi = selectedMidiTrack()) {
-        midi->mute = !midi->mute;
-        edit_.notifyChanged();
-    } else if (document::BusTrack* bus = selectedBus()) {
-        bus->mute = !bus->mute;
+    if (document::Track* t = selectedTrack()) {
+        t->mute = !t->mute;
         edit_.notifyChanged();
     }
 }
 
 void DaveApp::toggleSelectedTrackSolo() {
-    if (document::Track* track = selectedTrack()) {
-        track->solo = !track->solo;
-        edit_.notifyChanged();
-    } else if (document::MidiTrack* midi = selectedMidiTrack()) {
-        midi->solo = !midi->solo;
-        edit_.notifyChanged();
-    } else if (document::BusTrack* bus = selectedBus()) {
-        bus->solo = !bus->solo;
+    if (document::Track* t = selectedTrack()) {
+        t->solo = !t->solo;
         edit_.notifyChanged();
     }
 }
@@ -730,11 +809,17 @@ bool DaveApp::startRecording() {
     writerTracks.reserve(armed.size());
     session->armedTrackIds.reserve(armed.size());
     std::unordered_set<std::string> reservedPaths;
-    const std::string timestamp = takeTimestamp();
+    TakeNameContext naming;
+    takeDateAndTime(naming.date, naming.time);
+    naming.projectName =
+        std::filesystem::path(projectPath_).stem().string();
     for (const auto* track : armed) {
         auto destination = std::make_unique<engine::DiskWriter::Track>();
+        naming.trackName = track->name;
+        naming.takeNumber = 1;
         destination->path = uniqueTakePath(
-            recordings, track->name, timestamp, reservedPaths).string();
+            recordings, editorPreferences_.takeNamePattern, naming,
+            reservedPaths).string();
         destination->trackId = track->id;
         destination->channels = track->inputChannelCount;
         session->armedTrackIds.push_back(track->id);
@@ -1182,10 +1267,9 @@ void DaveApp::drawUI() {
     // Hardware I/O is global and always starts the sidebar stack. Its height
     // is responsive only within a narrow useful range; the document panels
     // divide whatever remains below it.
-    const float ioPanelH = showIoPanel_
-        ? std::min(220.0f, contentH)
-        : 0.0f;
-    const float ioGap = showIoPanel_ ? splitterSize : 0.0f;
+    // I/O moved into Preferences, so the sidebar stack starts at the top.
+    constexpr float ioPanelH = 0.0f;
+    constexpr float ioGap = 0.0f;
     const float sidebarContentY = contentY + ioPanelH + ioGap;
     const float sidebarContentH =
         std::max(1.0f, contentH - ioPanelH - ioGap);
@@ -1246,8 +1330,13 @@ void DaveApp::drawUI() {
             ImGui::Separator();
             if (ImGui::MenuItem("Add Track", "Ctrl+Shift+N"))
                 undo_.execute(std::make_unique<editing::AddTrackCommand>("Track"));
+            if (ImGui::MenuItem("Preferences...", "Ctrl+,")) {
+                showPreferences_ = true;
+                preferencesJustOpened_ = true;
+            }
+            ImGui::Separator();
             if (ImGui::MenuItem("Add Bus", "Ctrl+Shift+B"))
-                undo_.execute(std::make_unique<editing::AddBusCommand>("Bus"));
+                undo_.execute(std::make_unique<editing::AddTrackCommand>("Bus", editing::AddTrackCommand::Flavour::Bus));
             ImGui::Separator();
             if (ImGui::MenuItem("Transient Navigation", "Ctrl+Alt+T",
                                 view_.transientNavigationEnabled)) {
@@ -1281,8 +1370,10 @@ void DaveApp::drawUI() {
         if (ImGui::BeginMenu("Window")) {
             if (ImGui::MenuItem("Mixer", "Ctrl+=", showMixer_))
                 showMixer_ = !showMixer_;
-            if (ImGui::MenuItem("I/O Panel", nullptr, showIoPanel_))
-                showIoPanel_ = !showIoPanel_;
+            if (ImGui::MenuItem("Audio I/O...")) {
+                showPreferences_ = true;
+                preferencesJustOpened_ = true;
+            }
             if (ImGui::MenuItem("Video Window", "Ctrl+Shift+V",
                                 videoPoppedOut_ && hasVideo, hasVideo))
                 setVideoPoppedOut(!videoPoppedOut_);
@@ -1359,6 +1450,20 @@ void DaveApp::drawUI() {
                 wasRecording ? gui::theme::ButtonVariant::Danger
                              : gui::theme::ButtonVariant::Normal)) {
             toggleRecording();
+        }
+
+        // Right-click the record button for its settings. A separate toolbar
+        // button would cost width the row does not have, and the naming
+        // pattern is the only thing here to configure.
+        // Right-click still reaches the take-naming setting, but Preferences
+        // owns it now — two editors for one value is how they drift apart.
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+            showPreferences_ = true;
+            preferencesJustOpened_ = true;
+        }
+        if (ImGui::IsItemHovered() && !recordingActive()) {
+            ImGui::SetTooltip("Record and roll (Cmd/Ctrl+R)\n"
+                              "Right-click for take file names");
         }
 
         ImGui::SameLine(0.0f, kGap);
@@ -1657,7 +1762,7 @@ void DaveApp::drawUI() {
     const auto transientSnapshots = selectedTrackTransientSnapshots();
     gui::drawTimeline(
         edit_, undo_, transport, peaks_, view_, builder_.assetBuffers(),
-        trackRowHeight, 30.0f, transientSnapshots);
+        trackRowHeight, 30.0f, transientSnapshots, &builder_.trackGains());
     if (view_.requestTransientNavigation) {
         const auto direction = view_.transientNavigationDirection;
         const bool extend = view_.requestTransientSelectionExtension;
@@ -1685,26 +1790,16 @@ void DaveApp::drawUI() {
     }
     // Both the timeline and the mixer can ask for a picker or an editor, so
     // the requests are serviced once, after both have drawn.
+    if (view_.meterOptionsChanged) {
+        view_.meterOptionsChanged = false;
+        saveEditorPreferences();
+    }
     serviceViewRequests();
     // The loop follows the live selection, which the timeline has just
     // finished updating — so this runs every frame rather than only on
     // document changes. Dragging a new range while looping re-points the loop
     // at it without a second gesture.
     syncTransportLoop();
-
-    // I/O is global rather than document state, so it stays at the top of the
-    // sidebar even when the current project has no tracks or picture.
-    if (showIoPanel_) {
-        syncIoPanelState();
-        ImGui::SetNextWindowPos(ImVec2(sidebarX, contentY), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(sidebarW, ioPanelH), ImGuiCond_Always);
-        ImGui::Begin("I/O", nullptr,
-                     panelFlags | ImGuiWindowFlags_NoScrollbar |
-                         ImGuiWindowFlags_NoScrollWithMouse);
-        gui::drawIoPanel(ioPanel_);
-        ImGui::End();
-        serviceIoPanelRequests();
-    }
 
     // Picture stays above the plugin chain because sync-to-picture is the
     // primary post-production task — unless it has been popped out or never
@@ -1838,6 +1933,7 @@ void DaveApp::drawUI() {
 
     // Modals (browser) still float — they're temporary popups, not panels.
     drawPluginBrowser();
+    drawPreferencesWindow();
 
     if (!statusMessage_.empty() && ImGui::GetTime() < statusUntil_) {
         ImDrawList* foreground = ImGui::GetForegroundDrawList();
@@ -1876,8 +1972,8 @@ void DaveApp::drawUI() {
         for (const auto& t : edit_.tracks())
             if (!t.clips.empty()) { hasClips = true; break; }
         if (!hasClips) {
-            for (const auto& track : edit_.midiTracks()) {
-                if (!track.clips.empty()) { hasClips = true; break; }
+            for (const auto& track : edit_.tracks()) {
+                if (!track.midiClips.empty()) { hasClips = true; break; }
             }
         }
         if (!edit_.videoTracks().empty())
@@ -1944,7 +2040,7 @@ bool DaveApp::importMidiFile(const std::string& path) {
         clip.sourcePath = path;
         clip.sourcePpq = smf.ppq;
         clip.sourceTempi = smf.tempi;
-        mt.clips.push_back(std::move(clip));
+        mt.midiClips.push_back(std::move(clip));
         tracks.push_back(std::move(mt));
     }
 
@@ -1953,7 +2049,7 @@ bool DaveApp::importMidiFile(const std::string& path) {
         return false;
     }
 
-    const size_t firstNew = edit_.midiTracks().size();
+    const size_t firstNew = edit_.tracks().size();
     undo_.execute(std::make_unique<editing::ImportMidiFileCommand>(
         std::move(tracks), fileName));
     // Select the first imported row so the instrument picker in the gutter is
@@ -1961,8 +2057,8 @@ bool DaveApp::importMidiFile(const std::string& path) {
     view_.selectedTrackIndex =
         static_cast<int>(edit_.tracks().size() + firstNew);
     std::fprintf(stderr, "Dave: imported %s (%zu track%s)\n", fileName.c_str(),
-                 edit_.midiTracks().size() - firstNew,
-                 (edit_.midiTracks().size() - firstNew) == 1 ? "" : "s");
+                 edit_.tracks().size() - firstNew,
+                 (edit_.tracks().size() - firstNew) == 1 ? "" : "s");
     return true;
 }
 
@@ -2148,11 +2244,11 @@ void DaveApp::newProject() {
         return;
     }
     edit_.tracksMut().clear();
-    edit_.clearMidiTracks_();
-    edit_.clearBuses_();
+    edit_.clearTracks_();
+    edit_.clearTracks_();
     edit_.ensureMainBus_();
     if (audio_.playbackChannelCount() == 1) {
-        edit_.bus(document::kMainBusId)->mainOutput =
+        edit_.track(document::kMainBusId)->mainOutput =
             document::RouteTarget::hardwareOutput(0, 1);
     }
     edit_.clearMarkerTracks_();
@@ -2421,26 +2517,15 @@ void DaveApp::openProjectDialog() {
 void DaveApp::saveProject(bool saveAs) {
     // Capture plugin states before serializing — get each loaded plugin's
     // current parameter/internal state and stash it in the slot.
-    for (auto& track : edit_.tracksMut()) {
-        for (auto& slot : track.plugins) {
-            auto inst = builder_.pluginInstance(slot.id);
-            if (inst && inst->isLoaded()) {
-                slot.stateBase64 = inst->getStateBase64();
-            }
-        }
-    }
     const auto captureSlotState = [&](document::PluginSlot& slot) {
         auto instance = builder_.pluginInstance(slot.id);
         if (instance && instance->isLoaded()) {
             slot.stateBase64 = instance->getStateBase64();
         }
     };
-    for (auto& track : edit_.midiTracksMut()) {
+    for (auto& track : edit_.tracksMut()) {
         captureSlotState(track.instrument);
         for (auto& slot : track.plugins) captureSlotState(slot);
-    }
-    for (auto& bus : edit_.busesMut()) {
-        for (auto& slot : bus.plugins) captureSlotState(slot);
     }
 
     std::string path = projectPath_;
@@ -2742,7 +2827,7 @@ void DaveApp::drawMidiTrackPanel(const document::MidiTrack& track) {
         ++slotIdx;
     }
     if (!removeSlotId.empty()) {
-        undo_.execute(std::make_unique<editing::RemoveMidiPluginCommand>(
+        undo_.execute(std::make_unique<editing::RemovePluginCommand>(
             track.id, removeSlotId));
         editors_.erase(removeSlotId);
         return;
@@ -2758,8 +2843,6 @@ void DaveApp::drawPluginsPanelContent() {
     // the order they're drawn in on the timeline.
     int sel = view_.selectedTrackIndex;
     const int audioCount = static_cast<int>(edit_.tracks().size());
-    const int midiCount = static_cast<int>(edit_.midiTracks().size());
-    const int busCount = static_cast<int>(edit_.buses().size());
     auto drawRouting = [&](const std::string& ownerId,
                            document::RouteTarget& mainOutput,
                            std::vector<document::AuxSend>& sends,
@@ -2909,18 +2992,20 @@ void DaveApp::drawPluginsPanelContent() {
         ImGui::Separator();
     };
 
-    if (sel >= audioCount + midiCount &&
-        sel < audioCount + midiCount + busCount) {
-        auto& bus = edit_.busesMut()[sel - audioCount - midiCount];
-        ImGui::Text("Bus: %s", bus.name.c_str());
-        drawRouting(bus.id, bus.mainOutput, bus.sends, nullptr);
-        return;
-    }
-    if (sel >= audioCount && sel < audioCount + midiCount) {
-        auto& midi = edit_.midiTracksMut()[sel - audioCount];
-        drawRouting(midi.id, midi.mainOutput, midi.sends, nullptr);
-        drawMidiTrackPanel(midi);
-        return;
+    if (sel >= 0 && sel < audioCount) {
+        auto& row = edit_.tracksMut()[static_cast<size_t>(sel)];
+        // A bus has no local source, so it gets routing only; a row with an
+        // instrument also gets the instrument and its post-instrument chain.
+        if (row.isMain) {
+            // Main has no local source, so routing is all there is.
+            drawRouting(row.id, row.mainOutput, row.sends, nullptr);
+            return;
+        }
+        if (!row.instrument.uidString.empty() || !row.midiClips.empty()) {
+            drawRouting(row.id, row.mainOutput, row.sends, nullptr);
+            drawMidiTrackPanel(row);
+            return;
+        }
     }
     if (sel < 0 || sel >= audioCount) {
         if (edit_.tracks().empty()) {
@@ -3013,18 +3098,8 @@ void DaveApp::openPluginBrowser(BrowserMode mode, std::string trackId) {
 const document::PluginSlot* DaveApp::findSlot(const std::string& slotId) const {
     if (slotId.empty()) return nullptr;
     for (const auto& t : edit_.tracks()) {
-        for (const auto& s : t.plugins) {
-            if (s.id == slotId) return &s;
-        }
-    }
-    for (const auto& mt : edit_.midiTracks()) {
-        if (mt.instrument.id == slotId) return &mt.instrument;
-        for (const auto& s : mt.plugins) {
-            if (s.id == slotId) return &s;
-        }
-    }
-    for (const auto& bus : edit_.buses()) {
-        for (const auto& slot : bus.plugins) {
+        if (t.instrument.id == slotId) return &t.instrument;
+        for (const auto& slot : t.plugins) {
             if (slot.id == slotId) return &slot;
         }
     }
@@ -3062,10 +3137,10 @@ void DaveApp::serviceViewRequests() {
                 undo_.execute(std::make_unique<editing::RemoveSendCommand>(
                     request.ownerId, request.send.id)); break;
             case Kind::AddBus:
-                undo_.execute(std::make_unique<editing::AddBusCommand>("Bus"));
+                undo_.execute(std::make_unique<editing::AddTrackCommand>("Bus", editing::AddTrackCommand::Flavour::Bus));
                 break;
             case Kind::RemoveBus:
-                undo_.execute(std::make_unique<editing::RemoveBusCommand>(
+                undo_.execute(std::make_unique<editing::RemoveTrackCommand>(
                     request.ownerId)); break;
         }
     }
@@ -3179,7 +3254,7 @@ void DaveApp::drawPluginBrowser() {
                                 browserTargetTrackId_, slot));
                         break;
                     case BrowserMode::MidiFx:
-                        undo_.execute(std::make_unique<editing::AddMidiPluginCommand>(
+                        undo_.execute(std::make_unique<editing::AddPluginCommand>(
                             browserTargetTrackId_, slot));
                         break;
                 }

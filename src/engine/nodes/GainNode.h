@@ -75,16 +75,24 @@ public:
         currentPan_ = targetPan_.load(std::memory_order_relaxed);
         meterSampleRate_ = std::isfinite(sampleRate) && sampleRate > 0.0
             ? static_cast<float>(sampleRate) : 48000.0f;
-        for (auto& meter : meters_) {
+        for (auto* bank : {&meters_, &preMeters_}) {
+        for (auto& meter : *bank) {
             meter.peak.store(0.0f, std::memory_order_relaxed);
             meter.rms.store(0.0f, std::memory_order_relaxed);
             meter.clipped.store(0, std::memory_order_relaxed);
         }
+        }
     }
 
-    [[nodiscard]] MeterSnapshot meter(int channel) const noexcept {
+    // `preFader` reads the signal as it arrived, before gain, pan and
+    // automation — what the source is actually delivering, independent of how
+    // the track is currently balanced.
+    [[nodiscard]] MeterSnapshot meter(int channel,
+                                      bool preFader = false) const noexcept {
         if (channel < 0 || channel >= static_cast<int>(meters_.size())) return {};
-        const auto& state = meters_[static_cast<size_t>(channel)];
+        const auto& state = preFader
+            ? preMeters_[static_cast<size_t>(channel)]
+            : meters_[static_cast<size_t>(channel)];
         return {state.peak.load(std::memory_order_relaxed),
                 state.rms.load(std::memory_order_relaxed),
                 state.clipped.load(std::memory_order_acquire) != 0};
@@ -92,6 +100,9 @@ public:
 
     void clearMeterClips() noexcept {
         for (auto& meter : meters_) {
+            meter.clipped.store(0, std::memory_order_release);
+        }
+        for (auto& meter : preMeters_) {
             meter.clipped.store(0, std::memory_order_release);
         }
     }
@@ -107,6 +118,12 @@ public:
         std::array<float, 2> blockPeak{};
         std::array<double, 2> squareSum{};
         std::array<bool, 2> blockClipped{};
+        // The pre-fader tap costs one extra max and one multiply-add per
+        // sample. Publishing both every block means switching the meter's
+        // source is a UI decision with no round trip to the audio thread.
+        std::array<float, 2> preBlockPeak{};
+        std::array<double, 2> preSquareSum{};
+        std::array<bool, 2> preBlockClipped{};
         const int64_t blockStart = ctx.time != nullptr ? ctx.time->samplePos : 0;
         size_t nextAutomation = static_cast<size_t>(std::lower_bound(
             automation_.begin(), automation_.end(), blockStart,
@@ -176,6 +193,12 @@ public:
             double lGain = effectiveGain * std::cos(angle);
             double rGain = effectiveGain * std::sin(angle);
             if (chans >= 2) {
+                accumulateMeterSample(0, ctx.inputs[0].channels[0][i],
+                                      preBlockPeak, preSquareSum,
+                                      preBlockClipped);
+                accumulateMeterSample(1, ctx.inputs[0].channels[1][i],
+                                      preBlockPeak, preSquareSum,
+                                      preBlockClipped);
                 const float left = static_cast<float>(
                     ctx.inputs[0].channels[0][i] * lGain);
                 const float right = static_cast<float>(
@@ -187,6 +210,9 @@ public:
                 accumulateMeterSample(1, right, blockPeak, squareSum,
                                       blockClipped);
             } else if (chans == 1) {
+                accumulateMeterSample(0, ctx.inputs[0].channels[0][i],
+                                      preBlockPeak, preSquareSum,
+                                      preBlockClipped);
                 const float mono = static_cast<float>(
                     ctx.inputs[0].channels[0][i] * effectiveGain);
                 ctx.output.channels[0][i] = mono;
@@ -194,7 +220,9 @@ public:
                                       blockClipped);
             }
         }
-        publishMeters(n, chans, blockPeak, squareSum, blockClipped);
+        publishMeters(n, chans, blockPeak, squareSum, blockClipped, meters_);
+        publishMeters(n, chans, preBlockPeak, preSquareSum, preBlockClipped,
+                      preMeters_);
         currentGain_ = g;
         currentPan_ = p;
     }
@@ -225,7 +253,8 @@ private:
     void publishMeters(
         int frames, int channels, const std::array<float, 2>& blockPeak,
         const std::array<double, 2>& squareSum,
-        const std::array<bool, 2>& blockClipped) noexcept {
+        const std::array<bool, 2>& blockClipped,
+        std::array<MeterState, 2>& target) noexcept {
         if (frames <= 0) return;
         constexpr float peakDecaySeconds = 0.75f;
         constexpr float rmsDecaySeconds = 0.30f;
@@ -235,13 +264,13 @@ private:
         const float rmsRelease = std::max(
             0.0f, 1.0f - static_cast<float>(frames) /
                 (meterSampleRate_ * rmsDecaySeconds));
-        for (size_t channel = 0; channel < meters_.size(); ++channel) {
+        for (size_t channel = 0; channel < target.size(); ++channel) {
             const bool active = static_cast<int>(channel) < channels;
             const float blockRms = active
                 ? static_cast<float>(std::sqrt(
                       squareSum[channel] / static_cast<double>(frames)))
                 : 0.0f;
-            auto& state = meters_[channel];
+            auto& state = target[channel];
             const float releasedPeak =
                 state.peak.load(std::memory_order_relaxed) * peakRelease;
             const float releasedRms =
@@ -269,6 +298,7 @@ private:
     std::vector<AutomationPoint> automation_;
     std::vector<PanAutomationPoint> panAutomation_;
     std::array<MeterState, 2> meters_{};
+    std::array<MeterState, 2> preMeters_{};
     float meterSampleRate_ = 48000.0f;
     double currentGain_ = 1.0;
     double currentPan_ = 0.0;

@@ -30,7 +30,7 @@ std::vector<RoutingTargetOption> routingTargetOptions(
         appendOption(options, edit, ownerId,
                      RoutingTargetOption::Group::MainAndBuses, "None",
                      document::RouteTarget::none(), forSend);
-        for (const auto& bus : edit.buses()) {
+        for (const auto& bus : edit.tracks()) {
             appendOption(options, edit, ownerId,
                          RoutingTargetOption::Group::MainAndBuses, bus.name,
                          document::RouteTarget::bus(bus.id), forSend);
@@ -70,7 +70,7 @@ std::string routeTargetLabel(const document::Edit& edit,
             return track ? track->name : "Missing audio track";
         }
         case document::RouteTarget::Kind::Bus: {
-            const auto* bus = edit.bus(target.targetId);
+            const auto* bus = edit.track(target.targetId);
             return bus ? bus->name : "Missing bus";
         }
         case document::RouteTarget::Kind::HardwareOutput: {

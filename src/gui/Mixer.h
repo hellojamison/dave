@@ -15,8 +15,6 @@
 
 namespace dave::gui {
 
-using TrackGainNodes =
-    std::unordered_map<std::string, std::shared_ptr<engine::GainNode>>;
 
 // Draw the mixer: one vertical strip per track, audio then MIDI, in the same
 // order as the timeline rows.

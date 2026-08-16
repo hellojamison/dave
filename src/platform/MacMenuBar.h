@@ -31,6 +31,7 @@ extern std::function<void()> g_menuReturnToStart;
 extern std::function<void()> g_menuToggleVideoWindow;
 extern std::function<void()> g_menuToggleIoPanel;
 extern std::function<void()> g_menuImportMidi;
+extern std::function<void()> g_menuOpenPreferences;
 extern std::function<void()> g_menuQuit;
 
 } // namespace dave::platform

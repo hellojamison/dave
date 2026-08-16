@@ -4,6 +4,7 @@
 #include "document/Edit.h"
 #include "editing/Command.h"
 #include "engine/transport/Transport.h"
+#include "gui/LevelMeter.h"
 #include "gui/RoutingViewModel.h"
 #include "gui/TransientNavigation.h"
 
@@ -11,12 +12,18 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_set>
 #include <unordered_map>
 #include <vector>
 
 namespace dave::gui {
+
+// Live gain nodes by track id, for meters. Declared here rather than in
+// Mixer.h because both the mixer and the timeline headers now need it.
+using TrackGainNodes =
+    std::unordered_map<std::string, std::shared_ptr<engine::GainNode>>;
 
 // Peak cache: min/max per "bucket" of samples, used to draw waveforms cheaply
 // at a given zoom level. Power-of-two levels form a bounded mip chain so zoom
@@ -111,8 +118,6 @@ struct TimelineViewState {
     bool isDragging(DragKind kind) const { return dragKind == kind; }
     // The MIDI track whose clip opened the context menu (selectedTrackIndex is
     // a row index across both bands, which the popup can't resolve on its own
-    // once the track list changes underneath it).
-    std::string contextMidiTrackId;
 
     // ─── Requests back to the application ──────────────────────────────────
     // Widgets draw into an existing window and can't open a modal or a
@@ -142,6 +147,10 @@ struct TimelineViewState {
     // When enabled, timeline edits snap to divisions expressed by the active
     // ruler format: frames for SMPTE/feet+frames, musical subdivisions for
     // bars|beats, round time values for min:sec, or round sample counts.
+    // Shared by every meter in the timeline and the mixer, so a bank of them
+    // can be compared at a glance. Persisted via EditorPreferences.
+    LevelMeterOptions meterOptions;
+    bool meterOptionsChanged = false;
     bool snapEnabled = false;
     // Timeline keyboard ownership is remembered from the previous frame so
     // the application can route Tab before the immediate-mode widget draws.
@@ -288,7 +297,11 @@ void drawTimeline(const document::Edit& edit,
                   // need more room, so this is a floor, not a guarantee.
                   float trackHeight = 58.0f,
                   float timelineHeight = 30.0f,
-                  const TransientSnapshotMap& transientAnalyses = {});
+                  const TransientSnapshotMap& transientAnalyses = {},
+                  // Live post-fader levels, keyed by track id. Null draws the
+                  // meters at silence rather than omitting them, so the header
+                  // keeps its shape whether or not a graph is live.
+                  const TrackGainNodes* gainNodes = nullptr);
 
 // Draw the marker lane (a strip above the track rows showing markers as flags
 // and regions). Returns the height it consumed (caller reserves that much

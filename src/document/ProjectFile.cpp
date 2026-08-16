@@ -271,13 +271,16 @@ static void readChannelRouting(const json& value, Channel& channel) {
 
 std::string serializeEdit(const Edit& edit) {
     json j;
-    j["format"] = "dave.doc/v3";
+    j["format"] = "dave.doc/v4";
     // The session's own format, not a constant: sample positions in this
     // document are only meaningful against the rate that produced them.
     j["sampleRate"] = edit.sampleRate();
     j["bitDepth"] = edit.bitDepth();
 
-    // Tracks (audio + clips + plugins).
+    // One tracks array. What used to be three — audio tracks, MIDI tracks and
+    // buses — are one type now, so a row carries whichever of audio clips,
+    // MIDI clips and an instrument it happens to have. Row order is the
+    // document's; Main is last.
     json tracks = json::array();
     for (const auto& t : edit.tracks()) {
         json jt;
@@ -288,105 +291,67 @@ std::string serializeEdit(const Edit& edit) {
         jt["pan"] = t.pan;
         jt["mute"] = t.mute;
         jt["solo"] = t.solo;
+        jt["isMain"] = t.isMain;
         jt["recordArm"] = t.recordArm;
         jt["inputChannel"] = t.inputChannel;
         jt["inputChannelCount"] = t.inputChannelCount;
         jt["hardwareInput"] = {
-            // inputChannel/inputChannelCount remain a compatibility surface
-            // during the v1->v2 transition. All new mutators synchronize the
-            // pair, and preferring them here preserves older callers too.
+            // inputChannel/inputChannelCount remain a compatibility surface.
+            // All mutators keep the pair in step, and preferring them here
+            // preserves callers that only set the older fields.
             {"firstChannel", t.inputChannel},
             {"channelCount", t.inputChannelCount},
         };
         jt["inputMonitor"] = t.inputMonitor;
         writeChannelRouting(jt, t);
+
         json clips = json::array();
         for (const auto& c : t.clips) {
-            clips.push_back({
-                {"id", c.id},
-                {"asset", c.asset.sha256},
-                {"timelineStart", c.timelineStart},
-                {"sourceOffset", c.sourceOffset},
-                {"length", c.length},
-                {"gain", c.gain},
-                {"fadeIn", c.fadeIn},
-                {"fadeOut", c.fadeOut},
-            });
+            clips.push_back({{"id", c.id},
+                             {"asset", c.asset.sha256},
+                             {"timelineStart", c.timelineStart},
+                             {"sourceOffset", c.sourceOffset},
+                             {"length", c.length},
+                             {"gain", c.gain},
+                             {"fadeIn", c.fadeIn},
+                             {"fadeOut", c.fadeOut}});
         }
-        jt["clips"] = clips;
-        json plugins = json::array();
-        for (const auto& p : t.plugins) plugins.push_back(pluginSlotToJson(p));
-        jt["plugins"] = plugins;
-        tracks.push_back(jt);
-    }
-    j["tracks"] = tracks;
+        jt["clips"] = std::move(clips);
 
-    // MIDI tracks (RB-7). Notes are written as fixed 5-element arrays rather
-    // than objects: a few bars of piano is thousands of notes, and
-    // {"startSample":...,"lengthSamples":...} per note turns a small project
-    // into a megabyte of key names. The order is the MidiNote field order.
-    json midiTracks = json::array();
-    for (const auto& mt : edit.midiTracks()) {
-        json jmt;
-        jmt["id"] = mt.id;
-        jmt["name"] = mt.name;
-        jmt["color"] = mt.color;
-        jmt["gain"] = mt.gain;
-        jmt["pan"] = mt.pan;
-        jmt["mute"] = mt.mute;
-        jmt["solo"] = mt.solo;
-        writeChannelRouting(jmt, mt);
-        jmt["instrument"] = pluginSlotToJson(mt.instrument);
-        json mclips = json::array();
-        for (const auto& c : mt.clips) {
+        // Notes and tempi stay positional arrays: object keys per note turn a
+        // small project into a megabyte of field names.
+        json midiClips = json::array();
+        for (const auto& c : t.midiClips) {
             json notes = json::array();
             for (const auto& n : c.notes) {
-                notes.push_back(json::array({n.startSample, n.lengthSamples,
-                                             n.pitch, n.velocity, n.channel}));
+                notes.push_back({n.startSample, n.lengthSamples, n.pitch,
+                                 n.velocity, n.channel});
             }
             json tempi = json::array();
-            for (const auto& t : c.sourceTempi) {
-                tempi.push_back(json::array({t.tick, t.microsecondsPerQuarter}));
+            for (const auto& tempo : c.sourceTempi) {
+                tempi.push_back({tempo.tick, tempo.microsecondsPerQuarter});
             }
-            mclips.push_back({
-                {"id", c.id},
-                {"name", c.name},
-                {"timelineStart", c.timelineStart},
-                {"sourceOffset", c.sourceOffset},
-                {"length", c.length},
-                {"notes", notes},
-                {"sourcePath", c.sourcePath},
-                {"sourcePpq", c.sourcePpq},
-                {"sourceTempi", tempi},
-            });
+            midiClips.push_back({{"id", c.id},
+                                 {"name", c.name},
+                                 {"timelineStart", c.timelineStart},
+                                 {"sourceOffset", c.sourceOffset},
+                                 {"length", c.length},
+                                 {"notes", std::move(notes)},
+                                 {"sourcePath", c.sourcePath},
+                                 {"sourcePpq", c.sourcePpq},
+                                 {"sourceTempi", std::move(tempi)}});
         }
-        jmt["clips"] = mclips;
-        json mplugins = json::array();
-        for (const auto& p : mt.plugins) mplugins.push_back(pluginSlotToJson(p));
-        jmt["plugins"] = mplugins;
-        midiTracks.push_back(jmt);
-    }
-    j["midiTracks"] = midiTracks;
+        jt["midiClips"] = std::move(midiClips);
+        jt["instrument"] = pluginSlotToJson(t.instrument);
 
-    json buses = json::array();
-    for (const auto& bus : edit.buses()) {
-        json jb{{"id", bus.id},
-                {"name", bus.name},
-                {"color", bus.color},
-                {"gain", bus.gain},
-                {"pan", bus.pan},
-                {"mute", bus.mute},
-                {"solo", bus.solo},
-                {"isMain", bus.isMain}};
-        writeChannelRouting(jb, bus);
         json plugins = json::array();
-        for (const auto& plugin : bus.plugins) {
+        for (const auto& plugin : t.plugins) {
             plugins.push_back(pluginSlotToJson(plugin));
         }
-        jb["plugins"] = std::move(plugins);
-        buses.push_back(std::move(jb));
+        jt["plugins"] = std::move(plugins);
+        tracks.push_back(std::move(jt));
     }
-    j["buses"] = std::move(buses);
+    j["tracks"] = std::move(tracks);
 
     // Assets.
     json assets = json::array();
@@ -460,6 +425,44 @@ std::string serializeEdit(const Edit& edit) {
 
 // ─── Deserialize ────────────────────────────────────────────────────────────
 
+// One MIDI clip. Shared by the v4 track reader and the v1..v3 migration so a
+// clip cannot parse differently depending on which shape carried it.
+MidiClip readMidiClip(const json& jc) {
+    MidiClip c;
+    c.id = jc.value("id", "");
+    c.name = jc.value("name", "");
+    c.timelineStart = jc.value("timelineStart", int64_t(0));
+    c.sourceOffset = jc.value("sourceOffset", int64_t(0));
+    c.length = jc.value("length", int64_t(0));
+    c.sourcePath = jc.value("sourcePath", "");
+    c.sourcePpq = jc.value("sourcePpq", 480);
+    if (jc.contains("notes")) {
+        for (const auto& jn : jc["notes"]) {
+            // Skip anything that isn't a well-formed 5-tuple
+            // rather than throwing: one bad note shouldn't cost
+            // the user the whole project.
+            if (!jn.is_array() || jn.size() < 5) continue;
+            MidiNote n;
+            n.startSample = jn[0].get<int64_t>();
+            n.lengthSamples = jn[1].get<int64_t>();
+            n.pitch = static_cast<uint8_t>(jn[2].get<int>() & 0x7F);
+            n.velocity = static_cast<uint8_t>(jn[3].get<int>() & 0x7F);
+            n.channel = static_cast<uint8_t>(jn[4].get<int>() & 0x0F);
+            c.notes.push_back(n);
+        }
+    }
+    if (jc.contains("sourceTempi")) {
+        for (const auto& jt2 : jc["sourceTempi"]) {
+            if (!jt2.is_array() || jt2.size() < 2) continue;
+            TempoEvent te;
+            te.tick = jt2[0].get<int64_t>();
+            te.microsecondsPerQuarter = jt2[1].get<int32_t>();
+            c.sourceTempi.push_back(te);
+        }
+    }
+    return c;
+}
+
 ProjectResult deserializeEdit(const std::string& text, Edit& edit) {
     json j;
     try {
@@ -469,9 +472,14 @@ ProjectResult deserializeEdit(const std::string& text, Edit& edit) {
     }
     const std::string format = j.value("format", "");
     const bool legacyV1 = format == "dave.doc/v1";
-    if (!legacyV1 && format != "dave.doc/v2" && format != "dave.doc/v3") {
+    // v1..v3 stored three arrays — tracks, midiTracks, buses. v4 stores one.
+    // The old shapes are folded into the single list in that order so an
+    // existing session opens with its rows exactly where the user left them.
+    const bool splitBands = legacyV1 || format == "dave.doc/v2" ||
+                            format == "dave.doc/v3";
+    if (!splitBands && format != "dave.doc/v4") {
         return {false,
-                "not a supported dave.doc project (expected v1, v2, or v3)"};
+                "not a supported dave.doc project (expected v1 through v4)"};
     }
 
     // Projects written before the session format was configurable carry no
@@ -484,7 +492,7 @@ ProjectResult deserializeEdit(const std::string& text, Edit& edit) {
     // suppress by direct field access via the mut- accessors.
     auto& tracks = edit.tracksMut();
     tracks.clear();
-    if (j.contains("tracks")) {
+    if (j.contains("tracks") && j["tracks"].is_array()) {
         for (const auto& jt : j["tracks"]) {
             Track t;
             t.id = jt.value("id", "");
@@ -531,6 +539,20 @@ ProjectResult deserializeEdit(const std::string& text, Edit& edit) {
                     t.clips.push_back(std::move(c));
                 }
             }
+            // v4 rows carry whatever content they have. In v1..v3 these keys
+            // are simply absent and the MIDI band is folded in below.
+            if (jt.contains("midiClips")) {
+                for (const auto& jc : jt["midiClips"]) {
+                    t.midiClips.push_back(readMidiClip(jc));
+                }
+            }
+            if (jt.contains("instrument")) {
+                t.instrument = pluginSlotFromJson(jt["instrument"]);
+            }
+            // isMain is derived from the id rather than trusted: a file
+            // claiming a second Main would give the document two permanent
+            // channels it can never remove.
+            t.isMain = t.id == kMainBusId && jt.value("isMain", true);
             if (jt.contains("plugins")) {
                 for (const auto& jp : jt["plugins"]) {
                     t.plugins.push_back(pluginSlotFromJson(jp));
@@ -540,10 +562,9 @@ ProjectResult deserializeEdit(const std::string& text, Edit& edit) {
         }
     }
 
-    // MIDI tracks (RB-7). Guarded by contains() like every other section, so a
-    // project written before MIDI existed loads unchanged.
-    edit.clearMidiTracks_();
-    if (j.contains("midiTracks")) {
+    // v1..v3 migration: the MIDI band appends after the audio band, so rows
+    // land in the order the user saw them. v4 has no such array.
+    if (splitBands && j.contains("midiTracks") && j["midiTracks"].is_array()) {
         for (const auto& jmt : j["midiTracks"]) {
             MidiTrack mt;
             mt.id = jmt.value("id", "");
@@ -560,52 +581,16 @@ ProjectResult deserializeEdit(const std::string& text, Edit& edit) {
             }
             if (jmt.contains("clips")) {
                 for (const auto& jc : jmt["clips"]) {
-                    MidiClip c;
-                    c.id = jc.value("id", "");
-                    c.name = jc.value("name", "");
-                    c.timelineStart = jc.value("timelineStart", int64_t(0));
-                    c.sourceOffset = jc.value("sourceOffset", int64_t(0));
-                    c.length = jc.value("length", int64_t(0));
-                    c.sourcePath = jc.value("sourcePath", "");
-                    c.sourcePpq = jc.value("sourcePpq", 480);
-                    if (jc.contains("notes")) {
-                        for (const auto& jn : jc["notes"]) {
-                            // Skip anything that isn't a well-formed 5-tuple
-                            // rather than throwing: one bad note shouldn't cost
-                            // the user the whole project.
-                            if (!jn.is_array() || jn.size() < 5) continue;
-                            MidiNote n;
-                            n.startSample = jn[0].get<int64_t>();
-                            n.lengthSamples = jn[1].get<int64_t>();
-                            n.pitch = static_cast<uint8_t>(jn[2].get<int>() & 0x7F);
-                            n.velocity = static_cast<uint8_t>(jn[3].get<int>() & 0x7F);
-                            n.channel = static_cast<uint8_t>(jn[4].get<int>() & 0x0F);
-                            c.notes.push_back(n);
-                        }
-                    }
-                    if (jc.contains("sourceTempi")) {
-                        for (const auto& jt2 : jc["sourceTempi"]) {
-                            if (!jt2.is_array() || jt2.size() < 2) continue;
-                            TempoEvent te;
-                            te.tick = jt2[0].get<int64_t>();
-                            te.microsecondsPerQuarter = jt2[1].get<int32_t>();
-                            c.sourceTempi.push_back(te);
-                        }
-                    }
-                    mt.clips.push_back(std::move(c));
+                    mt.midiClips.push_back(readMidiClip(jc));
                 }
             }
-            if (jmt.contains("plugins")) {
-                for (const auto& jp : jmt["plugins"]) {
-                    mt.plugins.push_back(pluginSlotFromJson(jp));
-                }
-            }
-            edit.loadMidiTrack_(std::move(mt));
+            edit.loadTrack_(std::move(mt));
         }
     }
 
-    edit.clearBuses_();
-    if (!legacyV1 && j.contains("buses") && j["buses"].is_array()) {
+    // v1..v3 migration: buses append last, ahead of ensureMainBus_ below.
+    if (splitBands && !legacyV1 && j.contains("buses") &&
+        j["buses"].is_array()) {
         for (const auto& jb : j["buses"]) {
             BusTrack bus;
             bus.id = jb.value("id", "");
@@ -618,12 +603,18 @@ ProjectResult deserializeEdit(const std::string& text, Edit& edit) {
             bus.solo = jb.value("solo", false);
             bus.isMain = bus.id == kMainBusId && jb.value("isMain", true);
             readChannelRouting(jb, bus);
+            // readChannelRouting defaults every channel to Main. For a bus
+            // whose JSON omitted mainOutput that is wrong twice over — Main
+            // would route to itself — so the hardware default is reapplied.
+            if (bus.isMain && !jb.contains("mainOutput")) {
+                bus.mainOutput = RouteTarget::hardwareOutput(0, 2);
+            }
             if (jb.contains("plugins")) {
                 for (const auto& plugin : jb["plugins"]) {
                     bus.plugins.push_back(pluginSlotFromJson(plugin));
                 }
             }
-            edit.loadBus_(std::move(bus));
+            edit.loadTrack_(std::move(bus));
         }
     }
     edit.ensureMainBus_();

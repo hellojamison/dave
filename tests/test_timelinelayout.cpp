@@ -19,12 +19,37 @@
 #include <unordered_map>
 #include <vector>
 
+namespace {
+// Main is a row in the one track list now, so a test asking "how many tracks
+// did I make?" has to say so. Counting user rows keeps the intent visible
+// rather than burying a +1 in every expectation.
+inline size_t userTracks(const dave::document::Edit& e) {
+    size_t n = 0;
+    for (const auto& t : e.tracks()) if (!t.isMain) ++n;
+    return n;
+}
+} // namespace
+
 using namespace dave;
 using dave::testing::ImGuiRig;
 
 namespace {
 
 constexpr float kTrackHeight = 58.0f;
+// Automation tool buttons, derived the way Timeline.cpp derives them: the
+// gutter content origin (colour band + level meter), then the 112 px parameter
+// combo, then three 24 px buttons 4 px apart. Kept in one place because five
+// tests depend on it and a layout change used to break all of them separately.
+// Gutter columns, mirroring Timeline.cpp: level meter, then the colour band
+// with its disclosure arrow, then the controls. Named because eleven tests
+// click the band and every one of them used to carry the same magic number.
+constexpr float kMeterCenterX = 16.0f;
+constexpr float kBandCenterX = 39.0f;
+constexpr float kGutterContentX = 54.0f;
+constexpr float kAutomationToolsLeft = kGutterContentX - 4.0f + 112.0f + 8.0f;
+constexpr float automationToolCenter(int index) {
+    return kAutomationToolsLeft + static_cast<float>(index) * 28.0f + 12.0f;
+}
 constexpr float kGutterWidth = 260.0f;
 constexpr float kRulerHeight = 30.0f;
 constexpr float kMarkerLaneHeight = 28.0f;
@@ -171,11 +196,11 @@ TEST_CASE("the add-track + sits above the topmost track", "[timelinelayout]") {
     rig.clickTimelineAt(rig.origin.x + 20.0f,
                         rig.origin.y + kRulerHeight * 0.5f);
 
-    REQUIRE(rig.edit.tracks().size() == 2);
+    REQUIRE(userTracks(rig.edit) == 2);
     // And it goes through the undo stack rather than mutating the edit.
     CHECK(rig.undo.canUndo());
     rig.undo.undo();
-    CHECK(rig.edit.tracks().size() == 1);
+    CHECK(userTracks(rig.edit) == 1);
 }
 
 TEST_CASE("clicking below the last track no longer adds one",
@@ -192,7 +217,7 @@ TEST_CASE("clicking below the last track no longer adds one",
                               kTrackHeight + 20.0f;
     rig.clickTimelineAt(rig.origin.x + kGutterWidth + 200.0f, belowTracks);
 
-    CHECK(rig.edit.tracks().size() == 1);
+    CHECK(userTracks(rig.edit) == 1);
     CHECK_FALSE(rig.undo.canUndo());
 }
 
@@ -879,7 +904,7 @@ TEST_CASE("the track colour band toggles the disclosure state",
 
     const float tracksTop = rig.origin.y + kRulerHeight + kMarkerLaneHeight;
     // The band sits 8 px in from the gutter's left edge and is 18 px wide.
-    const float bandX = rig.origin.x + 17.0f;
+    const float bandX = rig.origin.x + kBandCenterX;
 
     CHECK(rig.view.expandedTracks.empty());
 
@@ -899,7 +924,7 @@ TEST_CASE("the track colour band toggles the disclosure state",
 
 TEST_CASE("track disclosures open editable volume automation lanes",
           "[timelinelayout][automation]") {
-    constexpr float bandInsetX = 17.0f;
+    constexpr float bandInsetX = kBandCenterX;
     constexpr float laneClickOffsetX = 180.0f;
 
     SECTION("audio track") {
@@ -943,7 +968,7 @@ TEST_CASE("track disclosures open editable volume automation lanes",
         rig.clickTimelineAt(
             rig.origin.x + kGutterWidth + laneClickOffsetX,
             tracksTop + midiHeight + kAutomationLaneHeight * 0.5f);
-        REQUIRE(rig.edit.midiTrack(midi)->volumeAutomation.size() == 2);
+        REQUIRE(rig.edit.track(midi)->volumeAutomation.size() == 2);
     }
 
     SECTION("user bus and Main") {
@@ -960,7 +985,7 @@ TEST_CASE("track disclosures open editable volume automation lanes",
         rig.clickTimelineAt(
             rig.origin.x + kGutterWidth + laneClickOffsetX,
             tracksTop + kTrackHeight + kAutomationLaneHeight * 0.5f);
-        REQUIRE(rig.edit.bus(bus)->volumeAutomation.size() == 2);
+        REQUIRE(rig.edit.track(bus)->volumeAutomation.size() == 2);
 
         const float mainTop =
             tracksTop + kTrackHeight + kAutomationLaneHeight;
@@ -983,18 +1008,22 @@ TEST_CASE("automation lane toggles between pencil line and curve tools",
     const float tracksTop =
         rig.origin.y + kRulerHeight + kMarkerLaneHeight;
     const float automationTop = tracksTop + effectiveTrackHeight();
-    rig.clickTimelineAt(rig.origin.x + 17.0f,
+    rig.clickTimelineAt(rig.origin.x + kBandCenterX,
                         tracksTop + kTrackHeight * 0.5f);
     REQUIRE(rig.view.expandedTracks.contains(track));
     REQUIRE(rig.view.automationTool == gui::AutomationTool::Pencil);
 
-    // Parameter selector occupies x=28..140. The three 24 px tool buttons sit
-    // immediately to its right: Pencil, Line, then Curve.
-    rig.clickTimelineAt(rig.origin.x + 192.0f, automationTop + 16.0f);
+    // The gutter content starts at 57 (colour band, then the level meter), so
+    // the 112 px parameter selector runs 53..165 and the three 24 px tool
+    // buttons follow at 173, 201, 229: Pencil, Line, then Curve.
+    rig.clickTimelineAt(rig.origin.x + automationToolCenter(1),
+                        automationTop + 16.0f);
     CHECK(rig.view.automationTool == gui::AutomationTool::Line);
-    rig.clickTimelineAt(rig.origin.x + 216.0f, automationTop + 16.0f);
+    rig.clickTimelineAt(rig.origin.x + automationToolCenter(2),
+                        automationTop + 16.0f);
     CHECK(rig.view.automationTool == gui::AutomationTool::Curve);
-    rig.clickTimelineAt(rig.origin.x + 160.0f, automationTop + 16.0f);
+    rig.clickTimelineAt(rig.origin.x + automationToolCenter(0),
+                        automationTop + 16.0f);
     CHECK(rig.view.automationTool == gui::AutomationTool::Pencil);
     CHECK_FALSE(rig.undo.canUndo());
 }
@@ -1008,7 +1037,7 @@ TEST_CASE("pencil tool uses its pencil as the automation lane cursor",
     const float tracksTop =
         rig.origin.y + kRulerHeight + kMarkerLaneHeight;
     const float automationTop = tracksTop + effectiveTrackHeight();
-    rig.clickTimelineAt(rig.origin.x + 17.0f,
+    rig.clickTimelineAt(rig.origin.x + kBandCenterX,
                         tracksTop + kTrackHeight * 0.5f);
     REQUIRE(rig.view.expandedTracks.contains(track));
 
@@ -1039,7 +1068,7 @@ TEST_CASE("pencil draws a thinned envelope as one undoable gesture",
     const float tracksTop =
         rig.origin.y + kRulerHeight + kMarkerLaneHeight;
     const float automationTop = tracksTop + effectiveTrackHeight();
-    rig.clickTimelineAt(rig.origin.x + 17.0f,
+    rig.clickTimelineAt(rig.origin.x + kBandCenterX,
                         tracksTop + kTrackHeight * 0.5f);
 
     auto volumeY = [&](double db) {
@@ -1111,9 +1140,10 @@ TEST_CASE("line tool replaces its range with one straight ramp",
     const float tracksTop =
         rig.origin.y + kRulerHeight + kMarkerLaneHeight;
     const float automationTop = tracksTop + effectiveTrackHeight();
-    rig.clickTimelineAt(rig.origin.x + 17.0f,
+    rig.clickTimelineAt(rig.origin.x + kBandCenterX,
                         tracksTop + kTrackHeight * 0.5f);
-    rig.clickTimelineAt(rig.origin.x + 192.0f, automationTop + 16.0f);
+    rig.clickTimelineAt(rig.origin.x + automationToolCenter(1),
+                        automationTop + 16.0f);
     REQUIRE(rig.view.automationTool == gui::AutomationTool::Line);
 
     auto volumeY = [&](double db) {
@@ -1164,9 +1194,10 @@ TEST_CASE("line tool draws pan automation with normalized values",
     const float tracksTop =
         rig.origin.y + kRulerHeight + kMarkerLaneHeight;
     const float automationTop = tracksTop + effectiveTrackHeight();
-    rig.clickTimelineAt(rig.origin.x + 17.0f,
+    rig.clickTimelineAt(rig.origin.x + kBandCenterX,
                         tracksTop + kTrackHeight * 0.5f);
-    rig.clickTimelineAt(rig.origin.x + 192.0f, automationTop + 16.0f);
+    rig.clickTimelineAt(rig.origin.x + automationToolCenter(1),
+                        automationTop + 16.0f);
     REQUIRE(rig.view.automationTool == gui::AutomationTool::Line);
 
     auto panY = [&](double pan) {
@@ -1203,9 +1234,10 @@ TEST_CASE("curve tool draws a parabolic ramp as one undoable gesture",
     const float tracksTop =
         rig.origin.y + kRulerHeight + kMarkerLaneHeight;
     const float automationTop = tracksTop + effectiveTrackHeight();
-    rig.clickTimelineAt(rig.origin.x + 17.0f,
+    rig.clickTimelineAt(rig.origin.x + kBandCenterX,
                         tracksTop + kTrackHeight * 0.5f);
-    rig.clickTimelineAt(rig.origin.x + 216.0f, automationTop + 16.0f);
+    rig.clickTimelineAt(rig.origin.x + automationToolCenter(2),
+                        automationTop + 16.0f);
     REQUIRE(rig.view.automationTool == gui::AutomationTool::Curve);
 
     auto volumeY = [&](double db) {
@@ -1258,9 +1290,10 @@ TEST_CASE("holding Option switches an active curve to logarithmic automation",
     const float tracksTop =
         rig.origin.y + kRulerHeight + kMarkerLaneHeight;
     const float automationTop = tracksTop + effectiveTrackHeight();
-    rig.clickTimelineAt(rig.origin.x + 17.0f,
+    rig.clickTimelineAt(rig.origin.x + kBandCenterX,
                         tracksTop + kTrackHeight * 0.5f);
-    rig.clickTimelineAt(rig.origin.x + 216.0f, automationTop + 16.0f);
+    rig.clickTimelineAt(rig.origin.x + automationToolCenter(2),
+                        automationTop + 16.0f);
     REQUIRE(rig.view.automationTool == gui::AutomationTool::Curve);
 
     auto panY = [&](double pan) {
@@ -1316,9 +1349,10 @@ TEST_CASE("holding Control reverses an active curve slope",
     const float tracksTop =
         rig.origin.y + kRulerHeight + kMarkerLaneHeight;
     const float automationTop = tracksTop + effectiveTrackHeight();
-    rig.clickTimelineAt(rig.origin.x + 17.0f,
+    rig.clickTimelineAt(rig.origin.x + kBandCenterX,
                         tracksTop + kTrackHeight * 0.5f);
-    rig.clickTimelineAt(rig.origin.x + 216.0f, automationTop + 16.0f);
+    rig.clickTimelineAt(rig.origin.x + automationToolCenter(2),
+                        automationTop + 16.0f);
     REQUIRE(rig.view.automationTool == gui::AutomationTool::Curve);
 
     auto volumeY = [&](double db) {
@@ -1375,7 +1409,7 @@ TEST_CASE("double-clicking an automation point opens an undoable dB editor",
 
     const float tracksTop =
         rig.origin.y + kRulerHeight + kMarkerLaneHeight;
-    rig.clickTimelineAt(rig.origin.x + 17.0f,
+    rig.clickTimelineAt(rig.origin.x + kBandCenterX,
                         tracksTop + kTrackHeight * 0.5f);
     REQUIRE(rig.view.expandedTracks.contains(track));
 
@@ -1428,7 +1462,7 @@ TEST_CASE("pan automation lane edits normalized pan with percent entry",
 
     const float tracksTop =
         rig.origin.y + kRulerHeight + kMarkerLaneHeight;
-    rig.clickTimelineAt(rig.origin.x + 17.0f,
+    rig.clickTimelineAt(rig.origin.x + kBandCenterX,
                         tracksTop + kTrackHeight * 0.5f);
     REQUIRE(rig.view.expandedTracks.contains(track));
 
@@ -1498,11 +1532,11 @@ TEST_CASE("timeline MIDI rows keep M at its pre-recording position",
     const float tracksTop = rig.origin.y + kRulerHeight + kMarkerLaneHeight;
     // The audio R position remains ordinary name space on MIDI.
     rig.clickTimelineAt(rig.origin.x + 189.5f, tracksTop + 14.5f);
-    CHECK_FALSE(rig.edit.midiTrack(midi)->mute);
+    CHECK_FALSE(rig.edit.track(midi)->mute);
     // M and S did not shift when audio gained R.
     rig.clickTimelineAt(rig.origin.x + 213.5f, tracksTop + 14.5f);
-    CHECK(rig.edit.midiTrack(midi)->mute);
-    CHECK_FALSE(rig.edit.midiTrack(midi)->solo);
+    CHECK(rig.edit.track(midi)->mute);
+    CHECK_FALSE(rig.edit.track(midi)->solo);
 }
 
 TEST_CASE("Option-clicking timeline pan and gain restores their defaults",

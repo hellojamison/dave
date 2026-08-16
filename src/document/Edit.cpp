@@ -20,22 +20,16 @@ namespace {
 
 RouteTarget* mainOutputFor(Edit& edit, const std::string& id) {
     if (auto* track = edit.track(id)) return &track->mainOutput;
-    if (auto* track = edit.midiTrack(id)) return &track->mainOutput;
-    if (auto* bus = edit.bus(id)) return &bus->mainOutput;
     return nullptr;
 }
 
 std::vector<AuxSend>* sendsFor(Edit& edit, const std::string& id) {
     if (auto* track = edit.track(id)) return &track->sends;
-    if (auto* track = edit.midiTrack(id)) return &track->sends;
-    if (auto* bus = edit.bus(id)) return &bus->sends;
     return nullptr;
 }
 
 const std::vector<AuxSend>* sendsFor(const Edit& edit, const std::string& id) {
     if (const auto* track = edit.track(id)) return &track->sends;
-    if (const auto* track = edit.midiTrack(id)) return &track->sends;
-    if (const auto* bus = edit.bus(id)) return &bus->sends;
     return nullptr;
 }
 
@@ -55,13 +49,13 @@ Edit::Edit() {
 }
 
 void Edit::ensureMainBus_() {
-    if (bus(kMainBusId) != nullptr) return;
+    if (track(kMainBusId) != nullptr) return;
     BusTrack main;
     main.id = kMainBusId;
     main.name = "Main";
     main.isMain = true;
     main.mainOutput = RouteTarget::hardwareOutput(0, 2);
-    buses_.push_back(std::move(main));
+    tracks_.push_back(std::move(main));
 }
 
 std::string Edit::newId(const char* prefix) const {
@@ -119,14 +113,22 @@ const AudioAsset* Edit::asset(const AssetId& id) const {
     return it == assets_.end() ? nullptr : &it->second;
 }
 
+// Main is the last row, always. Every creator inserts ahead of it, which is
+// the one ordering rule the single track list has.
+std::vector<Track>::iterator Edit::mainRow_() {
+    return std::find_if(tracks_.begin(), tracks_.end(),
+                        [](const Track& t) { return t.isMain; });
+}
+
 std::string Edit::addTrack(const std::string& name) {
     Track t;
     t.id = newId("track_");
     ++idCounter_;
     t.name = name.empty() ? "Track " + std::to_string(idCounter_) : name;
-    tracks_.push_back(std::move(t));
+    const std::string id = t.id;
+    tracks_.insert(mainRow_(), std::move(t));
     notifyChanged();
-    return tracks_.back().id;
+    return id;
 }
 
 Track* Edit::track(const std::string& id) {
@@ -140,9 +142,17 @@ const Track* Edit::track(const std::string& id) const {
 }
 
 bool Edit::removeTrack(const std::string& id) {
-    if (routeReferences(RouteTarget::Kind::AudioTrack, id)) return false;
+    // Main is permanent. Anything a route still points at stays too — this
+    // guard used to cover audio tracks and buses but not MIDI tracks, so
+    // deleting a MIDI track a send referenced left a dangling route.
+    if (id == kMainBusId) return false;
+    if (routeReferences(RouteTarget::Kind::AudioTrack, id) ||
+        routeReferences(RouteTarget::Kind::Bus, id)) {
+        return false;
+    }
     for (auto it = tracks_.begin(); it != tracks_.end(); ++it) {
         if (it->id == id) {
+            if (it->isMain) return false;
             tracks_.erase(it);
             notifyChanged();
             return true;
@@ -155,8 +165,6 @@ bool Edit::setTrackColor(const std::string& ownerId, std::string color) {
     if (!validTrackColor(color)) return false;
     std::string* destination = nullptr;
     if (auto* value = track(ownerId)) destination = &value->color;
-    else if (auto* value = midiTrack(ownerId)) destination = &value->color;
-    else if (auto* value = bus(ownerId)) destination = &value->color;
     if (destination == nullptr) return false;
     if (*destination == color) return true;
     *destination = std::move(color);
@@ -167,16 +175,12 @@ bool Edit::setTrackColor(const std::string& ownerId, std::string color) {
 std::vector<VolumeAutomationPoint>* Edit::volumeAutomation(
     const std::string& ownerId) {
     if (auto* value = track(ownerId)) return &value->volumeAutomation;
-    if (auto* value = midiTrack(ownerId)) return &value->volumeAutomation;
-    if (auto* value = bus(ownerId)) return &value->volumeAutomation;
     return nullptr;
 }
 
 const std::vector<VolumeAutomationPoint>* Edit::volumeAutomation(
     const std::string& ownerId) const {
     if (const auto* value = track(ownerId)) return &value->volumeAutomation;
-    if (const auto* value = midiTrack(ownerId)) return &value->volumeAutomation;
-    if (const auto* value = bus(ownerId)) return &value->volumeAutomation;
     return nullptr;
 }
 
@@ -307,16 +311,12 @@ bool Edit::replaceVolumeAutomation(
 std::vector<PanAutomationPoint>* Edit::panAutomation(
     const std::string& ownerId) {
     if (auto* value = track(ownerId)) return &value->panAutomation;
-    if (auto* value = midiTrack(ownerId)) return &value->panAutomation;
-    if (auto* value = bus(ownerId)) return &value->panAutomation;
     return nullptr;
 }
 
 const std::vector<PanAutomationPoint>* Edit::panAutomation(
     const std::string& ownerId) const {
     if (const auto* value = track(ownerId)) return &value->panAutomation;
-    if (const auto* value = midiTrack(ownerId)) return &value->panAutomation;
-    if (const auto* value = bus(ownerId)) return &value->panAutomation;
     return nullptr;
 }
 
@@ -491,7 +491,6 @@ bool Edit::removeClip(const std::string& trackId, const std::string& clipId) {
 std::string Edit::addPlugin(const std::string& trackId, PluginSlot slot) {
     std::vector<PluginSlot>* plugins = nullptr;
     if (Track* t = track(trackId)) plugins = &t->plugins;
-    else if (BusTrack* b = bus(trackId)) plugins = &b->plugins;
     if (plugins == nullptr) return "";
     slot.id = newId("plugin_");
     ++idCounter_;
@@ -503,7 +502,6 @@ std::string Edit::addPlugin(const std::string& trackId, PluginSlot slot) {
 bool Edit::removePlugin(const std::string& trackId, const std::string& slotId) {
     std::vector<PluginSlot>* plugins = nullptr;
     if (Track* t = track(trackId)) plugins = &t->plugins;
-    else if (BusTrack* b = bus(trackId)) plugins = &b->plugins;
     if (plugins == nullptr) return false;
     for (auto it = plugins->begin(); it != plugins->end(); ++it) {
         if (it->id == slotId) {
@@ -518,93 +516,50 @@ bool Edit::removePlugin(const std::string& trackId, const std::string& slotId) {
 // ─── MIDI tracks ────────────────────────────────────────────────────────────
 
 std::string Edit::addMidiTrack(const std::string& name) {
-    MidiTrack mt;
+    // Same object as any other track; only the id prefix and default name say
+    // what it was made for. Buses stay last, so a new row lands before Main.
+    Track mt;
     mt.id = newId("miditrack_");
     ++idCounter_;
-    mt.name = name.empty() ? ("MIDI " + std::to_string(idCounter_)) : name;
-    midiTracks_.push_back(std::move(mt));
-    notifyChanged();
-    return midiTracks_.back().id;
-}
-
-MidiTrack* Edit::midiTrack(const std::string& id) {
-    for (auto& mt : midiTracks_) if (mt.id == id) return &mt;
-    return nullptr;
-}
-
-const MidiTrack* Edit::midiTrack(const std::string& id) const {
-    for (const auto& mt : midiTracks_) if (mt.id == id) return &mt;
-    return nullptr;
-}
-
-bool Edit::removeMidiTrack(const std::string& id) {
-    for (auto it = midiTracks_.begin(); it != midiTracks_.end(); ++it) {
-        if (it->id == id) {
-            midiTracks_.erase(it);
-            notifyChanged();
-            return true;
-        }
-    }
-    return false;
-}
-
-// ─── Routing and buses ─────────────────────────────────────────────────────
-
-BusTrack* Edit::bus(const std::string& id) {
-    for (auto& candidate : buses_) if (candidate.id == id) return &candidate;
-    return nullptr;
-}
-
-const BusTrack* Edit::bus(const std::string& id) const {
-    for (const auto& candidate : buses_) if (candidate.id == id) return &candidate;
-    return nullptr;
-}
-
-std::string Edit::addBus(const std::string& name) {
-    BusTrack candidate;
-    do {
-        candidate.id = newId("bus_");
-        ++idCounter_;
-    } while (bus(candidate.id) || track(candidate.id) || midiTrack(candidate.id));
-    candidate.name = name.empty() ? "Bus " + std::to_string(idCounter_) : name;
-    candidate.mainOutput = RouteTarget::bus();
-    const std::string id = candidate.id;
-    auto main = std::find_if(buses_.begin(), buses_.end(), [](const BusTrack& bus) {
-        return bus.id == kMainBusId;
-    });
-    buses_.insert(main, std::move(candidate));
+    mt.name = name.empty() ? "MIDI " + std::to_string(idCounter_) : name;
+    const std::string id = mt.id;
+    tracks_.insert(mainRow_(), std::move(mt));
     notifyChanged();
     return id;
 }
 
-bool Edit::restoreBus_(BusTrack restored, size_t index) {
-    if (restored.id.empty() || restored.id == kMainBusId || bus(restored.id)) {
-        return false;
+std::string Edit::addBus(const std::string& name) {
+    Track candidate;
+    do {
+        candidate.id = newId("bus_");
+        ++idCounter_;
+    } while (track(candidate.id));
+    candidate.name = name.empty() ? "Bus " + std::to_string(idCounter_) : name;
+    candidate.mainOutput = RouteTarget::bus();
+    const std::string id = candidate.id;
+    tracks_.insert(mainRow_(), std::move(candidate));
+    notifyChanged();
+    return id;
+}
+
+bool Edit::restoreTrack_(Track restored, size_t index) {
+    if (restored.id.empty() || restored.isMain) return false;
+    if (track(restored.id)) return false;
+    // Main is pinned last, so a restore can never land after it.
+    size_t mainIndex = tracks_.size();
+    for (size_t i = 0; i < tracks_.size(); ++i) {
+        if (tracks_[i].isMain) { mainIndex = i; break; }
     }
-    const size_t mainIndex = buses_.empty() ? 0 : buses_.size() - 1;
-    const size_t at = std::min(index, mainIndex);
-    buses_.insert(buses_.begin() + static_cast<ptrdiff_t>(at),
-                  std::move(restored));
+    index = std::min(index, mainIndex);
+    tracks_.insert(tracks_.begin() + static_cast<ptrdiff_t>(index),
+                   std::move(restored));
     const auto validation = validateRouting();
     if (!validation.ok) {
-        buses_.erase(buses_.begin() + static_cast<ptrdiff_t>(at));
+        tracks_.erase(tracks_.begin() + static_cast<ptrdiff_t>(index));
         return false;
     }
     notifyChanged();
     return true;
-}
-
-bool Edit::removeBus(const std::string& id) {
-    if (id == kMainBusId || routeReferences(RouteTarget::Kind::Bus, id)) {
-        return false;
-    }
-    for (auto it = buses_.begin(); it != buses_.end(); ++it) {
-        if (it->id != id) continue;
-        buses_.erase(it);
-        notifyChanged();
-        return true;
-    }
-    return false;
 }
 
 bool Edit::routeReferences(RouteTarget::Kind kind, const std::string& id) const {
@@ -617,8 +572,6 @@ bool Edit::routeReferences(RouteTarget::Kind kind, const std::string& id) const 
                            [&](const AuxSend& send) { return references(send.target); });
     };
     for (const auto& track : tracks_) if (channelReferences(track)) return true;
-    for (const auto& track : midiTracks_) if (channelReferences(track)) return true;
-    for (const auto& candidate : buses_) if (channelReferences(candidate)) return true;
     return false;
 }
 
@@ -629,8 +582,12 @@ Edit::RoutingValidation Edit::validateRouting() const {
     std::vector<std::string> owners;
     for (const auto& track : tracks_) {
         if (track.id.empty() || !audioIds.insert(track.id).second) {
-            return {false, "audio track has an empty or duplicate id"};
+            return {false, "track has an empty or duplicate id"};
         }
+        // One track list, so a route naming this channel resolves whether it
+        // was stored as an AudioTrack target or a Bus target. Older documents
+        // contain both spellings for what is now the same thing.
+        busIds.insert(track.id);
         if (!allOwnerIds.insert(track.id).second) {
             return {false, "routing owner ids must be globally unique"};
         }
@@ -638,21 +595,6 @@ Edit::RoutingValidation Edit::validateRouting() const {
         if (!validHardwareSpan(track.hardwareInput, false)) {
             return {false, "audio track has an invalid hardware input span"};
         }
-    }
-    for (const auto& track : midiTracks_) {
-        if (track.id.empty() || !allOwnerIds.insert(track.id).second) {
-            return {false, "MIDI track has an empty or duplicate id"};
-        }
-        owners.push_back(track.id);
-    }
-    for (const auto& candidate : buses_) {
-        if (candidate.id.empty() || !busIds.insert(candidate.id).second) {
-            return {false, "bus has an empty or duplicate id"};
-        }
-        if (!allOwnerIds.insert(candidate.id).second) {
-            return {false, "routing owner ids must be globally unique"};
-        }
-        owners.push_back(candidate.id);
     }
     const auto* main = mainBus();
     if (!main || !main->isMain) return {false, "permanent Main bus is missing"};
@@ -706,12 +648,6 @@ Edit::RoutingValidation Edit::validateRouting() const {
     };
     for (const auto& track : tracks_) {
         auto result = checkChannel(track); if (!result.ok) return result;
-    }
-    for (const auto& track : midiTracks_) {
-        auto result = checkChannel(track); if (!result.ok) return result;
-    }
-    for (const auto& candidate : buses_) {
-        auto result = checkChannel(candidate); if (!result.ok) return result;
     }
 
     enum class Mark { Unseen, Visiting, Done };
@@ -800,8 +736,6 @@ std::string Edit::addSend(const std::string& ownerId, AuxSend send) {
                                });
         };
         for (const auto& track : tracks_) if (has(track)) return true;
-        for (const auto& track : midiTracks_) if (has(track)) return true;
-        for (const auto& bus : buses_) if (has(bus)) return true;
         return false;
     };
     do {
@@ -863,28 +797,28 @@ bool Edit::removeSend(const std::string& ownerId, const std::string& sendId) {
 }
 
 std::string Edit::addMidiClip(const std::string& trackId, MidiClip clip) {
-    MidiTrack* mt = midiTrack(trackId);
+    Track* mt = track(trackId);
     if (mt == nullptr) return "";
     clip.id = newId("mclip_");
     ++idCounter_;
-    mt->clips.push_back(std::move(clip));
+    mt->midiClips.push_back(std::move(clip));
     notifyChanged();
-    return mt->clips.back().id;
+    return mt->midiClips.back().id;
 }
 
 MidiClip* Edit::midiClip(const std::string& trackId, const std::string& clipId) {
-    MidiTrack* mt = midiTrack(trackId);
+    Track* mt = track(trackId);
     if (mt == nullptr) return nullptr;
-    for (auto& c : mt->clips) if (c.id == clipId) return &c;
+    for (auto& c : mt->midiClips) if (c.id == clipId) return &c;
     return nullptr;
 }
 
 bool Edit::removeMidiClip(const std::string& trackId, const std::string& clipId) {
-    MidiTrack* mt = midiTrack(trackId);
+    Track* mt = track(trackId);
     if (mt == nullptr) return false;
-    for (auto it = mt->clips.begin(); it != mt->clips.end(); ++it) {
+    for (auto it = mt->midiClips.begin(); it != mt->midiClips.end(); ++it) {
         if (it->id == clipId) {
-            mt->clips.erase(it);
+            mt->midiClips.erase(it);
             notifyChanged();
             return true;
         }
@@ -893,7 +827,7 @@ bool Edit::removeMidiClip(const std::string& trackId, const std::string& clipId)
 }
 
 bool Edit::setMidiInstrument(const std::string& trackId, PluginSlot slot) {
-    MidiTrack* mt = midiTrack(trackId);
+    Track* mt = track(trackId);
     if (mt == nullptr) return false;
     // The instrument keeps a stable id across replacements only if the caller
     // supplies one; a fresh instrument gets a new id so the GraphBuilder's
@@ -907,33 +841,8 @@ bool Edit::setMidiInstrument(const std::string& trackId, PluginSlot slot) {
     return true;
 }
 
-std::string Edit::addMidiPlugin(const std::string& trackId, PluginSlot slot) {
-    MidiTrack* mt = midiTrack(trackId);
-    if (mt == nullptr) return "";
-    slot.id = newId("plugin_");
-    ++idCounter_;
-    mt->plugins.push_back(std::move(slot));
-    notifyChanged();
-    return mt->plugins.back().id;
-}
-
-bool Edit::removeMidiPlugin(const std::string& trackId, const std::string& slotId) {
-    MidiTrack* mt = midiTrack(trackId);
-    if (mt == nullptr) return false;
-    for (auto it = mt->plugins.begin(); it != mt->plugins.end(); ++it) {
-        if (it->id == slotId) {
-            mt->plugins.erase(it);
-            notifyChanged();
-            return true;
-        }
-    }
-    return false;
-}
-
 bool Edit::anySoloed() const {
     for (const auto& t : tracks_) if (t.solo) return true;
-    for (const auto& mt : midiTracks_) if (mt.solo) return true;
-    for (const auto& bus : buses_) if (bus.solo) return true;
     return false;
 }
 
@@ -1073,9 +982,7 @@ int64_t Edit::contentEndSamples() const {
         for (const auto& c : t.clips) {
             end = std::max(end, c.timelineStart + c.length);
         }
-    }
-    for (const auto& mt : midiTracks_) {
-        for (const auto& c : mt.clips) {
+        for (const auto& c : t.midiClips) {
             end = std::max(end, c.timelineStart + c.length);
         }
     }

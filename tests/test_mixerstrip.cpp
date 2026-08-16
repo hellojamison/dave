@@ -14,6 +14,17 @@
 
 #include <string>
 
+namespace {
+// Main is a row in the one track list now, so a test asking "how many tracks
+// did I make?" has to say so. Counting user rows keeps the intent visible
+// rather than burying a +1 in every expectation.
+inline size_t userTracks(const dave::document::Edit& e) {
+    size_t n = 0;
+    for (const auto& t : e.tracks()) if (!t.isMain) ++n;
+    return n;
+}
+} // namespace
+
 using namespace dave;
 using dave::testing::ImGuiRig;
 using Picker = gui::TimelineViewState::PluginPicker;
@@ -80,11 +91,14 @@ bool dragUpColumn(ImGuiRig& rig, int stripIndex, const StopFn& stop) {
 } // namespace
 
 TEST_CASE("the add-insert row asks for the audio effect picker", "[mixerstrip]") {
+    // Every strip now offers an instrument row above its inserts, because any
+    // track can hold MIDI. Sweeping down therefore meets the instrument first;
+    // this asserts the inserts row below it still opens the effect picker.
     ImGuiRig rig;
     const std::string t = rig.edit.addTrack("Drums");
 
     const bool fired = clickDownColumn(rig, 0, [&] {
-        return rig.view.requestPicker != Picker::None;
+        return rig.view.requestPicker == Picker::AudioFx;
     });
     REQUIRE(fired);
     CHECK(rig.view.requestPicker == Picker::AudioFx);
@@ -194,24 +208,28 @@ TEST_CASE("the record button arms only its audio strip",
     CHECK_FALSE(rig.edit.track(a)->recordArm);
 }
 
-TEST_CASE("MIDI strips preserve their two-button mute and solo layout",
+TEST_CASE("every non-Main strip carries the same R/M/S row",
           "[mixerstrip][record-arm]") {
+    // There is one track type, so a track made for MIDI is as armable as any
+    // other. The old two-button MIDI layout was a consequence of the split,
+    // not a decision — R sits at the left third on every strip now.
     ImGuiRig rig;
     const std::string midi = rig.edit.addMidiTrack("Keys");
 
     const bool fired = clickDownColumn(rig, 0, [&] {
-        return rig.edit.midiTrack(midi)->mute;
-    }, 0.25f);   // still the left half; no audio-only R was inserted
+        return rig.edit.track(midi)->recordArm;
+    }, 0.16f);
     REQUIRE(fired);
-    CHECK(rig.edit.midiTrack(midi)->mute);
-    CHECK_FALSE(rig.edit.midiTrack(midi)->solo);
+    CHECK(rig.edit.track(midi)->recordArm);
+    CHECK_FALSE(rig.edit.track(midi)->mute);
+    CHECK_FALSE(rig.edit.track(midi)->solo);
 }
 
 TEST_CASE("an empty session draws a mixer without crashing", "[mixerstrip]") {
     ImGuiRig rig;
     rig.clickAt(200.0f, 200.0f,
                 [&] { gui::drawMixer(rig.edit, rig.undo, rig.view, kStripWidth); });
-    CHECK(rig.edit.tracks().empty());
+    CHECK((userTracks(rig.edit) == 0));
     CHECK(rig.view.requestPicker == Picker::None);
 }
 

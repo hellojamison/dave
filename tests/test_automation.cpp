@@ -12,6 +12,17 @@
 #include <cmath>
 #include <memory>
 
+namespace {
+// Main is a row in the one track list now, so a test asking "how many tracks
+// did I make?" has to say so. Counting user rows keeps the intent visible
+// rather than burying a +1 in every expectation.
+inline size_t userTracks(const dave::document::Edit& e) {
+    size_t n = 0;
+    for (const auto& t : e.tracks()) if (!t.isMain) ++n;
+    return n;
+}
+} // namespace
+
 using Catch::Approx;
 
 TEST_CASE("volume automation points are ordered, bounded, and undoable",
@@ -181,23 +192,23 @@ TEST_CASE("volume and pan automation round-trip on every channel type",
         dave::document::kMainBusId, 40, -0.5).empty());
 
     const std::string json = dave::document::serializeEdit(edit);
-    CHECK(json.find("dave.doc/v3") != std::string::npos);
+    CHECK(json.find("dave.doc/v4") != std::string::npos);
     dave::document::Edit loaded;
     REQUIRE(dave::document::deserializeEdit(json, loaded).ok);
     REQUIRE(loaded.track(audio)->volumeAutomation.size() == 1);
-    REQUIRE(loaded.midiTrack(midi)->volumeAutomation.size() == 1);
-    REQUIRE(loaded.bus(bus)->volumeAutomation.size() == 1);
+    REQUIRE(loaded.track(midi)->volumeAutomation.size() == 1);
+    REQUIRE(loaded.track(bus)->volumeAutomation.size() == 1);
     REQUIRE(loaded.mainBus()->volumeAutomation.size() == 1);
     CHECK(loaded.track(audio)->volumeAutomation[0].db == Approx(-3.0));
-    CHECK(loaded.midiTrack(midi)->volumeAutomation[0].db == Approx(-6.0));
-    CHECK(loaded.bus(bus)->volumeAutomation[0].db == Approx(3.0));
+    CHECK(loaded.track(midi)->volumeAutomation[0].db == Approx(-6.0));
+    CHECK(loaded.track(bus)->volumeAutomation[0].db == Approx(3.0));
     REQUIRE(loaded.track(audio)->panAutomation.size() == 1);
-    REQUIRE(loaded.midiTrack(midi)->panAutomation.size() == 1);
-    REQUIRE(loaded.bus(bus)->panAutomation.size() == 1);
+    REQUIRE(loaded.track(midi)->panAutomation.size() == 1);
+    REQUIRE(loaded.track(bus)->panAutomation.size() == 1);
     REQUIRE(loaded.mainBus()->panAutomation.size() == 1);
     CHECK(loaded.track(audio)->panAutomation[0].pan == Approx(-0.75));
-    CHECK(loaded.midiTrack(midi)->panAutomation[0].pan == Approx(0.25));
-    CHECK(loaded.bus(bus)->panAutomation[0].pan == Approx(1.0));
+    CHECK(loaded.track(midi)->panAutomation[0].pan == Approx(0.25));
+    CHECK(loaded.track(bus)->panAutomation[0].pan == Approx(1.0));
 }
 
 TEST_CASE("GainNode evaluates volume automation at every sample",

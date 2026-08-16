@@ -12,6 +12,17 @@
 #include <string>
 #include <vector>
 
+namespace {
+// Main is a row in the one track list now, so a test asking "how many tracks
+// did I make?" has to say so. Counting user rows keeps the intent visible
+// rather than burying a +1 in every expectation.
+inline size_t userTracks(const dave::document::Edit& e) {
+    size_t n = 0;
+    for (const auto& t : e.tracks()) if (!t.isMain) ++n;
+    return n;
+}
+} // namespace
+
 using namespace dave;
 
 namespace {
@@ -135,13 +146,13 @@ TEST_CASE("audio and MIDI tracks route independently into Main", "[midigraph]") 
 TEST_CASE("muting a MIDI track zeroes its gain", "[midigraph]") {
     document::Edit edit;
     const std::string midi = edit.addMidiTrack("Keys");
-    edit.midiTrack(midi)->gain = 0.9;
+    edit.track(midi)->gain = 0.9;
 
     engine::GraphBuilder builder;
     builder.build(edit, kSampleRate);
     CHECK(builder.trackGains().at(midi)->gain() == 0.9);
 
-    edit.midiTrack(midi)->mute = true;
+    edit.track(midi)->mute = true;
     builder.build(edit, kSampleRate);
     CHECK(builder.trackGains().at(midi)->gain() == 0.0);
 }

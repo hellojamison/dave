@@ -89,11 +89,9 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit,
     std::unordered_map<std::string, std::vector<std::string>> forward;
     std::unordered_map<std::string, std::vector<std::string>> reverse;
     auto targetKey = [](const document::RouteTarget& target) {
-        if (target.kind == document::RouteTarget::Kind::AudioTrack) {
-            return std::string("audio:") + target.targetId;
-        }
-        if (target.kind == document::RouteTarget::Kind::Bus) {
-            return std::string("bus:") + target.targetId;
+        if (target.kind == document::RouteTarget::Kind::AudioTrack ||
+            target.kind == document::RouteTarget::Kind::Bus) {
+            return std::string("channel:") + target.targetId;
         }
         if (target.kind == document::RouteTarget::Kind::HardwareOutput) {
             return std::string("hardware:") +
@@ -119,8 +117,6 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit,
         }
     };
     for (const auto& track : edit.tracks()) rememberChannel(track);
-    for (const auto& track : edit.midiTracks()) rememberChannel(track);
-    for (const auto& bus : edit.buses()) rememberChannel(bus);
 
     const bool anySoloed = edit.anySoloed();
     std::unordered_set<std::string> soloActive;
@@ -138,8 +134,7 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit,
                 if (found == forward.end()) return;
                 for (const auto& next : found->second) {
                     soloEdges.insert(edgeKey(current, next));
-                    if (next.starts_with("audio:")) downstream(next.substr(6));
-                    else if (next.starts_with("bus:")) downstream(next.substr(4));
+                    if (next.starts_with("channel:")) downstream(next.substr(8));
                 }
             };
         downstream(id);
@@ -150,8 +145,9 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit,
             auto found = reverse.find(current);
             if (found == reverse.end()) return;
             for (const auto& previous : found->second) {
-                const std::string destination = edit.bus(current)
-                    ? "bus:" + current : "audio:" + current;
+                // One track list: "audio:" and "bus:" named the same
+                // thing, so the solo graph keys them identically.
+                const std::string destination = "channel:" + current;
                 soloEdges.insert(edgeKey(previous, destination));
                 upstream(previous);
             }
@@ -159,8 +155,6 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit,
         upstream(id);
     };
     for (const auto& track : edit.tracks()) if (track.solo) activateSolo(track.id);
-    for (const auto& track : edit.midiTracks()) if (track.solo) activateSolo(track.id);
-    for (const auto& bus : edit.buses()) if (bus.solo) activateSolo(bus.id);
 
     auto addPluginChain = [&](NodeId source,
                               const std::vector<document::PluginSlot>& plugins) {
@@ -261,6 +255,18 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit,
             graph->connect(clips, 0, input, 0);
         }
 
+        // A track with an instrument drives it from its MIDI clips. Audio
+        // clips above bypass it straight into the chain; a track can carry
+        // both, and a bus carries neither.
+        if (auto instrument = instanceForSlot(track.instrument, sampleRate)) {
+            auto node = std::make_shared<InstrumentNode>();
+            node->setInstrument(std::move(instrument));
+            node->setSequence(bakeClips(track.midiClips));
+            const NodeId instrumentId = graph->addNode(node);
+            instrumentNodes_[track.id] = node;
+            graph->connect(instrumentId, 0, input, 0);
+        }
+
         if (track.inputMonitor) {
             const int first = track.inputChannel;
             const int count = std::clamp(track.inputChannelCount, 1, 2);
@@ -269,33 +275,10 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit,
             graph->connect(hardware, 0, input, 0);
         }
         const NodeId pre = addPluginChain(input, track.plugins);
-        addGain(track, pre);
+        const NodeId post = addGain(track, pre);
         channels[track.id].input = input;
-    }
-
-    for (const auto& track : edit.midiTracks()) {
-        const NodeId input = graph->addNode(std::make_shared<SummingNode>(1));
-        auto instrument = instanceForSlot(track.instrument, sampleRate);
-        if (instrument) {
-            auto node = std::make_shared<InstrumentNode>();
-            node->setInstrument(std::move(instrument));
-            node->setSequence(bakeClips(track.clips));
-            const NodeId instrumentId = graph->addNode(node);
-            instrumentNodes_[track.id] = node;
-            graph->connect(instrumentId, 0, input, 0);
-        }
-        const NodeId pre = addPluginChain(input, track.plugins);
-        addGain(track, pre);
-        channels[track.id].input = input;
-    }
-
-    for (const auto& bus : edit.buses()) {
-        const NodeId input = graph->addNode(std::make_shared<SummingNode>(1));
-        const NodeId pre = addPluginChain(input, bus.plugins);
-        const NodeId post = addGain(bus, pre);
-        channels[bus.id].input = input;
-        channels[bus.id].postFader = post;
-        if (bus.id == document::kMainBusId) master_ = trackGains_[bus.id];
+        channels[track.id].postFader = post;
+        if (track.id == document::kMainBusId) master_ = trackGains_[track.id];
     }
 
     auto connectTarget = [&](const std::string& ownerId, NodeId source,
@@ -345,19 +328,11 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit,
         }
     };
     for (const auto& track : edit.tracks()) routeChannel(track);
-    for (const auto& track : edit.midiTracks()) routeChannel(track);
-    for (const auto& bus : edit.buses()) routeChannel(bus);
 
     std::unordered_set<std::string> liveSlots;
     for (const auto& track : edit.tracks()) {
-        for (const auto& slot : track.plugins) liveSlots.insert(slot.id);
-    }
-    for (const auto& track : edit.midiTracks()) {
         if (!track.instrument.id.empty()) liveSlots.insert(track.instrument.id);
         for (const auto& slot : track.plugins) liveSlots.insert(slot.id);
-    }
-    for (const auto& bus : edit.buses()) {
-        for (const auto& slot : bus.plugins) liveSlots.insert(slot.id);
     }
     for (auto it = pluginInstances_.begin(); it != pluginInstances_.end();) {
         if (!liveSlots.count(it->first)) {

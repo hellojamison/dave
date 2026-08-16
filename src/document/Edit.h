@@ -63,30 +63,25 @@ public:
     bool removeClip(const std::string& trackId, const std::string& clipId);
 
     // --- Plugins (effect chain) -------------------------------------------
-    // Append a plugin slot to a track's chain. Assigns a stable id and returns
-    // it. Returns empty string if the track doesn't exist.
+    // Append a plugin slot to any track's chain — audio, MIDI or bus. Assigns
+    // a stable id and returns it, or empty if the track doesn't exist. (These
+    // used to resolve track-or-bus only, which is why a separate
+    // addMidiPlugin had to exist; one track type closes that gap.)
     std::string addPlugin(const std::string& trackId, PluginSlot slot);
     bool removePlugin(const std::string& trackId, const std::string& slotId);
 
-    // --- MIDI tracks (RB-7) ------------------------------------------------
-    // MIDI tracks are a parallel list to audio tracks: each drives one
-    // instrument plugin with its clips' notes, then an ordinary effect chain.
-    const std::vector<MidiTrack>& midiTracks() const { return midiTracks_; }
-    std::vector<MidiTrack>& midiTracksMut() { return midiTracks_; }
+    // --- Creating tracks for particular content ----------------------------
+    // These differ only in the id prefix, the default name and — for a bus —
+    // where the new row lands. They all produce the same Track; nothing about
+    // the document distinguishes them afterwards.
     std::string addMidiTrack(const std::string& name);
-    MidiTrack* midiTrack(const std::string& id);
-    const MidiTrack* midiTrack(const std::string& id) const;
-    bool removeMidiTrack(const std::string& id);
-
-    // --- Routing and buses -------------------------------------------------
-    const std::vector<BusTrack>& buses() const { return buses_; }
-    std::vector<BusTrack>& busesMut() { return buses_; }
-    BusTrack* bus(const std::string& id);
-    const BusTrack* bus(const std::string& id) const;
-    const BusTrack* mainBus() const { return bus(kMainBusId); }
+    // A bus is a track with no clips and no input. New buses land before Main,
+    // which stays last.
     std::string addBus(const std::string& name);
-    bool restoreBus_(BusTrack bus, size_t index);
-    bool removeBus(const std::string& id);
+    // Replay helper: re-inserts an already-identified track at a known row so
+    // redo cannot mint a different id.
+    bool restoreTrack_(Track track, size_t index);
+    const Track* mainBus() const { return track(kMainBusId); }
 
     // A referenced software destination cannot be removed. Main is always
     // referenced conceptually and is also protected explicitly.
@@ -154,9 +149,6 @@ public:
     // instrument. Returns false if the track doesn't exist.
     bool setMidiInstrument(const std::string& trackId, PluginSlot slot);
 
-    // Post-instrument effect chain, same semantics as addPlugin on audio tracks.
-    std::string addMidiPlugin(const std::string& trackId, PluginSlot slot);
-    bool removeMidiPlugin(const std::string& trackId, const std::string& slotId);
 
     // --- Solo ---------------------------------------------------------------
     // Is anything in the edit soloed? Solo is only meaningful relative to every
@@ -235,10 +227,8 @@ public:
     void clearMarkerTracks_() { markerTracks_.clear(); }
     void clearVideoTracks_() { videoTracks_.clear(); }
     void loadVideoTrack_(VideoTrack vt) { videoTracks_.push_back(std::move(vt)); }
-    void clearMidiTracks_() { midiTracks_.clear(); }
-    void loadMidiTrack_(MidiTrack mt) { midiTracks_.push_back(std::move(mt)); }
-    void clearBuses_() { buses_.clear(); }
-    void loadBus_(BusTrack bus) { buses_.push_back(std::move(bus)); }
+    void clearTracks_() { tracks_.clear(); }
+    void loadTrack_(Track t) { tracks_.push_back(std::move(t)); }
     void ensureMainBus_();
     std::unordered_map<AssetId, AudioAsset>& assets() { return assets_; }
 
@@ -251,10 +241,11 @@ public:
 
 private:
     std::string newId(const char* prefix) const;
+    // Main is pinned last; new rows go ahead of it.
+    std::vector<Track>::iterator mainRow_();
 
+    // One list. Row order is the user's; Main is pinned last.
     std::vector<Track> tracks_;
-    std::vector<MidiTrack> midiTracks_;
-    std::vector<BusTrack> buses_;
     std::vector<MarkerTrack> markerTracks_;
     std::vector<VideoTrack> videoTracks_;
     std::unordered_map<AssetId, AudioAsset> assets_;

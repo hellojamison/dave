@@ -12,16 +12,72 @@
 namespace dave::editing {
 
 // AddTrack: creates a new track. Undo removes it (and its clips).
+// Add a track. `Flavour` chooses only the id prefix and the default name —
+// the object produced is the same either way, and nothing downstream can tell
+// afterwards which one made it. It exists so a row created as a bus still
+// reads as "Bus 3" in the list.
 class AddTrackCommand : public Command {
 public:
-    explicit AddTrackCommand(std::string name) : name_(std::move(name)) {}
-    void perform(document::Edit& e) override { trackId_ = e.addTrack(name_); }
+    enum class Flavour { Audio, Midi, Bus };
+
+    explicit AddTrackCommand(std::string name, Flavour flavour = Flavour::Audio)
+        : name_(std::move(name)), flavour_(flavour) {}
+
+    void perform(document::Edit& e) override {
+        const std::string minted =
+            flavour_ == Flavour::Midi ? e.addMidiTrack(name_)
+          : flavour_ == Flavour::Bus  ? e.addBus(name_)
+                                      : e.addTrack(name_);
+        // Redo must reuse the first id, or every graph cache and selection
+        // keyed by it silently points at a track that no longer exists.
+        if (trackId_.empty()) {
+            trackId_ = minted;
+        } else if (auto* t = e.track(minted)) {
+            t->id = trackId_;
+        }
+    }
     void undo(document::Edit& e) override { e.removeTrack(trackId_); }
-    std::string name() const override { return "Add Track"; }
+    std::string name() const override {
+        return flavour_ == Flavour::Midi ? "Add MIDI Track"
+             : flavour_ == Flavour::Bus  ? "Add Bus"
+                                         : "Add Track";
+    }
     const std::string& trackId() const { return trackId_; }
+    // Retained for the bus call sites that read the new row's id.
+    const std::string& busId() const { return trackId_; }
 private:
     std::string name_;
+    Flavour flavour_ = Flavour::Audio;
     std::string trackId_;
+};
+
+// Remove any track. Undo restores it whole — clips, instrument, chain, sends
+// and its row position, since list order is the order the user sees. Audio
+// tracks had no remove command at all before the merge.
+class RemoveTrackCommand : public Command {
+public:
+    explicit RemoveTrackCommand(std::string trackId)
+        : trackId_(std::move(trackId)) {}
+    void perform(document::Edit& e) override {
+        const auto& tracks = e.tracks();
+        for (size_t i = 0; i < tracks.size(); ++i) {
+            if (tracks[i].id == trackId_) {
+                snapshot_ = tracks[i];
+                index_ = i;
+                break;
+            }
+        }
+        e.removeTrack(trackId_);
+    }
+    void undo(document::Edit& e) override {
+        if (snapshot_.id.empty()) return;
+        e.restoreTrack_(snapshot_, index_);
+    }
+    std::string name() const override { return "Remove Track"; }
+private:
+    std::string trackId_;
+    document::Track snapshot_;
+    size_t index_ = 0;
 };
 
 // AddClip: places a clip on a track. Undo removes the clip.
@@ -29,7 +85,14 @@ class AddClipCommand : public Command {
 public:
     AddClipCommand(std::string trackId, document::AudioClip clip)
         : trackId_(std::move(trackId)), clip_(std::move(clip)) {}
-    void perform(document::Edit& e) override { clipId_ = e.addClip(trackId_, clip_); }
+    void perform(document::Edit& e) override {
+        const std::string minted = e.addClip(trackId_, clip_);
+        if (clipId_.empty()) {
+            clipId_ = minted;
+        } else if (auto* c = e.clip(trackId_, minted)) {
+            c->id = clipId_;   // redo keeps the original identity
+        }
+    }
     void undo(document::Edit& e) override { e.removeClip(trackId_, clipId_); }
     std::string name() const override { return "Add Clip"; }
     const std::string& clipId() const { return clipId_; }
@@ -88,52 +151,47 @@ public:
           newStart_(newStart), newTrackId_(std::move(newTrackId)) {}
 
     void perform(document::Edit& e) override {
-        // Snapshot the original (track + position) so undo can restore it.
-        auto* c = e.clip(trackId_, clipId_);
-        if (c) {
+        if (auto* c = e.clip(trackId_, clipId_)) {
             oldStart_ = c->timelineStart;
-            snapshot_ = *c; // captures sourceOffset/length/fades/etc.
+            snapshot_ = *c;   // captures sourceOffset/length/fades/etc.
         }
-        // If moving to a different track, remove from old and add to new.
-        if (!newTrackId_.empty() && newTrackId_ != trackId_) {
+        if (crossesTracks()) {
             e.removeClip(trackId_, clipId_);
-            // Preserve the original id so references stay stable.
-            snapshot_.id = clipId_;
             snapshot_.timelineStart = newStart_;
-            e.addClip(newTrackId_, snapshot_);
-            // addClip assigns a NEW id; patch it back to the stable one.
-            auto* moved = e.clip(newTrackId_, clipId_);
-            // The clip is now the one with the new id; rename it.
-            // (Find the last clip on the track and rename.)
-            auto* t = e.track(newTrackId_);
-            if (t && !t->clips.empty()) {
-                t->clips.back().id = clipId_;
-            }
-            (void)moved;
-        } else {
-            // Same-track move: just update position.
-            auto* clip = e.clip(trackId_, clipId_);
-            if (clip) { clip->timelineStart = newStart_; e.notifyChanged(); }
+            reinsert(e, newTrackId_);
+        } else if (auto* c = e.clip(trackId_, clipId_)) {
+            c->timelineStart = newStart_;
+            e.notifyChanged();
         }
     }
 
     void undo(document::Edit& e) override {
-        // If it moved tracks, reverse: remove from new track, restore to old.
-        if (!newTrackId_.empty() && newTrackId_ != trackId_) {
+        if (crossesTracks()) {
             e.removeClip(newTrackId_, clipId_);
-            snapshot_.id = clipId_;
-            e.addClip(trackId_, snapshot_);
-            auto* t = e.track(trackId_);
-            if (t && !t->clips.empty()) t->clips.back().id = clipId_;
-        } else {
-            auto* c = e.clip(trackId_, clipId_);
-            if (c) { c->timelineStart = oldStart_; e.notifyChanged(); }
+            snapshot_.timelineStart = oldStart_;
+            reinsert(e, trackId_);
+        } else if (auto* c = e.clip(trackId_, clipId_)) {
+            c->timelineStart = oldStart_;
+            e.notifyChanged();
         }
     }
 
     std::string name() const override { return "Move Clip"; }
 
 private:
+    bool crossesTracks() const {
+        return !newTrackId_.empty() && newTrackId_ != trackId_;
+    }
+    // addClip mints a fresh id; patch the stable one back so undo/redo and any
+    // selection referring to the clip keep working. Resolving the re-added clip
+    // by its minted id rather than as the track's last clip is the difference
+    // that matters — a track whose clips are not in insertion order used to get
+    // the wrong clip renamed.
+    void reinsert(document::Edit& e, const std::string& intoTrack) {
+        const std::string mintedId = e.addClip(intoTrack, snapshot_);
+        if (auto* c = e.clip(intoTrack, mintedId)) c->id = clipId_;
+    }
+
     std::string trackId_;     // original track
     std::string clipId_;
     int64_t newStart_;
@@ -180,44 +238,61 @@ private:
     std::string slotId_;
 };
 
-// Split a clip at a given timeline position. Creates two clips from one:
-// the left half keeps the original id+position; the right half is a new clip
-// with sourceOffset adjusted. Undo removes the right clip (restoring one).
+// Split a clip at a given timeline position into two clips that between them
+// cover exactly what the original covered. Modelled on SplitMidiClipCommand,
+// which was written from scratch because this command's original undo was
+// broken: it rebuilt the left half's length by adding the right half back,
+// and it computed both halves by subtraction without checking that the cut
+// fell inside the clip. A cut past a clip's end therefore gave the right half
+// a negative length — reachable by right-clicking a clip with the playhead
+// parked elsewhere.
 class SplitClipCommand : public Command {
 public:
     SplitClipCommand(std::string trackId, std::string clipId, int64_t atSample)
-        : trackId_(std::move(trackId)), clipId_(std::move(clipId)), atSample_(atSample) {}
+        : trackId_(std::move(trackId)), clipId_(std::move(clipId)),
+          atSample_(atSample) {}
+
     void perform(document::Edit& e) override {
         auto* c = e.clip(trackId_, clipId_);
-        if (!c) return;
-        // Left clip: trim length. Right clip: new clip starting at atSample.
+        if (c == nullptr) return;
+        // A cut at or outside the clip's own bounds would produce an empty
+        // half; refuse rather than leave a zero-length clip on the timeline.
+        if (atSample_ <= c->timelineStart ||
+            atSample_ >= c->timelineStart + c->length) {
+            return;
+        }
+        originalLength_ = c->length;
+
         document::AudioClip right = *c;
         right.timelineStart = atSample_;
         right.sourceOffset = c->sourceOffset + (atSample_ - c->timelineStart);
         right.length = c->timelineStart + c->length - atSample_;
         c->length = atSample_ - c->timelineStart;
         e.notifyChanged();
-        // Add the right clip (assigns a new id).
-        rightId_ = e.addClip(trackId_, right);
+
+        const std::string minted = e.addClip(trackId_, right);
+        if (rightId_.empty()) rightId_ = minted;
+        else if (auto* r = e.clip(trackId_, minted)) r->id = rightId_;
     }
+
     void undo(document::Edit& e) override {
         if (rightId_.empty()) return;
-        // Remove the right clip, restore the left clip's original length.
-        auto* c = e.clip(trackId_, clipId_);
-        if (c) { c->length += /* right length */ 0; } // simplified; the right
-        // clip's length was the remainder. We re-merge by reading the right
-        // clip before removing.
-        auto* r = e.clip(trackId_, rightId_);
-        if (r && c) { c->length = c->length + r->length; }
         e.removeClip(trackId_, rightId_);
-        rightId_.clear();
+        if (auto* c = e.clip(trackId_, clipId_)) {
+            c->length = originalLength_;
+            e.notifyChanged();
+        }
     }
+
     std::string name() const override { return "Split Clip"; }
+    const std::string& rightId() const { return rightId_; }
+
 private:
     std::string trackId_;
     std::string clipId_;
     int64_t atSample_;
-    std::string rightId_; // id of the right half (for undo)
+    int64_t originalLength_ = 0;
+    std::string rightId_;
 };
 
 // RemovePlugin: deletes a plugin slot. Undo restores it.
@@ -227,23 +302,17 @@ public:
         : trackId_(std::move(trackId)), slotId_(std::move(slotId)) {}
     void perform(document::Edit& e) override {
         // Snapshot the slot for undo.
-        const auto* t = e.track(trackId_);
-        if (t) for (const auto& s : t->plugins) if (s.id == slotId_) { snapshot_ = s; break; }
-        const auto* b = e.bus(trackId_);
-        if (b) for (const auto& s : b->plugins) if (s.id == slotId_) { snapshot_ = s; break; }
+        if (const auto* t = e.track(trackId_)) {
+            for (const auto& s : t->plugins) {
+                if (s.id == slotId_) { snapshot_ = s; break; }
+            }
+        }
         e.removePlugin(trackId_, slotId_);
     }
     void undo(document::Edit& e) override {
         std::string newId = e.addPlugin(trackId_, snapshot_);
         if (const auto* t = e.track(trackId_)) {
             for (const auto& s : t->plugins) {
-                if (s.id == newId) {
-                    const_cast<document::PluginSlot&>(s).id = slotId_;
-                    break;
-                }
-            }
-        } else if (const auto* b = e.bus(trackId_)) {
-            for (const auto& s : b->plugins) {
                 if (s.id == newId) {
                     const_cast<document::PluginSlot&>(s).id = slotId_;
                     break;
@@ -269,57 +338,6 @@ private:
 // a fresh id every call, so a naive redo would produce a track that is
 // identical except for its identity — orphaning the selection, the mixer
 // strip, and every id-keyed engine map in one go.
-class AddMidiTrackCommand : public Command {
-public:
-    explicit AddMidiTrackCommand(std::string name) : name_(std::move(name)) {}
-    void perform(document::Edit& e) override {
-        const std::string minted = e.addMidiTrack(name_);
-        if (trackId_.empty()) {
-            trackId_ = minted;
-        } else if (auto* mt = e.midiTrack(minted)) {
-            mt->id = trackId_;
-        }
-    }
-    void undo(document::Edit& e) override { e.removeMidiTrack(trackId_); }
-    std::string name() const override { return "Add MIDI Track"; }
-    const std::string& trackId() const { return trackId_; }
-private:
-    std::string name_;
-    std::string trackId_;
-};
-
-// Remove a MIDI track. Undo restores it whole — clips, instrument, effect
-// chain, and crucially its position in the track list, since the list order is
-// the row order the user sees.
-class RemoveMidiTrackCommand : public Command {
-public:
-    explicit RemoveMidiTrackCommand(std::string trackId)
-        : trackId_(std::move(trackId)) {}
-    void perform(document::Edit& e) override {
-        auto& tracks = e.midiTracksMut();
-        for (size_t i = 0; i < tracks.size(); ++i) {
-            if (tracks[i].id == trackId_) {
-                snapshot_ = tracks[i];
-                index_ = i;
-                break;
-            }
-        }
-        e.removeMidiTrack(trackId_);
-    }
-    void undo(document::Edit& e) override {
-        if (snapshot_.id.empty()) return;
-        auto& tracks = e.midiTracksMut();
-        const size_t at = index_ < tracks.size() ? index_ : tracks.size();
-        tracks.insert(tracks.begin() + static_cast<ptrdiff_t>(at), snapshot_);
-        e.notifyChanged();
-    }
-    std::string name() const override { return "Remove MIDI Track"; }
-private:
-    std::string trackId_;
-    document::MidiTrack snapshot_;
-    size_t index_ = 0;
-};
-
 // Import a .mid file as one MIDI track per non-empty SMF track.
 //
 // The command takes tracks that have ALREADY been parsed rather than a path:
@@ -338,8 +356,12 @@ public:
             // and all. Re-running the mint dance would give every track and
             // clip a new identity, so a redo would look right on screen while
             // quietly orphaning the selection and the engine's id-keyed maps.
-            auto& tracks = e.midiTracksMut();
-            tracks.insert(tracks.end(), tracks_.begin(), tracks_.end());
+            auto& tracks = e.tracksMut();
+            // Ahead of Main, which is always the last row.
+            const auto main = std::find_if(
+                tracks.begin(), tracks.end(),
+                [](const document::Track& t) { return t.isMain; });
+            tracks.insert(main, tracks_.begin(), tracks_.end());
             e.notifyChanged();
             return;
         }
@@ -347,7 +369,7 @@ public:
         std::vector<document::MidiTrack> applied;
         for (const auto& src : tracks_) {
             const std::string id = e.addMidiTrack(src.name);
-            auto* mt = e.midiTrack(id);
+            auto* mt = e.track(id);
             if (mt == nullptr) continue;
             // Keep the id the Edit just minted (it's unique); take everything
             // else from the parsed track.
@@ -355,7 +377,7 @@ public:
             mt->pan = src.pan;
             mt->instrument = src.instrument;
             mt->plugins = src.plugins;
-            for (const auto& clip : src.clips) e.addMidiClip(id, clip);
+            for (const auto& clip : src.midiClips) e.addMidiClip(id, clip);
             applied.push_back(*mt);
             trackIds_.push_back(id);
         }
@@ -365,7 +387,7 @@ public:
     }
 
     void undo(document::Edit& e) override {
-        for (const auto& id : trackIds_) e.removeMidiTrack(id);
+        for (const auto& id : trackIds_) e.removeTrack(id);
     }
 
     std::string name() const override {
@@ -619,11 +641,11 @@ public:
     SetMidiInstrumentCommand(std::string trackId, document::PluginSlot slot)
         : trackId_(std::move(trackId)), slot_(std::move(slot)) {}
     void perform(document::Edit& e) override {
-        if (const auto* mt = e.midiTrack(trackId_)) previous_ = mt->instrument;
+        if (const auto* mt = e.track(trackId_)) previous_ = mt->instrument;
         // On redo, reuse the id minted the first time so the GraphBuilder's
         // instance cache and any open editor window still resolve.
         e.setMidiInstrument(trackId_, slot_);
-        if (const auto* mt = e.midiTrack(trackId_)) slot_ = mt->instrument;
+        if (const auto* mt = e.track(trackId_)) slot_ = mt->instrument;
     }
     void undo(document::Edit& e) override {
         e.setMidiInstrument(trackId_, previous_);
@@ -639,63 +661,6 @@ private:
 };
 
 // Append a plugin to a MIDI track's post-instrument effect chain.
-class AddMidiPluginCommand : public Command {
-public:
-    AddMidiPluginCommand(std::string trackId, document::PluginSlot slot)
-        : trackId_(std::move(trackId)), slot_(std::move(slot)) {}
-    void perform(document::Edit& e) override {
-        const std::string minted = e.addMidiPlugin(trackId_, slot_);
-        if (slotId_.empty()) {
-            slotId_ = minted;
-        } else if (auto* mt = e.midiTrack(trackId_)) {
-            // Redo keeps the original slot id so the GraphBuilder's plugin
-            // instance cache hands back the same loaded plugin.
-            for (auto& s : mt->plugins) {
-                if (s.id == minted) { s.id = slotId_; break; }
-            }
-        }
-    }
-    void undo(document::Edit& e) override { e.removeMidiPlugin(trackId_, slotId_); }
-    std::string name() const override { return "Add Plugin"; }
-    const std::string& slotId() const { return slotId_; }
-private:
-    std::string trackId_;
-    document::PluginSlot slot_;
-    std::string slotId_;
-};
-
-// Remove a plugin from a MIDI track's effect chain. Undo restores it (at the
-// end of the chain — chain order beyond append/remove has no UI yet).
-class RemoveMidiPluginCommand : public Command {
-public:
-    RemoveMidiPluginCommand(std::string trackId, std::string slotId)
-        : trackId_(std::move(trackId)), slotId_(std::move(slotId)) {}
-    void perform(document::Edit& e) override {
-        if (const auto* mt = e.midiTrack(trackId_)) {
-            for (const auto& s : mt->plugins) {
-                if (s.id == slotId_) { snapshot_ = s; break; }
-            }
-        }
-        e.removeMidiPlugin(trackId_, slotId_);
-    }
-    void undo(document::Edit& e) override {
-        const std::string mintedId = e.addMidiPlugin(trackId_, snapshot_);
-        if (auto* mt = e.midiTrack(trackId_)) {
-            for (auto& s : mt->plugins) {
-                if (s.id == mintedId) { s.id = slotId_; break; }
-            }
-        }
-    }
-    std::string name() const override { return "Remove Plugin"; }
-private:
-    std::string trackId_;
-    std::string slotId_;
-    document::PluginSlot snapshot_;
-};
-
-// ─── Marker commands (RB-4) ─────────────────────────────────────────────────
-
-// Add a marker track. Undo removes it.
 class AddMarkerTrackCommand : public Command {
 public:
     explicit AddMarkerTrackCommand(std::string name) : name_(std::move(name)) {}
@@ -774,16 +739,12 @@ private:
 inline document::RouteTarget routeForOwner(const document::Edit& edit,
                                            const std::string& id) {
     if (const auto* track = edit.track(id)) return track->mainOutput;
-    if (const auto* track = edit.midiTrack(id)) return track->mainOutput;
-    if (const auto* bus = edit.bus(id)) return bus->mainOutput;
     return document::RouteTarget::none();
 }
 
 inline std::string colorForOwner(const document::Edit& edit,
                                  const std::string& id) {
     if (const auto* track = edit.track(id)) return track->color;
-    if (const auto* track = edit.midiTrack(id)) return track->color;
-    if (const auto* bus = edit.bus(id)) return bus->color;
     return {};
 }
 
@@ -1130,38 +1091,10 @@ private:
     const std::vector<document::AuxSend>* ownerSends(
         const document::Edit& edit) const {
         if (const auto* track = edit.track(ownerId_)) return &track->sends;
-        if (const auto* track = edit.midiTrack(ownerId_)) return &track->sends;
-        if (const auto* bus = edit.bus(ownerId_)) return &bus->sends;
         return nullptr;
     }
     std::string ownerId_;
     document::AuxSend send_;
-    size_t index_ = 0;
-};
-
-class AddBusCommand : public Command {
-public:
-    explicit AddBusCommand(std::string name) : name_(std::move(name)) {}
-    void perform(document::Edit& edit) override {
-        if (snapshot_.id.empty()) {
-            const std::string id = edit.addBus(name_);
-            if (const auto* bus = edit.bus(id)) snapshot_ = *bus;
-        } else {
-            edit.restoreBus_(snapshot_, index_);
-        }
-    }
-    void undo(document::Edit& edit) override {
-        const auto& buses = edit.buses();
-        for (size_t i = 0; i < buses.size(); ++i) {
-            if (buses[i].id == snapshot_.id) { index_ = i; break; }
-        }
-        edit.removeBus(snapshot_.id);
-    }
-    std::string name() const override { return "Add Bus"; }
-    const std::string& busId() const { return snapshot_.id; }
-private:
-    std::string name_;
-    document::BusTrack snapshot_;
     size_t index_ = 0;
 };
 
@@ -1182,8 +1115,6 @@ public:
 private:
     const std::vector<document::AuxSend>* sends(const document::Edit& edit) const {
         if (const auto* track = edit.track(ownerId_)) return &track->sends;
-        if (const auto* track = edit.midiTrack(ownerId_)) return &track->sends;
-        if (const auto* bus = edit.bus(ownerId_)) return &bus->sends;
         return nullptr;
     }
     std::string ownerId_;
@@ -1210,33 +1141,11 @@ public:
 private:
     const std::vector<document::AuxSend>* sends(const document::Edit& edit) const {
         if (const auto* track = edit.track(ownerId_)) return &track->sends;
-        if (const auto* track = edit.midiTrack(ownerId_)) return &track->sends;
-        if (const auto* bus = edit.bus(ownerId_)) return &bus->sends;
         return nullptr;
     }
     std::string ownerId_;
     std::string sendId_;
     document::AuxSend snapshot_;
-    size_t index_ = 0;
-};
-
-class RemoveBusCommand : public Command {
-public:
-    explicit RemoveBusCommand(std::string id) : id_(std::move(id)) {}
-    void perform(document::Edit& edit) override {
-        const auto& buses = edit.buses();
-        for (size_t i = 0; i < buses.size(); ++i) {
-            if (buses[i].id == id_) { snapshot_ = buses[i]; index_ = i; break; }
-        }
-        edit.removeBus(id_);
-    }
-    void undo(document::Edit& edit) override {
-        edit.restoreBus_(snapshot_, index_);
-    }
-    std::string name() const override { return "Remove Bus"; }
-private:
-    std::string id_;
-    document::BusTrack snapshot_;
     size_t index_ = 0;
 };
 

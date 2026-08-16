@@ -67,6 +67,26 @@ EditorPreferences EditorPreferencesStore::load() const noexcept {
         preferences.showTransientTicks = ticks->get<bool>();
         preferences.transientSensitivity = std::clamp(
             sensitivity->get<int>(), 0, 100);
+        // Added after the first release of this file, so a missing key is a
+        // normal older preferences file rather than corruption — unlike the
+        // fields above, it falls back on its own instead of rejecting the lot.
+        const auto pattern = root.find("takeNamePattern");
+        if (pattern != root.end() && pattern->is_string()) {
+            auto value = pattern->get<std::string>();
+            // An empty or unusable pattern would name every take the same
+            // thing; the default is a better answer than a refusal here.
+            if (!expandTakeNamePattern(value, TakeNameContext{}).empty()) {
+                preferences.takeNamePattern = std::move(value);
+            }
+        }
+        const auto preFader = root.find("meterPreFader");
+        if (preFader != root.end() && preFader->is_boolean()) {
+            preferences.meterPreFader = preFader->get<bool>();
+        }
+        const auto rmsBody = root.find("meterRmsBody");
+        if (rmsBody != root.end() && rmsBody->is_boolean()) {
+            preferences.meterRmsBody = rmsBody->get<bool>();
+        }
         return preferences;
     } catch (...) {
         return defaults;
@@ -84,6 +104,9 @@ bool EditorPreferencesStore::save(
             {"showTransientTicks", preferences.showTransientTicks},
             {"transientSensitivity",
              std::clamp(preferences.transientSensitivity, 0, 100)},
+            {"takeNamePattern", preferences.takeNamePattern},
+            {"meterPreFader", preferences.meterPreFader},
+            {"meterRmsBody", preferences.meterRmsBody},
         };
         std::error_code error;
         const auto parent = path_.parent_path();

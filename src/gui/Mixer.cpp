@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "gui/Mixer.h"
 
+#include "gui/LevelMeter.h"
+
 #include "editing/Commands.h"
 #include "gui/RoutingViewModel.h"
 #include "gui/Theme.h"
@@ -197,89 +199,13 @@ bool drawPanKnob(const char* id, float& value) {
     return changed;
 }
 
-float amplitudeToMeterY(float amplitude, float top, float bottom) {
-    const float db = 20.0f * std::log10(std::max(amplitude, 0.001f));
-    const float normalized = std::clamp((db + 60.0f) / 66.0f, 0.0f, 1.0f);
-    return bottom - normalized * (bottom - top);
-}
-
-void drawStereoMeter(engine::GainNode* node, ImVec2 pos, float height) {
-    constexpr float channelWidth = 7.0f;
-    constexpr float channelGap = 3.0f;
-    constexpr float meterWidth = channelWidth * 2.0f + channelGap;
-    const auto& pal = theme::palette();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    const ImVec2 afterFader = ImGui::GetCursorScreenPos();
-
-    ImGui::SetCursorScreenPos(pos);
-    ImGui::InvisibleButton("##trackMeter", ImVec2(meterWidth, height));
-    const bool hovered = ImGui::IsItemHovered();
-    if (node != nullptr && ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
-        node->clearMeterClips();
+// The mixer's strips are always stereo, so it keeps a two-channel shorthand
+// over the shared drawer.
+void drawLevelMeter2(engine::GainNode* node, ImVec2 pos, float height,
+                     TimelineViewState& view) {
+    if (drawLevelMeter(node, pos, height, view.meterOptions, 2)) {
+        view.meterOptionsChanged = true;
     }
-
-    const float top = pos.y;
-    const float bottom = pos.y + height;
-    const float warningY = amplitudeToMeterY(
-        std::pow(10.0f, -12.0f / 20.0f), top, bottom);
-    const float dangerY = amplitudeToMeterY(
-        std::pow(10.0f, -3.0f / 20.0f), top, bottom);
-    std::array<engine::GainNode::MeterSnapshot, 2> snapshots{};
-    if (node != nullptr) {
-        snapshots[0] = node->meter(0);
-        snapshots[1] = node->meter(1);
-    }
-
-    for (size_t channel = 0; channel < snapshots.size(); ++channel) {
-        const float left = pos.x + static_cast<float>(channel) *
-            (channelWidth + channelGap);
-        const float right = left + channelWidth;
-        dl->AddRectFilled(ImVec2(left, top), ImVec2(right, bottom),
-                          C(pal.surfaceBase), 1.5f);
-        dl->AddRect(ImVec2(left, top), ImVec2(right, bottom),
-                    C(pal.border), 1.5f);
-
-        const float rmsY = amplitudeToMeterY(
-            std::clamp(snapshots[channel].rms, 0.0f, 2.0f), top, bottom);
-        if (rmsY < bottom) {
-            dl->AddRectFilled(ImVec2(left + 1.0f, std::max(rmsY, warningY)),
-                              ImVec2(right - 1.0f, bottom - 1.0f),
-                              C(pal.success), 1.0f);
-            if (rmsY < warningY) {
-                dl->AddRectFilled(
-                    ImVec2(left + 1.0f, std::max(rmsY, dangerY)),
-                    ImVec2(right - 1.0f, warningY), C(pal.warning));
-            }
-            if (rmsY < dangerY) {
-                dl->AddRectFilled(ImVec2(left + 1.0f, rmsY),
-                                  ImVec2(right - 1.0f, dangerY), C(pal.danger));
-            }
-        }
-
-        const float peakY = amplitudeToMeterY(
-            std::clamp(snapshots[channel].peak, 0.0f, 2.0f), top, bottom);
-        const ImU32 peakColor = snapshots[channel].peak >= 1.0f
-            ? C(pal.danger)
-            : (snapshots[channel].peak >= 0.25f
-                   ? C(pal.warning) : C(pal.accentStrong));
-        dl->AddLine(ImVec2(left + 1.0f, peakY),
-                    ImVec2(right - 1.0f, peakY), peakColor, 1.0f);
-        if (snapshots[channel].clipped) {
-            dl->AddRectFilled(ImVec2(left, top),
-                              ImVec2(right, top + 3.0f), C(pal.danger), 1.0f);
-        }
-    }
-
-    if (hovered) {
-        const auto db = [](float value) {
-            return value > 0.0f
-                ? 20.0f * std::log10(value)
-                : -60.0f;
-        };
-        ImGui::SetTooltip("Post-fader meter\nL %+.1f dB  R %+.1f dB\nClick to clear clips",
-                          db(snapshots[0].peak), db(snapshots[1].peak));
-    }
-    ImGui::SetCursorScreenPos(afterFader);
 }
 
 // A compact slot button: bypass dot on the left, name filling the rest.
@@ -528,7 +454,10 @@ StripAction drawStrip(const StripModel& m, document::Edit& edit,
             if (captureChannels == 0) ImGui::TextDisabled("No capture channels");
             ImGui::EndPopup();
         }
-    } else if (m.instrument != nullptr) {
+    }
+    // Not an else: a track can both record audio and host an instrument now,
+    // so the input row and the instrument row are independent.
+    if (m.instrument != nullptr) {
         if (m.instrument->uidString.empty()) {
             if (drawAddInsertRow(1, inner)) {
                 view.requestPicker =
@@ -723,10 +652,10 @@ StripAction drawStrip(const StripModel& m, document::Edit& edit,
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Fader (Option/Alt-click for 0 dB)");
         }
-        drawStereoMeter(m.meter,
+        drawLevelMeter2(m.meter,
                         ImVec2(faderPos.x + faderW + faderMeterGap,
                                faderPos.y),
-                        faderH);
+                        faderH, view);
         char dbText[16];
         std::snprintf(dbText, sizeof(dbText), "%+.1f", gainDb);
         const ImVec2 ts = ImGui::CalcTextSize(dbText);
@@ -748,8 +677,7 @@ void drawMixer(document::Edit& edit, editing::UndoStack& undo,
                const TrackGainNodes* gainNodes) {
     const bool anySoloed = edit.anySoloed();
 
-    if (edit.tracks().empty() && edit.midiTracks().empty() &&
-        edit.buses().empty()) {
+    if (edit.tracks().empty()) {
         const auto& pal = theme::palette();
         const char* msg = "No tracks yet";
         const ImVec2 ts = ImGui::CalcTextSize(msg);
@@ -781,6 +709,9 @@ void drawMixer(document::Edit& edit, editing::UndoStack& undo,
     // Audio strips, then MIDI, matching the timeline's row order — the mixer
     // and the timeline have to agree on what "the third track" means, since
     // selectedTrackIndex is shared between them.
+    // One strip loop. What a strip shows follows from what the track holds:
+    // an input row when it has a hardware input, an instrument row when it has
+    // an instrument, a bus label when it has neither clips nor input.
     for (auto& t : edit.tracksMut()) {
         StripModel m;
         m.trackId = t.id;
@@ -790,59 +721,25 @@ void drawMixer(document::Edit& edit, editing::UndoStack& undo,
         m.pan = &t.pan;
         m.mute = &t.mute;
         m.solo = &t.solo;
-        m.recordArm = &t.recordArm;
-        m.hardwareInput = &t.hardwareInput;
-        m.inputMonitor = &t.inputMonitor;
         m.mainOutput = &t.mainOutput;
         m.sends = &t.sends;
         m.inserts = &t.plugins;
         m.meter = meterFor(t.id);
-        const StripAction a = drawStrip(m, edit, view, uid,
-                                        view.selectedTrackIndex == uid,
-                                        anySoloed, stripWidth, stripHeight,
-                                        captureChannels, playbackChannels);
-        if (a.kind != StripAction::Kind::None) action = a;
-        ImGui::SameLine(0.0f, kSpaceSm);
-        ++uid;
-    }
-    for (auto& t : edit.midiTracksMut()) {
-        StripModel m;
-        m.trackId = t.id;
-        m.name = &t.name;
-        m.color = &t.color;
-        m.gain = &t.gain;
-        m.pan = &t.pan;
-        m.mute = &t.mute;
-        m.solo = &t.solo;
-        m.mainOutput = &t.mainOutput;
-        m.sends = &t.sends;
-        m.inserts = &t.plugins;
+        m.isMain = t.isMain;
+        // Only Main is special. "Bus" is not a property a track has — a new
+        // track and a new bus are identical, so deriving it from emptiness
+        // would classify every freshly added track as a bus. Every other row
+        // offers everything: an input to record from, an instrument to play
+        // MIDI through, and a chain. A bus is simply a row you never put
+        // anything on.
+        m.isBus = t.isMain;
+        m.isMidi = !t.instrument.uidString.empty() || !t.midiClips.empty();
         m.instrument = &t.instrument;
-        m.isMidi = true;
-        m.meter = meterFor(t.id);
-        const StripAction a = drawStrip(m, edit, view, uid,
-                                        view.selectedTrackIndex == uid,
-                                        anySoloed, stripWidth, stripHeight,
-                                        captureChannels, playbackChannels);
-        if (a.kind != StripAction::Kind::None) action = a;
-        ImGui::SameLine(0.0f, kSpaceSm);
-        ++uid;
-    }
-    for (auto& bus : edit.busesMut()) {
-        StripModel m;
-        m.trackId = bus.id;
-        m.name = &bus.name;
-        m.color = &bus.color;
-        m.gain = &bus.gain;
-        m.pan = &bus.pan;
-        m.mute = &bus.mute;
-        m.solo = &bus.solo;
-        m.mainOutput = &bus.mainOutput;
-        m.sends = &bus.sends;
-        m.inserts = &bus.plugins;
-        m.isBus = true;
-        m.isMain = bus.isMain;
-        m.meter = meterFor(bus.id);
+        if (!t.isMain) {
+            m.recordArm = &t.recordArm;
+            m.hardwareInput = &t.hardwareInput;
+            m.inputMonitor = &t.inputMonitor;
+        }
         const StripAction a = drawStrip(m, edit, view, uid,
                                         view.selectedTrackIndex == uid,
                                         anySoloed, stripWidth, stripHeight,
@@ -859,7 +756,7 @@ void drawMixer(document::Edit& edit, editing::UndoStack& undo,
             undo.execute(std::make_unique<editing::AddTrackCommand>("Track"));
         }
         if (ImGui::MenuItem("Add Bus", "Shift+Cmd+B")) {
-            undo.execute(std::make_unique<editing::AddBusCommand>("Bus"));
+            undo.execute(std::make_unique<editing::AddTrackCommand>("Bus", editing::AddTrackCommand::Flavour::Bus));
         }
         ImGui::EndPopup();
     }
@@ -877,7 +774,7 @@ void drawMixer(document::Edit& edit, editing::UndoStack& undo,
             break;
         case StripAction::Kind::RemoveInsert:
             if (action.isMidi) {
-                undo.execute(std::make_unique<editing::RemoveMidiPluginCommand>(
+                undo.execute(std::make_unique<editing::RemovePluginCommand>(
                     action.trackId, action.slotId));
             } else {
                 undo.execute(std::make_unique<editing::RemovePluginCommand>(

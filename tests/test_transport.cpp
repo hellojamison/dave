@@ -13,6 +13,14 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+namespace {
+inline size_t userTracks(const dave::document::Edit& e) {
+    size_t n = 0;
+    for (const auto& t : e.tracks()) if (!t.isMain) ++n;
+    return n;
+}
+} // namespace
+
 using namespace dave;
 
 namespace {
@@ -176,7 +184,7 @@ TEST_CASE("audio track arm and input routing round-trip independently",
 
     document::Edit loaded;
     REQUIRE(document::deserializeEdit(document::serializeEdit(edit), loaded).ok);
-    REQUIRE(loaded.tracks().size() == 2);
+    REQUIRE(userTracks(loaded) == 2);
     const auto* loadedFirst = loaded.track(first);
     const auto* loadedSecond = loaded.track(second);
     REQUIRE(loadedFirst != nullptr);
@@ -197,7 +205,7 @@ TEST_CASE("legacy audio tracks load unarmed on the first mono input",
     })";
     document::Edit edit;
     REQUIRE(document::deserializeEdit(legacy, edit).ok);
-    REQUIRE(edit.tracks().size() == 1);
+    REQUIRE(userTracks(edit) == 1);
     const auto& track = edit.tracks().front();
     CHECK_FALSE(track.recordArm);
     CHECK(track.inputChannel == 0);

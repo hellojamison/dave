@@ -35,6 +35,15 @@ TEST_CASE("editor preferences default safely and round trip globally",
     preferences.transientNavigationEnabled = true;
     preferences.showTransientTicks = true;
     preferences.transientSensitivity = 73;
+    // Fade defaults ride the same round trip; the whole-struct == below covers
+    // them, so a shape or length that failed to serialize would fail here.
+    preferences.defaultFadeInShape = document::FadeShape::EqualPower;
+    preferences.defaultFadeOutShape = document::FadeShape::SCurve;
+    preferences.defaultFadeMs = 42;
+    preferences.preRollEnabled = true;
+    preferences.preRollMs = 1500;
+    preferences.postRollEnabled = true;
+    preferences.postRollMs = 3000;
     REQUIRE(store.save(preferences));
     REQUIRE(store.load() == preferences);
 }

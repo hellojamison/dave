@@ -5,11 +5,36 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace dave::editing {
+
+// Several edits that undo as one. Built for range delete, where trimming a
+// clip on each of a few tracks (and splitting one in two) is a single user
+// action and has to be a single Ctrl+Z. Sub-commands run in order and undo in
+// reverse, so an add that depends on a preceding trim is unwound before it.
+class CompoundCommand : public Command {
+public:
+    CompoundCommand(std::vector<std::unique_ptr<Command>> commands,
+                    std::string label)
+        : commands_(std::move(commands)), label_(std::move(label)) {}
+    void perform(document::Edit& e) override {
+        for (auto& command : commands_) command->perform(e);
+    }
+    void undo(document::Edit& e) override {
+        for (auto it = commands_.rbegin(); it != commands_.rend(); ++it) {
+            (*it)->undo(e);
+        }
+    }
+    std::string name() const override { return label_; }
+    size_t size() const { return commands_.size(); }
+private:
+    std::vector<std::unique_ptr<Command>> commands_;
+    std::string label_;
+};
 
 // AddTrack: creates a new track. Undo removes it (and its clips).
 // Add a track. `Flavour` chooses only the id prefix and the default name —
@@ -335,6 +360,159 @@ private:
     std::string clipId_;
     int64_t newStart_, newSourceOffset_, newLength_;
     int64_t oldStart_ = 0, oldSourceOffset_ = 0, oldLength_ = 0;
+};
+
+// Set a clip's fades — both lengths and their curve shapes at once. The caller
+// passes the whole fade state (copying the side it isn't touching straight from
+// the clip), so one command serves a fade-in, a fade-out, or a preset applied
+// to both, and a single undo puts every field back.
+class SetClipFadeCommand : public Command {
+public:
+    SetClipFadeCommand(std::string trackId, std::string clipId, int64_t fadeIn,
+                       document::FadeShape fadeInShape, int64_t fadeOut,
+                       document::FadeShape fadeOutShape)
+        : trackId_(std::move(trackId)), clipId_(std::move(clipId)),
+          fadeIn_(fadeIn), fadeOut_(fadeOut), fadeInShape_(fadeInShape),
+          fadeOutShape_(fadeOutShape) {}
+    void perform(document::Edit& e) override {
+        auto* c = e.clip(trackId_, clipId_);
+        if (c == nullptr) return;
+        oldFadeIn_ = c->fadeIn;
+        oldFadeOut_ = c->fadeOut;
+        oldFadeInShape_ = c->fadeInShape;
+        oldFadeOutShape_ = c->fadeOutShape;
+        c->fadeIn = fadeIn_;
+        c->fadeOut = fadeOut_;
+        c->fadeInShape = fadeInShape_;
+        c->fadeOutShape = fadeOutShape_;
+        e.notifyChanged();
+    }
+    void undo(document::Edit& e) override {
+        auto* c = e.clip(trackId_, clipId_);
+        if (c == nullptr) return;
+        c->fadeIn = oldFadeIn_;
+        c->fadeOut = oldFadeOut_;
+        c->fadeInShape = oldFadeInShape_;
+        c->fadeOutShape = oldFadeOutShape_;
+        e.notifyChanged();
+    }
+    std::string name() const override { return "Set Fade"; }
+private:
+    std::string trackId_;
+    std::string clipId_;
+    int64_t fadeIn_, fadeOut_;
+    document::FadeShape fadeInShape_, fadeOutShape_;
+    int64_t oldFadeIn_ = 0, oldFadeOut_ = 0;
+    document::FadeShape oldFadeInShape_ = document::FadeShape::Linear;
+    document::FadeShape oldFadeOutShape_ = document::FadeShape::Linear;
+};
+
+// Set an audio clip's per-clip gain. Undo restores the old value.
+class SetClipGainCommand : public Command {
+public:
+    SetClipGainCommand(std::string trackId, std::string clipId, double gain)
+        : trackId_(std::move(trackId)), clipId_(std::move(clipId)),
+          gain_(gain) {}
+    void perform(document::Edit& e) override {
+        auto* c = e.clip(trackId_, clipId_);
+        if (c == nullptr) return;
+        oldGain_ = c->gain;
+        c->gain = gain_;
+        e.notifyChanged();
+    }
+    void undo(document::Edit& e) override {
+        if (auto* c = e.clip(trackId_, clipId_)) {
+            c->gain = oldGain_;
+            e.notifyChanged();
+        }
+    }
+    std::string name() const override { return "Clip Gain"; }
+private:
+    std::string trackId_;
+    std::string clipId_;
+    double gain_, oldGain_ = 1.0;
+};
+
+// Set an audio clip's mute. The caller passes the desired state (a toggle
+// passes the negation of what it read), so undo is a plain restore.
+class SetClipMuteCommand : public Command {
+public:
+    SetClipMuteCommand(std::string trackId, std::string clipId, bool muted)
+        : trackId_(std::move(trackId)), clipId_(std::move(clipId)),
+          muted_(muted) {}
+    void perform(document::Edit& e) override {
+        auto* c = e.clip(trackId_, clipId_);
+        if (c == nullptr) return;
+        oldMuted_ = c->muted;
+        c->muted = muted_;
+        e.notifyChanged();
+    }
+    void undo(document::Edit& e) override {
+        if (auto* c = e.clip(trackId_, clipId_)) {
+            c->muted = oldMuted_;
+            e.notifyChanged();
+        }
+    }
+    std::string name() const override { return muted_ ? "Mute Clip"
+                                                      : "Unmute Clip"; }
+private:
+    std::string trackId_;
+    std::string clipId_;
+    bool muted_, oldMuted_ = false;
+};
+
+// Copy a clip onto a track at a position — Option-dragging leaves the original
+// where it was and drops a copy at the release. Undo removes the copy.
+class CopyClipToCommand : public Command {
+public:
+    CopyClipToCommand(std::string srcTrack, std::string srcClip,
+                      std::string dstTrack, int64_t position)
+        : srcTrack_(std::move(srcTrack)), srcClip_(std::move(srcClip)),
+          dstTrack_(std::move(dstTrack)), position_(position) {}
+    void perform(document::Edit& e) override {
+        const auto* src = e.clip(srcTrack_, srcClip_);
+        if (src == nullptr) return;
+        document::AudioClip copy = *src;
+        copy.timelineStart = position_;
+        const std::string minted = e.addClip(dstTrack_, copy);
+        if (copyId_.empty()) copyId_ = minted;
+        else if (auto* c = e.clip(dstTrack_, minted)) c->id = copyId_;
+    }
+    void undo(document::Edit& e) override {
+        if (!copyId_.empty()) e.removeClip(dstTrack_, copyId_);
+    }
+    std::string name() const override { return "Copy Clip"; }
+    const std::string& copyId() const { return copyId_; }
+private:
+    std::string srcTrack_, srcClip_, dstTrack_;
+    int64_t position_;
+    std::string copyId_;
+};
+
+// The MIDI twin of CopyClipToCommand.
+class CopyMidiClipToCommand : public Command {
+public:
+    CopyMidiClipToCommand(std::string srcTrack, std::string srcClip,
+                          std::string dstTrack, int64_t position)
+        : srcTrack_(std::move(srcTrack)), srcClip_(std::move(srcClip)),
+          dstTrack_(std::move(dstTrack)), position_(position) {}
+    void perform(document::Edit& e) override {
+        const auto* src = e.midiClip(srcTrack_, srcClip_);
+        if (src == nullptr) return;
+        document::MidiClip copy = *src;
+        copy.timelineStart = position_;
+        const std::string minted = e.addMidiClip(dstTrack_, copy);
+        if (copyId_.empty()) copyId_ = minted;
+        else if (auto* c = e.midiClip(dstTrack_, minted)) c->id = copyId_;
+    }
+    void undo(document::Edit& e) override {
+        if (!copyId_.empty()) e.removeMidiClip(dstTrack_, copyId_);
+    }
+    std::string name() const override { return "Copy Clip"; }
+private:
+    std::string srcTrack_, srcClip_, dstTrack_;
+    int64_t position_;
+    std::string copyId_;
 };
 
 // Duplicate an audio clip, placing the copy immediately after the original so
@@ -1195,6 +1373,193 @@ private:
     std::string slotId_;
     bool bypass_ = false;
     bool previous_ = false;
+    bool applied_ = false;
+};
+
+// Hide or show a track. Undoable because it is easy to hit by accident and
+// the track is then not on screen to put back.
+class SetTrackHiddenCommand : public Command {
+public:
+    SetTrackHiddenCommand(std::string trackId, bool hidden)
+        : trackId_(std::move(trackId)), hidden_(hidden) {}
+
+    void perform(document::Edit& e) override {
+        if (const auto* t = e.track(trackId_)) previous_ = t->hidden;
+        applied_ = e.setTrackHidden(trackId_, hidden_);
+    }
+    void undo(document::Edit& e) override {
+        if (applied_) e.setTrackHidden(trackId_, previous_);
+    }
+    std::string name() const override {
+        return hidden_ ? "Hide Track" : "Show Track";
+    }
+
+private:
+    std::string trackId_;
+    bool hidden_ = false;
+    bool previous_ = false;
+    bool applied_ = false;
+};
+
+// Exempt a track from other tracks' solos. Undoable like the other per-track
+// switches — it changes what you hear, and Cmd-clicking a button you meant to
+// click plainly is easy to do.
+class SetTrackSoloSafeCommand : public Command {
+public:
+    SetTrackSoloSafeCommand(std::string trackId, bool safe)
+        : trackId_(std::move(trackId)), safe_(safe) {}
+
+    void perform(document::Edit& e) override {
+        if (const auto* t = e.track(trackId_)) previous_ = t->soloSafe;
+        applied_ = e.setTrackSoloSafe(trackId_, safe_);
+    }
+    void undo(document::Edit& e) override {
+        if (applied_) e.setTrackSoloSafe(trackId_, previous_);
+    }
+    std::string name() const override { return "Solo Safe"; }
+
+private:
+    std::string trackId_;
+    bool safe_ = false;
+    bool previous_ = false;
+    bool applied_ = false;
+};
+
+// Put every hidden track back. One command, so an accidental hide-several is
+// one undo rather than several.
+class ShowAllTracksCommand : public Command {
+public:
+    void perform(document::Edit& e) override {
+        hiddenIds_.clear();
+        for (const auto& track : e.tracks()) {
+            if (track.hidden) hiddenIds_.push_back(track.id);
+        }
+        for (const auto& id : hiddenIds_) e.setTrackHidden(id, false);
+    }
+    void undo(document::Edit& e) override {
+        for (const auto& id : hiddenIds_) e.setTrackHidden(id, true);
+    }
+    std::string name() const override { return "Show All Tracks"; }
+
+private:
+    std::vector<std::string> hiddenIds_;
+};
+
+// ─── Clip groups ────────────────────────────────────────────────────────────
+
+// Group the given clips. The clips themselves are untouched — a group is a
+// record held beside them — so undo is the removal of that record and nothing
+// has to be reconstructed.
+class GroupClipsCommand : public Command {
+public:
+    GroupClipsCommand(std::vector<document::ClipGroup::Member> members,
+                      int64_t start, int64_t length,
+                      std::vector<std::string> trackIds = {},
+                      std::vector<std::string> childGroupIds = {},
+                      std::string name = {})
+        : members_(std::move(members)), start_(start), length_(length),
+          trackIds_(std::move(trackIds)),
+          childGroupIds_(std::move(childGroupIds)), name_(std::move(name)) {}
+
+    void perform(document::Edit& e) override {
+        if (groupId_.empty()) {
+            groupId_ = e.addClipGroup(members_, start_, length_, trackIds_,
+                                      childGroupIds_, name_);
+            if (const auto* group = e.clipGroup(groupId_)) snapshot_ = *group;
+        } else {
+            // Redo reuses the first id, so anything holding it still resolves.
+            e.restoreClipGroup_(snapshot_, index_);
+        }
+    }
+
+    void undo(document::Edit& e) override {
+        if (groupId_.empty()) return;
+        const auto& groups = e.clipGroups();
+        for (size_t i = 0; i < groups.size(); ++i) {
+            if (groups[i].id == groupId_) { index_ = i; break; }
+        }
+        e.removeClipGroup(groupId_);
+    }
+
+    std::string name() const override { return "Group Clips"; }
+    const std::string& groupId() const { return groupId_; }
+
+private:
+    std::vector<document::ClipGroup::Member> members_;
+    int64_t start_ = 0;
+    int64_t length_ = 0;
+    std::vector<std::string> trackIds_;
+    std::vector<std::string> childGroupIds_;
+    std::string name_;
+    std::string groupId_;
+    document::ClipGroup snapshot_;
+    size_t index_ = 0;
+};
+
+// Ungroup. Undo puts the group back exactly, including its position in the
+// list, because the clips never moved.
+class UngroupClipsCommand : public Command {
+public:
+    explicit UngroupClipsCommand(std::string groupId)
+        : groupId_(std::move(groupId)) {}
+
+    void perform(document::Edit& e) override {
+        const auto& groups = e.clipGroups();
+        for (size_t i = 0; i < groups.size(); ++i) {
+            if (groups[i].id != groupId_) continue;
+            snapshot_ = groups[i];
+            index_ = i;
+            break;
+        }
+        removed_ = e.removeClipGroup(groupId_);
+    }
+
+    void undo(document::Edit& e) override {
+        if (removed_) e.restoreClipGroup_(snapshot_, index_);
+    }
+
+    std::string name() const override { return "Ungroup Clips"; }
+
+private:
+    std::string groupId_;
+    document::ClipGroup snapshot_;
+    size_t index_ = 0;
+    bool removed_ = false;
+};
+
+// Move a group: its range and every clip in it, together. One command, so it
+// moves and un-moves as one thing — a command per member would let an undo
+// stop halfway and tear the group apart on the timeline.
+//
+// Members keep their tracks. A group can span tracks, and dragging one across
+// lanes would have to decide what happens to a member with no lane to land in;
+// sliding in time has no such question.
+class MoveClipGroupCommand : public Command {
+public:
+    MoveClipGroupCommand(std::string groupId, int64_t deltaSamples)
+        : groupId_(std::move(groupId)), delta_(deltaSamples) {}
+
+    void perform(document::Edit& e) override {
+        const auto* before = e.clipGroup(groupId_);
+        const int64_t start = before != nullptr ? before->timelineStart : 0;
+        applied_ = e.moveClipGroup(groupId_, delta_);
+        if (applied_) {
+            // The clamp may have shortened the move; undo has to reverse what
+            // actually happened, not what was asked for.
+            const auto* after = e.clipGroup(groupId_);
+            if (after != nullptr) delta_ = after->timelineStart - start;
+        }
+    }
+
+    void undo(document::Edit& e) override {
+        if (applied_) e.moveClipGroup(groupId_, -delta_);
+    }
+
+    std::string name() const override { return "Move Clip Group"; }
+
+private:
+    std::string groupId_;
+    int64_t delta_ = 0;
     bool applied_ = false;
 };
 

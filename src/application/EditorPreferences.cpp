@@ -91,6 +91,38 @@ EditorPreferences EditorPreferencesStore::load() const noexcept {
         if (rmsBody != root.end() && rmsBody->is_boolean()) {
             preferences.meterRmsBody = rmsBody->get<bool>();
         }
+        // Fade defaults, also added after the first release. A shape is clamped
+        // to the known values so a future or corrupt id can't cast past the
+        // enum.
+        const auto clampShape = [](int v) {
+            return static_cast<document::FadeShape>(
+                std::clamp(v, 0, static_cast<int>(document::FadeShape::SCurve)));
+        };
+        const auto fadeInShape = root.find("defaultFadeInShape");
+        if (fadeInShape != root.end() && fadeInShape->is_number_integer()) {
+            preferences.defaultFadeInShape = clampShape(fadeInShape->get<int>());
+        }
+        const auto fadeOutShape = root.find("defaultFadeOutShape");
+        if (fadeOutShape != root.end() && fadeOutShape->is_number_integer()) {
+            preferences.defaultFadeOutShape =
+                clampShape(fadeOutShape->get<int>());
+        }
+        const auto fadeMs = root.find("defaultFadeMs");
+        if (fadeMs != root.end() && fadeMs->is_number_integer()) {
+            preferences.defaultFadeMs = std::max(0, fadeMs->get<int>());
+        }
+        const auto preOn = root.find("preRollEnabled");
+        if (preOn != root.end() && preOn->is_boolean())
+            preferences.preRollEnabled = preOn->get<bool>();
+        const auto preMs = root.find("preRollMs");
+        if (preMs != root.end() && preMs->is_number_integer())
+            preferences.preRollMs = std::max(0, preMs->get<int>());
+        const auto postOn = root.find("postRollEnabled");
+        if (postOn != root.end() && postOn->is_boolean())
+            preferences.postRollEnabled = postOn->get<bool>();
+        const auto postMs = root.find("postRollMs");
+        if (postMs != root.end() && postMs->is_number_integer())
+            preferences.postRollMs = std::max(0, postMs->get<int>());
         return preferences;
     } catch (...) {
         return defaults;
@@ -112,6 +144,15 @@ bool EditorPreferencesStore::save(
             {"meterPreFader", preferences.meterPreFader},
             {"meterRmsBody", preferences.meterRmsBody},
             {"meterPeakHoldSeconds", preferences.meterPeakHoldSeconds},
+            {"defaultFadeInShape",
+             static_cast<int>(preferences.defaultFadeInShape)},
+            {"defaultFadeOutShape",
+             static_cast<int>(preferences.defaultFadeOutShape)},
+            {"defaultFadeMs", preferences.defaultFadeMs},
+            {"preRollEnabled", preferences.preRollEnabled},
+            {"preRollMs", preferences.preRollMs},
+            {"postRollEnabled", preferences.postRollEnabled},
+            {"postRollMs", preferences.postRollMs},
         };
         std::error_code error;
         const auto parent = path_.parent_path();

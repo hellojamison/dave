@@ -20,7 +20,9 @@
 #include "gui/IoPanel.h"
 #include "gui/ChannelStrip.h"
 #include "gui/Mixer.h"
+#include "gui/SideRail.h"
 #include "gui/Timeline.h"
+#include "gui/TrackList.h"
 #include "platform/AudioEngine.h"
 #include "platform/Window.h"
 
@@ -112,6 +114,8 @@ private:
     void punchIn();
     void punchOut();
     void toggleRecording();
+    // Start/stop playback, rolling in from the pre-roll lead when enabled.
+    void togglePlayback();
     // A capture is running — the engine is writing to disk, so routing
     // topology is frozen even when nothing is being kept.
     bool capturing() const { return recordingSession_ != nullptr; }
@@ -123,6 +127,13 @@ private:
     void showStatus(std::string message, bool error = false);
     bool requestClose();
     bool loadWavIntoNewTrack(const std::string& path);
+    // Import a WAV and place it as a clip on an existing track at `sample`.
+    bool placeWavOnTrack(const std::string& path, const std::string& trackId,
+                         int64_t sample);
+    // Frame count of a WAV from its header, cached for the drag-over ghost.
+    int64_t wavLengthSamples(const std::string& path);
+    std::string fileDragLenPath_;
+    int64_t fileDragLenSamples_ = 0;
     void drawUI();
     void drawPluginBrowser();
     void drawVideoPreview();        // legacy wrapper
@@ -184,7 +195,19 @@ private:
     // The strip is a single narrow column now, not a plugin list, and it is
     // opt-in: a session that isn't routing anything shouldn't spend width on
     // it. The E button on a track header opens it.
+    // What the right column is showing. One panel at a time, the way an
+    // activity bar works: two panels sharing a column would each get half the
+    // width and neither would be usable.
+    enum class RightPanel { None, Strip };
+    // The channel strip is the right column's default content: the right
+    // Tracks panel was removed (the left list is the only one needed), and an
+    // empty right column reads as a missing panel rather than a clean layout.
+    RightPanel rightPanel_ = RightPanel::Strip;
     bool showChannelStrip_ = false;
+    // The track list on the left. Off by default like the strip: a session
+    // with nothing hidden has nothing to look up.
+    bool showTrackList_ = false;
+    float trackListWidth_ = 190.0f;
     float sidebarWidth_ = 260.0f;
     gui::ChannelStripState channelStrip_;
     float videoHeight_ = 322.0f;
@@ -204,6 +227,9 @@ private:
     // session.
     bool showMixer_ = false;
     float mixerHeight_ = 340.0f;
+    // Toolbar snap-increment custom value, in milliseconds (session-only).
+    double snapCustomMs_ = 100.0;
+    double gridCustomMs_ = 100.0;
 
     // ─── Loop transport ─────────────────────────────────────────────────────
     // Loop is a transport mode, not a document property: it follows whatever

@@ -16,6 +16,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cmath>
 #include <array>
 #include <memory>
 #include <string>
@@ -105,6 +106,28 @@ TEST_CASE("a drop index follows the rows' real heights", "[channelstrip]") {
     // Past the end is still the last row, not off it.
     CHECK(gui::dropIndexAmongRows(9000.0f, tops, bottom) == 2);
     CHECK(gui::dropIndexAmongRows(50.0f, {}, bottom) == 0);
+}
+
+TEST_CASE("the fader's unity tick sits where ImGui draws the 0 dB grab",
+          "[channelstrip]") {
+    // ImGui insets a slider's grab travel by grab_padding (2px) + grab_sz/2 at
+    // each end, so the tick has to use that same geometry. The reference
+    // numbers are computed straight from SliderBehaviorT for a 200px fader with
+    // an 18px grab: usable travel [11, 189].
+    constexpr float h = 200.0f;
+    constexpr float grab = 18.0f;
+    auto at = [&](float db) {
+        return gui::verticalSliderGrabCenterY(0.0f, h, grab, db, -60.0f, 6.0f);
+    };
+    // The endpoints land at the grab-centre insets, never the raw frame edges
+    // (which is what a full-height mapping would have used).
+    CHECK(std::abs(at(6.0f) - 11.0f) < 0.01f);     // +6 dB pinned to the top
+    CHECK(std::abs(at(-60.0f) - 189.0f) < 0.01f);  // -60 dB pinned to the bottom
+    // 0 dB: grabT = 1 - 60/66, so 11 + 178 * (6/66) = 27.18 — a full grab-half
+    // below the 18.18 the old full-height formula produced.
+    CHECK(std::abs(at(0.0f) - 27.1818f) < 0.01f);
+    // Never higher than the naive mapping: the inset only pushes the tick down.
+    CHECK(at(0.0f) > 0.0f + (1.0f - 60.0f / 66.0f) * h);
 }
 
 TEST_CASE("the picker filter is case-insensitive and matches anywhere",
@@ -536,3 +559,109 @@ TEST_CASE("the fader row survives being dragged and undone", "[channelstrip]") {
           std::vector<std::string>{"fader", "insert:" + fx[0],
                                    "insert:" + fx[1], "insert:" + fx2});
 }
+
+// ─── Meter placement and output pinning ─────────────────────────────────────
+
+namespace {
+// A strip rig that passes meter options through, so the below-fader placement
+// and the bottom-pinned output can be exercised at the real widget.
+struct MeteredStripRig : dave::testing::ImGuiRig {
+    gui::ChannelStripState strip;
+    gui::LevelMeterOptions meterOptions;
+
+    void render(float windowHeight) {
+        frame(-100.0f, -100.0f, false, [&] {
+            ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
+            ImGui::SetNextWindowSize(ImVec2(260.0f, windowHeight));
+            ImGui::Begin("strip");
+            gui::drawChannelStrip(edit, undo, view, strip, 4, 2, false, {},
+                                  nullptr, &meterOptions);
+            ImGui::End();
+        });
+    }
+};
+
+bool chainHasFader(const dave::document::Edit& edit, const std::string& id) {
+    const auto* t = edit.track(id);
+    if (t == nullptr) return false;
+    for (const auto& slot : t->chain) {
+        if (slot.kind == dave::document::ChainSlot::Kind::Fader) return true;
+    }
+    return false;
+}
+} // namespace
+
+TEST_CASE("the strip renders with the meter in either place",
+          "[channelstrip][meter]") {
+    // A pure layout change must not touch the document: no undo entries, and
+    // the chain keeps its single fader slot whichever way the meter is shown.
+    // Both placements are exercised at two heights so the output-pinning
+    // spacer is tested where there is spare room and where there is not.
+    MeteredStripRig rig;
+    const std::string track = rig.edit.addTrack("Dialog");
+    rig.view.selectedTrackIndex =
+        static_cast<int>(rig.edit.tracks().size()) - 1;
+    REQUIRE(chainHasFader(rig.edit, track));
+
+    for (bool below : {false, true, false}) {
+        rig.meterOptions.belowFader = below;
+        rig.render(900.0f);   // spare room below -> output pushed to the base
+        rig.render(240.0f);   // cramped -> the spacer must clamp, not overflow
+        CHECK(rig.undo.undoDepth() == 0);
+        CHECK(chainHasFader(rig.edit, track));
+    }
+}
+
+TEST_CASE("the below-fader meter option persists through the menu path",
+          "[channelstrip][meter]") {
+    // The option lives on LevelMeterOptions and is toggled from the meter's own
+    // menu; here we set it directly and confirm the strip honours it without
+    // resetting it — the failure that would make the toggle feel dead.
+    MeteredStripRig rig;
+    const std::string track = rig.edit.addTrack("Music");
+    rig.view.selectedTrackIndex =
+        static_cast<int>(rig.edit.tracks().size()) - 1;
+
+    rig.meterOptions.belowFader = true;
+    rig.render(700.0f);
+    CHECK(rig.meterOptions.belowFader);   // the strip must not clear it
+}
+
+TEST_CASE("dragging the meter down moves it below the fader, up restores it",
+          "[channelstrip][meter]") {
+    // The meter toggles its placement on a vertical drag. The flip has to reach
+    // the real options, not the pre-fader copy the strip hands the meter — the
+    // bug that made the drag look dead.
+    MeteredStripRig rig;
+    rig.edit.addTrack("Vox");
+    rig.view.selectedTrackIndex =
+        static_cast<int>(rig.edit.tracks().size()) - 1;
+    rig.meterOptions.belowFader = false;
+
+    auto body = [&] {
+        ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
+        ImGui::SetNextWindowSize(ImVec2(260.0f, 900.0f));
+        ImGui::Begin("strip");
+        gui::drawChannelStrip(rig.edit, rig.undo, rig.view, rig.strip, 4, 2,
+                              false, {}, nullptr, &rig.meterOptions);
+        ImGui::End();
+    };
+
+    // The in-chain meter sits at the fader row; sweep to find it, then drag it
+    // down past the threshold.
+    const float x = 130.0f;
+    bool movedDown = false;
+    for (float y = 30.0f; y < 500.0f && !movedDown; y += 4.0f) {
+        rig.meterOptions.belowFader = false;
+        rig.frame(x, y, false, body);
+        rig.frame(x, y, true, body);
+        rig.frame(x, y + 15.0f, true, body);
+        rig.frame(x, y + 40.0f, true, body);
+        rig.frame(x, y + 40.0f, false, body);
+        movedDown = rig.meterOptions.belowFader;
+    }
+    CHECK(movedDown);
+    // A placement change is layout only — it never touches the document.
+    CHECK(rig.undo.undoDepth() == 0);
+}
+

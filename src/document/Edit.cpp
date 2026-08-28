@@ -485,6 +485,7 @@ bool Edit::removeClip(const std::string& trackId, const std::string& clipId) {
     for (auto it = t->clips.begin(); it != t->clips.end(); ++it) {
         if (it->id == clipId) {
             t->clips.erase(it);
+            pruneClipGroups_();
             notifyChanged();
             return true;
         }
@@ -870,6 +871,286 @@ void Edit::loadMusicalTime_(std::vector<TempoChange> tempo,
     meterMap_ = normalizeMeterMap(std::move(map));
 }
 
+// ─── Clip groups ────────────────────────────────────────────────────────────
+
+namespace {
+
+bool memberExists(const Edit& edit, const ClipGroup::Member& member) {
+    const auto* track = edit.track(member.trackId);
+    if (track == nullptr) return false;
+    if (member.midi) {
+        return std::any_of(track->midiClips.begin(), track->midiClips.end(),
+                           [&](const MidiClip& c) {
+                               return c.id == member.clipId;
+                           });
+    }
+    return std::any_of(track->clips.begin(), track->clips.end(),
+                       [&](const AudioClip& c) {
+                           return c.id == member.clipId;
+                       });
+}
+
+} // namespace
+
+std::string Edit::addClipGroup(std::vector<ClipGroup::Member> members,
+                               int64_t start, int64_t length,
+                               std::vector<std::string> trackIds,
+                               std::vector<std::string> childGroupIds,
+                               std::string name) {
+    // Drop anything that does not name a real clip, and anything already in
+    // another group — a clip in two groups would move twice for one drag.
+    std::vector<ClipGroup::Member> kept;
+    kept.reserve(members.size());
+    for (auto& member : members) {
+        if (!memberExists(*this, member)) continue;
+        if (clipGroupContaining(member.trackId, member.clipId) != nullptr) {
+            continue;
+        }
+        const bool duplicate =
+            std::any_of(kept.begin(), kept.end(),
+                        [&](const ClipGroup::Member& existing) {
+                            return existing == member;
+                        });
+        if (!duplicate) kept.push_back(std::move(member));
+    }
+    // A group is defined by its range, not by how many clips are in it. An
+    // empty one is a legitimate object — a placeholder over a section you are
+    // about to fill, which you can drag around like anything else — so the
+    // only thing refused is a group with no extent.
+    if (length <= 0) return {};
+
+    // Only groups that exist and are not already inside something else. A
+    // group with two parents would move twice for one drag, the same way a
+    // clip in two groups would.
+    childGroupIds.erase(
+        std::remove_if(childGroupIds.begin(), childGroupIds.end(),
+                       [&](const std::string& id) {
+                           return clipGroup(id) == nullptr ||
+                                  clipGroupParent(id) != nullptr;
+                       }),
+        childGroupIds.end());
+    // Their rows come with them, so an outer group drawn over a nested one
+    // covers everywhere the nested one did.
+    for (const auto& childId : childGroupIds) {
+        const auto* child = clipGroup(childId);
+        if (child == nullptr) continue;
+        for (const auto& trackId : child->trackIds) {
+            const bool known = std::any_of(trackIds.begin(), trackIds.end(),
+                                           [&](const std::string& id) {
+                                               return id == trackId;
+                                           });
+            if (!known) trackIds.push_back(trackId);
+        }
+    }
+
+    ClipGroup group;
+    group.childGroupIds = std::move(childGroupIds);
+    // Every member's track counts even if the caller did not list it.
+    for (const auto& member : kept) {
+        const bool known = std::any_of(trackIds.begin(), trackIds.end(),
+                                       [&](const std::string& id) {
+                                           return id == member.trackId;
+                                       });
+        if (!known) trackIds.push_back(member.trackId);
+    }
+    // A group has to sit somewhere. With no members and no rows named, there
+    // is nothing to draw it on.
+    if (trackIds.empty()) return {};
+    group.trackIds = std::move(trackIds);
+    group.timelineStart = std::max<int64_t>(0, start);
+    group.length = std::max<int64_t>(0, length);
+    group.id = newId("group_");
+    ++idCounter_;
+    group.name = name.empty() ? "Group " + std::to_string(idCounter_)
+                              : std::move(name);
+    group.members = std::move(kept);
+    const std::string id = group.id;
+    clipGroups_.push_back(std::move(group));
+    notifyChanged();
+    return id;
+}
+
+const ClipGroup* Edit::clipGroupParent(const std::string& groupId) const {
+    if (groupId.empty()) return nullptr;
+    for (const auto& group : clipGroups_) {
+        for (const auto& childId : group.childGroupIds) {
+            if (childId == groupId) return &group;
+        }
+    }
+    return nullptr;
+}
+
+bool Edit::moveClipGroup(const std::string& groupId, int64_t deltaSamples) {
+    const auto it = std::find_if(clipGroups_.begin(), clipGroups_.end(),
+                                 [&](const ClipGroup& g) {
+                                     return g.id == groupId;
+                                 });
+    if (it == clipGroups_.end() || deltaSamples == 0) return false;
+
+    // Clamped as one object. Clamping each clip against zero separately would
+    // squash the members together and lose their spacing, which is the one
+    // thing a group exists to keep — and the range would no longer match them.
+    const int64_t earliest = earliestInClipGroup_(groupId);
+    const int64_t applied = std::max(deltaSamples, -earliest);
+    if (applied == 0) return false;
+
+    shiftClipGroup_(groupId, applied);
+    notifyChanged();
+    return true;
+}
+
+// Slide one group and everything it contains, without notifying — the caller
+// does that once for the whole move. Recursive, because a nested group's own
+// range has to travel with the clips inside it or the box stops sitting over
+// its contents.
+// The earliest sample anything in this group touches, its nested groups
+// included. The clamp uses it so a drag stops the whole tree at zero rather
+// than squashing whatever happened to be leftmost.
+int64_t Edit::earliestInClipGroup_(const std::string& groupId) const {
+    const auto* group = clipGroup(groupId);
+    if (group == nullptr) return 0;
+    int64_t earliest = group->timelineStart;
+    for (const auto& member : group->members) {
+        if (member.midi) {
+            if (const auto* c = const_cast<Edit*>(this)->midiClip(
+                    member.trackId, member.clipId)) {
+                earliest = std::min(earliest, c->timelineStart);
+            }
+        } else if (const auto* c = const_cast<Edit*>(this)->clip(
+                       member.trackId, member.clipId)) {
+            earliest = std::min(earliest, c->timelineStart);
+        }
+    }
+    for (const auto& childId : group->childGroupIds) {
+        earliest = std::min(earliest, earliestInClipGroup_(childId));
+    }
+    return earliest;
+}
+
+void Edit::shiftClipGroup_(const std::string& groupId, int64_t delta) {
+    const auto it = std::find_if(clipGroups_.begin(), clipGroups_.end(),
+                                 [&](const ClipGroup& g) {
+                                     return g.id == groupId;
+                                 });
+    if (it == clipGroups_.end()) return;
+    it->timelineStart += delta;
+    const auto members = it->members;
+    const auto children = it->childGroupIds;
+    for (const auto& member : members) {
+        if (member.midi) {
+            if (auto* c = midiClip(member.trackId, member.clipId)) {
+                c->timelineStart += delta;
+            }
+        } else if (auto* c = clip(member.trackId, member.clipId)) {
+            c->timelineStart += delta;
+        }
+    }
+    for (const auto& childId : children) shiftClipGroup_(childId, delta);
+}
+
+bool Edit::restoreClipGroup_(ClipGroup group, size_t index) {
+    if (group.id.empty()) return false;
+    if (clipGroup(group.id) != nullptr) return false;
+    const size_t at = std::min(index, clipGroups_.size());
+    clipGroups_.insert(clipGroups_.begin() + static_cast<ptrdiff_t>(at),
+                       std::move(group));
+    notifyChanged();
+    return true;
+}
+
+bool Edit::removeClipGroup(const std::string& groupId) {
+    const auto it = std::find_if(clipGroups_.begin(), clipGroups_.end(),
+                                 [&](const ClipGroup& g) {
+                                     return g.id == groupId;
+                                 });
+    if (it == clipGroups_.end()) return false;
+    clipGroups_.erase(it);
+    // A parent naming a group that has gone would keep pretending to contain
+    // it — the child would stay hidden with nothing standing in for it.
+    for (auto& group : clipGroups_) {
+        group.childGroupIds.erase(
+            std::remove(group.childGroupIds.begin(),
+                        group.childGroupIds.end(), groupId),
+            group.childGroupIds.end());
+    }
+    notifyChanged();
+    return true;
+}
+
+const ClipGroup* Edit::clipGroup(const std::string& groupId) const {
+    for (const auto& group : clipGroups_) {
+        if (group.id == groupId) return &group;
+    }
+    return nullptr;
+}
+
+const ClipGroup* Edit::clipGroupContaining(const std::string& trackId,
+                                           const std::string& clipId) const {
+    if (clipId.empty()) return nullptr;
+    for (const auto& group : clipGroups_) {
+        for (const auto& member : group.members) {
+            if (member.trackId == trackId && member.clipId == clipId) {
+                return &group;
+            }
+        }
+    }
+    return nullptr;
+}
+
+void Edit::pruneClipGroups_() {
+    bool changed = false;
+    for (auto& group : clipGroups_) {
+        group.childGroupIds.erase(
+            std::remove_if(group.childGroupIds.begin(),
+                           group.childGroupIds.end(),
+                           [&](const std::string& id) {
+                               return clipGroup(id) == nullptr;
+                           }),
+            group.childGroupIds.end());
+        const auto before = group.members.size();
+        group.members.erase(
+            std::remove_if(group.members.begin(), group.members.end(),
+                           [&](const ClipGroup::Member& member) {
+                               return !memberExists(*this, member);
+                           }),
+            group.members.end());
+        changed = changed || group.members.size() != before;
+    }
+    // Emptying a group does NOT delete it: the range is the object, and one
+    // that vanished when you deleted its last clip would take the section
+    // marker with it. Only a group with no extent is dropped, which cannot be
+    // created and can only come from a damaged file.
+    const auto before = clipGroups_.size();
+    clipGroups_.erase(std::remove_if(clipGroups_.begin(), clipGroups_.end(),
+                                     [](const ClipGroup& group) {
+                                         return group.length <= 0;
+                                     }),
+                      clipGroups_.end());
+    if (changed || clipGroups_.size() != before) notifyChanged();
+}
+
+bool Edit::setTrackSoloSafe(const std::string& trackId, bool safe) {
+    Track* t = track(trackId);
+    if (t == nullptr) return false;
+    if (t->soloSafe == safe) return false;
+    t->soloSafe = safe;
+    notifyChanged();
+    return true;
+}
+
+bool Edit::setTrackHidden(const std::string& trackId, bool hidden) {
+    Track* t = track(trackId);
+    if (t == nullptr) return false;
+    // Main is where everything ends up; a session with no visible Main has no
+    // visible output, and no way to get it back except from a menu that would
+    // have to exist only for this case.
+    if (t->isMain && hidden) return false;
+    if (t->hidden == hidden) return false;
+    t->hidden = hidden;
+    notifyChanged();
+    return true;
+}
+
 void Edit::normalizeChain_(Track& track) {
     std::vector<ChainSlot> rebuilt;
     rebuilt.reserve(track.plugins.size() + track.sends.size() + 1);
@@ -1070,6 +1351,7 @@ bool Edit::removeMidiClip(const std::string& trackId, const std::string& clipId)
     for (auto it = mt->midiClips.begin(); it != mt->midiClips.end(); ++it) {
         if (it->id == clipId) {
             mt->midiClips.erase(it);
+            pruneClipGroups_();
             notifyChanged();
             return true;
         }

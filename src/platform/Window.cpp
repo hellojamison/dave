@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "platform/Window.h"
+#include "platform/FileDrag.h"
 
 #include <glad.h>
 
@@ -120,6 +121,11 @@ Window::Window(int width, int height, const std::string& title) {
 
     // Keep the window from shrinking below a usable DAW size.
     glfwSetWindowSizeLimits(window_, 900, 540, GLFW_DONT_CARE, GLFW_DONT_CARE);
+
+    // Track file drag-over so the app can preview a drop before release. The
+    // OS runs a modal loop during the drag, parking our own run loop, so the
+    // tracker renders a frame on each move through this callback.
+    installFileDragTracking(window_, [this] { renderFrame(); });
 }
 
 Window::~Window() {
@@ -268,6 +274,11 @@ void Window::setCursorHidden(bool hidden) {
     const int want = hidden ? GLFW_CURSOR_HIDDEN : GLFW_CURSOR_NORMAL;
     if (mode != want) glfwSetInputMode(window_, GLFW_CURSOR, want);
     cursorHidden_ = hidden;
+}
+
+void Window::cursorPos(double& x, double& y) const {
+    x = 0.0; y = 0.0;
+    if (window_ != nullptr) glfwGetCursorPos(window_, &x, &y);
 }
 
 } // namespace dave::platform

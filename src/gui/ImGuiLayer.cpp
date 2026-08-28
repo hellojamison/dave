@@ -30,18 +30,12 @@ bool ImGuiLayer::init(platform::Window& window) {
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;       // docking branch feature
-    // Multi-viewport (detached OS windows) is enabled for one reason: the video
-    // preview can be popped out of the sidebar and dragged onto a second
-    // display, which is how picture is monitored in post. The layout stays
-    // predictable anyway — every docked panel is repositioned with
-    // ImGuiCond_Always and carries NoMove | NoDocking, so the popped-out
-    // picture window is the only thing that can leave the main window.
-    // The framebuffer screenshot harness captures one GLFW context. Detached
-    // ImGui viewports (including popovers promoted to platform windows) live
-    // in other contexts and would disappear from visual acceptance images.
-    if (!platform::Window::screenshotMode()) {
-        io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
-    }
+    // Multi-viewport (detached OS windows) exists for one thing: the video
+    // preview can be popped out and dragged onto a second display. It is NOT
+    // enabled here, because with it on macOS swallows the first click after the
+    // app is reactivated (the click activates the app instead of hitting the
+    // control). setViewportsEnabled turns it on only while the picture is
+    // actually popped out, so the everyday case has no focus-first behaviour.
     // Keep ImGui's own title bar on detached windows rather than the OS one:
     // this build of ImGui draws both when the platform window is decorated.
     io.ConfigViewportsNoDecoration = true;
@@ -82,6 +76,19 @@ void ImGuiLayer::newFrame() {
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
+}
+
+void ImGuiLayer::setViewportsEnabled(bool enabled) {
+    ImGui::SetCurrentContext(context_);
+    ImGuiIO& io = ImGui::GetIO();
+    // Screenshots capture one GLFW context; detached viewports live in other
+    // contexts and would vanish from the acceptance images, so force off there.
+    const bool on = enabled && !platform::Window::screenshotMode();
+    if (on) {
+        io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+    } else {
+        io.ConfigFlags &= ~ImGuiConfigFlags_ViewportsEnable;
+    }
 }
 
 void ImGuiLayer::render() {

@@ -533,18 +533,20 @@ bool iconButton(const char* id, TransportIcon icon, const char* tooltip,
         case TransportIcon::Transient: {
             // A compact onset pulse with a precise landing rail. It describes
             // the operation without borrowing another DAW's toolbar artwork.
+            // Mirrored horizontally: the landing rail on the left, the pulse
+            // rising toward it, so the glyph reads right-to-left.
             const ImVec2 points[] = {
-                ImVec2(center.x - 8.0f, center.y + 4.0f),
-                ImVec2(center.x - 4.5f, center.y + 4.0f),
-                ImVec2(center.x - 1.5f, center.y - 6.0f),
-                ImVec2(center.x + 1.5f, center.y + 6.0f),
-                ImVec2(center.x + 4.0f, center.y - 2.0f),
-                ImVec2(center.x + 7.5f, center.y - 2.0f),
+                ImVec2(center.x + 8.0f, center.y + 4.0f),
+                ImVec2(center.x + 4.5f, center.y + 4.0f),
+                ImVec2(center.x + 1.5f, center.y - 6.0f),
+                ImVec2(center.x - 1.5f, center.y + 6.0f),
+                ImVec2(center.x - 4.0f, center.y - 2.0f),
+                ImVec2(center.x - 7.5f, center.y - 2.0f),
             };
             drawList->AddPolyline(points, IM_ARRAYSIZE(points), glyph,
                                   ImDrawFlags_None, 1.8f);
-            drawList->AddLine(ImVec2(center.x + 8.0f, center.y - 7.0f),
-                              ImVec2(center.x + 8.0f, center.y + 7.0f),
+            drawList->AddLine(ImVec2(center.x - 8.0f, center.y - 7.0f),
+                              ImVec2(center.x - 8.0f, center.y + 7.0f),
                               glyph, 1.0f);
             break;
         }

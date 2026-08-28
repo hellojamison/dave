@@ -101,11 +101,13 @@ if(APPLE)
     target_sources(Dave PRIVATE
         "${THIRD_PARTY}/vst3sdk/public.sdk/source/vst/hosting/module_mac.mm"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/engine/plugins/PluginEditor_mac.mm"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/MacMenuBar.mm")
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/MacMenuBar.mm"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/FileDragMac.mm")
     set_source_files_properties(
         "${THIRD_PARTY}/vst3sdk/public.sdk/source/vst/hosting/module_mac.mm"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/engine/plugins/PluginEditor_mac.mm"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/MacMenuBar.mm" PROPERTIES
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/MacMenuBar.mm"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/FileDragMac.mm" PROPERTIES
         COMPILE_FLAGS "-fobjc-arc")
 elseif(WIN32)
     target_sources(Dave PRIVATE

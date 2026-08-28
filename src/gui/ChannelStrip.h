@@ -37,6 +37,19 @@ namespace dave::gui {
 size_t dropIndexAmongRows(float mouseY, const std::vector<float>& rowTops,
                           float listBottom);
 
+// Screen Y of a vertical slider's grab centre for `value`, replicating ImGui's
+// SliderBehaviorT geometry. ImGui insets the grab's travel by
+// grab_padding + grab_sz/2 at each end so the handle never spills past the
+// frame; mapping value linearly across the full height (as the fader's unity
+// tick once did) therefore lands a grab-half above where the handle actually
+// sits. Used to place the 0 dB tick so it reads as being at nominal.
+//
+// `grabMinSize` is the value pushed via ImGuiStyleVar_GrabMinSize around the
+// slider, not the style default. Vertical sliders put the maximum at the top.
+float verticalSliderGrabCenterY(float trackTopY, float trackHeight,
+                                float grabMinSize, float value, float vMin,
+                                float vMax);
+
 // Drag state for the sends list. Held in the view rather than in a static so
 // two strips (or a strip and a test) can't share one drag.
 struct ChannelStripState {

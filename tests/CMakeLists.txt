@@ -11,6 +11,7 @@ add_executable(dave_tests
     test_markers.cpp
     test_mixer.cpp
     test_clipmove.cpp
+    test_clipgroups.cpp
     test_trackcommands.cpp
     test_channelstrip.cpp
     test_smf.cpp
@@ -21,6 +22,9 @@ add_executable(dave_tests
     test_timelinelayout.cpp
     test_maineditorlayout.cpp
     test_trackcolor.cpp
+    test_trackvisibility.cpp
+    test_tracklist.cpp
+    test_siderail.cpp
     test_automation.cpp
     test_trackmeter.cpp
     test_transport.cpp
@@ -36,11 +40,15 @@ add_executable(dave_tests
     test_takenaming.cpp
     test_punchrecording.cpp
     test_musicaltime.cpp
+    test_fade.cpp
+    test_clipfades.cpp
+    test_clipoverlap.cpp
     test_transientdetector.cpp
     test_transientcache.cpp
     test_transientnavigation.cpp
     test_iopanel.cpp
     test_mixerstrip.cpp
+    test_trimrange.cpp
     test_recordcontroller.cpp
     test_transportrecording.cpp
     test_committake.cpp
@@ -82,6 +90,8 @@ add_executable(dave_tests
     "${CMAKE_SOURCE_DIR}/src/gui/IoPanel.cpp"
     "${CMAKE_SOURCE_DIR}/src/gui/RoutingViewModel.cpp"
     "${CMAKE_SOURCE_DIR}/src/gui/TrackColorPicker.cpp"
+    "${CMAKE_SOURCE_DIR}/src/gui/SideRail.cpp"
+    "${CMAKE_SOURCE_DIR}/src/gui/TrackList.cpp"
     "${CMAKE_SOURCE_DIR}/src/engine/record/WavWriter.cpp"
     "${CMAKE_SOURCE_DIR}/src/engine/record/DiskWriter.cpp")
 target_sources(dave_tests PRIVATE

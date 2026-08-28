@@ -3,6 +3,7 @@
 
 #include "document/MusicalTime.h"
 #include "editing/Commands.h"
+#include "gui/SideRail.h"
 #include "gui/Theme.h"
 #include "gui/TrackColorPicker.h"
 
@@ -19,6 +20,18 @@ namespace dave::gui {
 
 // Format a sample position into the selected timecode mode.
 // sr=48000, fps=24 (default), bpm=120, beatsPerBar=4.
+std::vector<document::VolumeAutomationPoint> automationErase(
+    const std::vector<document::VolumeAutomationPoint>& points,
+    int64_t loSample, int64_t hiSample) {
+    std::vector<document::VolumeAutomationPoint> result;
+    result.reserve(points.size());
+    for (const auto& point : points) {
+        if (point.sample >= loSample && point.sample <= hiSample) continue;
+        result.push_back(point);
+    }
+    return result;
+}
+
 double automationCurveShape(double t, double steepness, bool flipped) {
     t = std::clamp(t, 0.0, 1.0);
     const double exponent = std::clamp(steepness, 0.1, 12.0);
@@ -403,6 +416,7 @@ struct TrackGutterFields {
     double* pan = nullptr;
     bool* mute = nullptr;
     bool* solo = nullptr;
+    const bool* soloSafe = nullptr;
     // Audio tracks expose record arm. MIDI passes null and retains the exact
     // two-button M/S layout it had before recording existed.
     bool* recordArm = nullptr;
@@ -427,7 +441,18 @@ float drawTrackGutter(const GutterLayout& g, TimelineViewState& view,
         const bool thisRenaming = view.isRenaming && view.renameTrackIndex == uid;
 
         if (thisRenaming) {
-            ImGui::SetCursorScreenPos(ImVec2(origin.x + kGutterContentX, y + g.rowPadding));
+            // Match the readout: same font and size, and back the input frame
+            // off by one FramePadding so the glyphs land exactly where the name
+            // is drawn when not editing — switching to edit shouldn't nudge it,
+            // the same fix as the time counter.
+            ImFont* nameFont = theme::fonts().label != nullptr
+                ? theme::fonts().label : ImGui::GetFont();
+            ImGui::PushFont(nameFont, g.labelHeight);
+            const float framePadX = ImGui::GetStyle().FramePadding.x;
+            const float framePadY = ImGui::GetStyle().FramePadding.y;
+            ImGui::SetCursorScreenPos(
+                ImVec2(origin.x + kGutterContentX - framePadX,
+                       y + g.rowPadding - framePadY));
             ImGui::PushItemWidth(
                 g.gutterWidth - (f.recordArm != nullptr ? 118.0f : 88.0f));
             ImGui::SetKeyboardFocusHere();
@@ -450,6 +475,7 @@ float drawTrackGutter(const GutterLayout& g, TimelineViewState& view,
             }
             ImGui::PopID();
             ImGui::PopItemWidth();
+            ImGui::PopFont();
         } else {
             ImFont* nameFont = theme::fonts().label != nullptr
                 ? theme::fonts().label : ImGui::GetFont();
@@ -464,13 +490,54 @@ float drawTrackGutter(const GutterLayout& g, TimelineViewState& view,
                         C(pal.text), f.name->c_str());
             dl->PopClipRect();
         }
-        if (g.gutterHovered &&
+        const bool overName = g.gutterHovered &&
             g.mouse.x >= origin.x + 16.0f &&
             g.mouse.x <= origin.x + g.gutterWidth -
                              (f.recordArm != nullptr ? 110.0f : 86.0f) &&
             g.mouse.y >= y &&
-            g.mouse.y <= y + g.headerHeight + g.rowPadding * 2.0f &&
-            ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            g.mouse.y <= y + g.headerHeight + g.rowPadding * 2.0f;
+
+        // Right-click the name for the track menu. The colour band next to it
+        // already owns right-click for colours, so this is the one other
+        // place on the row with nothing bound to it.
+        char menuId[32];
+        std::snprintf(menuId, sizeof(menuId), "##trackMenu_%d", uid);
+        if (overName && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+            ImGui::OpenPopup(menuId);
+        }
+        if (ImGui::BeginPopup(menuId)) {
+            ImGui::TextDisabled("%s", f.name->c_str());
+            ImGui::Separator();
+            if (ImGui::MenuItem("Rename")) {
+                view.isRenaming = true;
+                view.renameTrackIndex = uid;
+            }
+            const bool isMain = f.trackId != nullptr &&
+                                *f.trackId == document::kMainBusId;
+            if (ImGui::MenuItem("Hide Track", nullptr, false, !isMain)) {
+                if (f.trackId != nullptr) {
+                    view.requestHideTrackId = *f.trackId;
+                }
+            }
+            if (isMain &&
+                ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                ImGui::SetTooltip("Main is where everything ends up.");
+            }
+            size_t hiddenCount = 0;
+            for (const auto& t : edit.tracks()) {
+                if (t.hidden) ++hiddenCount;
+            }
+            if (ImGui::MenuItem("Show All Tracks", nullptr, false,
+                                hiddenCount > 0)) {
+                view.requestShowAllTracks = true;
+            }
+            if (hiddenCount > 0) {
+                ImGui::TextDisabled("%zu hidden", hiddenCount);
+            }
+            ImGui::EndPopup();
+        }
+
+        if (overName && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
             view.isRenaming = true;
             view.renameTrackIndex = uid;
         }
@@ -504,8 +571,13 @@ float drawTrackGutter(const GutterLayout& g, TimelineViewState& view,
                               hovered ? C(pal.surfaceStrong)
                                       : C(pal.trackControlInactive), 3.0f);
             dl->AddRect(bMin, bMax, C(pal.border), 3.0f);
-            theme::drawCenteredControlLabel(
-                dl, theme::Rect{bMin, bMax}, C(pal.textMuted), "E");
+            // The two-fader glyph the side rail uses for the strip, so the row
+            // button and the rail button read as the same thing rather than an
+            // unexplained "E".
+            drawStripIcon(dl,
+                          ImVec2((bMin.x + bMax.x) * 0.5f,
+                                 (bMin.y + bMax.y) * 0.5f),
+                          C(hovered ? pal.text : pal.textMuted));
             if (hovered) ImGui::SetTooltip("Channel strip");
             ImGui::PopID();
             msX += msSize.x + msGap;
@@ -532,9 +604,16 @@ float drawTrackGutter(const GutterLayout& g, TimelineViewState& view,
             ImGui::SetCursorScreenPos(ImVec2(msX, msY));
             const bool pressed = ImGui::InvisibleButton("##ms", msSize);
             const bool hovered = ImGui::IsItemHovered();
+            const bool isSolo = toggles[b].flag == f.solo;
             if (pressed) {
-                if (b == 0 && f.recordArm != nullptr &&
-                    view.deferRecordArmRequests && f.trackId != nullptr) {
+                const ImGuiIO& io = ImGui::GetIO();
+                // Either modifier: on macOS ImGui swaps them, so testing one
+                // alone is wrong on one platform or the other.
+                const bool commandHeld = io.KeySuper || io.KeyCtrl;
+                if (isSolo && commandHeld && f.trackId != nullptr) {
+                    view.requestToggleSoloSafeTrackId = *f.trackId;
+                } else if (b == 0 && f.recordArm != nullptr &&
+                           view.deferRecordArmRequests && f.trackId != nullptr) {
                     view.requestRecordArmTrackId = *f.trackId;
                 } else {
                     *toggles[b].flag = !*toggles[b].flag;
@@ -552,12 +631,19 @@ float drawTrackGutter(const GutterLayout& g, TimelineViewState& view,
                                (bMin.y + bMax.y) * 0.5f),
                     6.5f, on, hovered);
             } else {
+                const bool safe = isSolo && f.soloSafe != nullptr &&
+                                  *f.soloSafe;
                 const ImU32 fill = on ? C(t.active)
                                       : (hovered ? C(pal.surfaceStrong)
                                                  : C(pal.trackControlInactive));
                 dl->AddRectFilled(bMin, bMax, fill, 3.0f);
+                // Solo-safe is a ring, not a fill: the track is exempt from
+                // other solos, which is a standing state — filling it would
+                // read as "this track is soloed" and it is not.
                 dl->AddRect(bMin, bMax,
-                            on ? C(t.active) : C(pal.border), 3.0f);
+                            safe ? C(t.active)
+                                 : (on ? C(t.active) : C(pal.border)),
+                            3.0f, 0, safe ? 2.0f : 1.0f);
                 // Dark text on the bright active fills; both amber and yellow
                 // are too light for the normal foreground to stay legible.
                 const ImU32 labelCol =
@@ -800,7 +886,9 @@ void drawTimeline(const document::Edit& edit,
     const float minTrackHeight =
         rowPadding * 2.0f + headerHeight +
         compactControlHeight * 2.0f + rowGap * 2.0f;
-    trackHeight = std::max(trackHeight, minTrackHeight);
+    // Control+scroll scales the row height (see the wheel handler); the
+    // format-derived minimum is still enforced so controls never clip.
+    trackHeight = std::max(trackHeight * view.trackHeightScale, minTrackHeight);
 
     // Rows deliberately stop at their content boundary. The shell below them
     // is a canvas for future tracks, not a blank continuation of the gutter.
@@ -831,20 +919,45 @@ void drawTimeline(const document::Edit& edit,
     // Height is a property of the row, not of a band: a track carrying an
     // instrument needs the extra control row, everything else does not.
     auto baseHeightOf = [&](const document::Track& t) {
-        return t.instrument.uidString.empty() ? trackHeight : midiTrackHeight;
+        const float base =
+            t.instrument.uidString.empty() ? trackHeight : midiTrackHeight;
+        const auto it = view.trackHeightScales.find(t.id);
+        const float perTrack = it != view.trackHeightScales.end() ? it->second : 1.0f;
+        return std::max(minTrackHeight, base * perTrack);
     };
+    // A hidden row is zero-height rather than absent from this table. Every
+    // selection, drag and command in the timeline indexes tracks by their
+    // position in the document; compacting the table here would silently
+    // renumber all of them the moment a track was hidden.
     auto rowOffsets = [&](const auto& channels) {
         std::vector<float> offsets(channels.size() + 1, 0.0f);
         for (size_t index = 0; index < channels.size(); ++index) {
-            offsets[index + 1] = offsets[index] + baseHeightOf(channels[index]) +
-                (view.expandedTracks.contains(channels[index].id)
-                     ? automationLaneHeight : 0.0f);
+            const float height = channels[index].hidden
+                ? 0.0f
+                : baseHeightOf(channels[index]) +
+                      (view.expandedTracks.contains(channels[index].id)
+                           ? automationLaneHeight : 0.0f);
+            offsets[index + 1] = offsets[index] + height;
         }
         return offsets;
     };
     const auto audioOffsets = rowOffsets(tracks);
     const float audioRegionHeight = audioOffsets.back();
     const float tracksRegionHeight = audioRegionHeight;
+    // Only the track rows scroll; the ruler, marker lane and add-track "+" are
+    // pinned. Scrolling the rows ourselves (instead of the host window) keeps
+    // `origin` fixed, so the header can't slide up and clip against the top —
+    // and reserving only the VISIBLE row height below keeps the window itself
+    // from ever becoming scrollable, which is what moved `origin` before.
+    const float headerBottomY = origin.y + timelineHeight + markerLaneHeight;
+    const float visibleTracksHeight =
+        std::max(0.0f, origin.y + totalHeight - headerBottomY);
+    const float maxVerticalScroll =
+        std::max(0.0f, tracksRegionHeight - visibleTracksHeight);
+    view.verticalScroll =
+        std::clamp(view.verticalScroll, 0.0f, maxVerticalScroll);
+    const float trackAreaButtonHeight =
+        std::min(tracksRegionHeight, visibleTracksHeight);
     char areaBtn[32];
     std::snprintf(areaBtn, sizeof(areaBtn), "##timeline_area_%p", &view);
     // The InvisibleButton covers the clip lane (right of the gutter) so it
@@ -854,11 +967,27 @@ void drawTimeline(const document::Edit& edit,
         ImGui::SetCursorScreenPos(
             ImVec2(origin.x + gutterWidth,
                    origin.y + timelineHeight + markerLaneHeight));
+        // This area button spans every track row and every expanded automation
+        // lane. Small controls drawn later inside those lanes — the automation
+        // tool buttons — can spill right of the gutter and overlap it; without
+        // allowing overlap here, this earlier item swallows their clicks (the
+        // eraser button, sitting furthest right, was the one that lost).
+        ImGui::SetNextItemAllowOverlap();
         ImGui::InvisibleButton(
-            areaBtn, ImVec2(totalWidth - gutterWidth, tracksRegionHeight));
+            areaBtn, ImVec2(totalWidth - gutterWidth, trackAreaButtonHeight));
         areaHovered = ImGui::IsItemHovered();
     }
     const ImVec2 mouse = ImGui::GetIO().MousePos;
+    // Holding Command turns the pointer into a select-only tool: it draws a
+    // range and never grabs a clip, so a selection can be made straight over
+    // clips without nudging them.
+    // "Command as selector": while the platform command modifier is held
+    // (Command on macOS, Ctrl elsewhere) a press marks a time range instead of
+    // picking up the clip under it. ImGui's macOS behavior swaps Command and
+    // Control, so the command modifier surfaces as KeyCtrl on every platform;
+    // reading KeySuper (as this once did) fired on the physical Control key
+    // instead, which is why holding Command appeared to do nothing.
+    const bool selectorMode = ImGui::GetIO().KeyCtrl;
 
     // Is the mouse over the ruler region? Check independently of areaHovered
     // (the InvisibleButton only covers the track-rows area, but the ruler is
@@ -895,16 +1024,29 @@ void drawTimeline(const document::Edit& edit,
     const double bpm = edit.tempoBpm();
     const auto& meterMap = edit.meterMap();
     const auto& tempoMap = edit.tempoMap();
-    const GridStep grid = gridStepFor(view.tcMode, view.samplesPerPixel, sr,
-                                      24.0, bpm, &meterMap, &tempoMap);
+    GridStep grid = gridStepFor(view.tcMode, view.samplesPerPixel, sr,
+                                24.0, bpm, &meterMap, &tempoMap);
+    // A chosen grid increment overrides the format grid, but only while its
+    // lines stay at least a few pixels apart — otherwise a fine increment
+    // zoomed out would draw thousands of lines, so the format grid stands in.
+    bool gridOverridden = false;
+    if (view.gridIncrementSamples > 0 &&
+        view.gridIncrementSamples / view.samplesPerPixel >= 4.0) {
+        grid.minor = view.gridIncrementSamples;
+        grid.major = view.gridIncrementSamples * 5;
+        gridOverridden = true;
+    }
     // One snap policy serves automation points, seeks, clip moves and range
     // edges. Turning Snap off preserves the raw sample under the pointer.
     auto snapPosition = [&](int64_t pos) -> int64_t {
         pos = std::max<int64_t>(0, pos);
-        return view.snapEnabled
-            ? snapSampleToFormat(pos, view.tcMode, view.samplesPerPixel, sr,
-                                 24.0, bpm, &meterMap, &tempoMap)
-            : pos;
+        if (!view.snapEnabled) return pos;
+        if (view.snapIncrementSamples > 0) {
+            const int64_t inc = view.snapIncrementSamples;
+            return ((pos + inc / 2) / inc) * inc;
+        }
+        return snapSampleToFormat(pos, view.tcMode, view.samplesPerPixel, sr,
+                                  24.0, bpm, &meterMap, &tempoMap);
     };
 
     // Walks the visible grid at `step`. Majors and minors are walked
@@ -927,7 +1069,8 @@ void drawTimeline(const document::Edit& edit,
     // bars|beats walks the map instead of stepping. A uniform step drawn under
     // a 3/4 section puts every line in the wrong place — and the ruler labels
     // would disagree with the counter, which reads through the same map.
-    const bool musicalGrid = view.tcMode == TimecodeMode::BarsBeats;
+    const bool musicalGrid =
+        view.tcMode == TimecodeMode::BarsBeats && !gridOverridden;
     auto forEachMusicalLine = [&](bool majors, auto&& fn) {
         const double perBar =
             document::samplesPerBarAtBar(1, sr, tempoMap, meterMap);
@@ -1156,7 +1299,15 @@ void drawTimeline(const document::Edit& edit,
 
     // Marker lane was already drawn above (before the InvisibleButton). Reuse
     // its height to compute the track-row region.
-    const float tracksTop = origin.y + timelineHeight + markerLaneHeight;
+    const float tracksTop = headerBottomY - view.verticalScroll;
+    // Confine every row (gutter headers, clips, automation, the selection) to
+    // the area below the pinned header, so a scrolled-up row is clipped under
+    // the ruler/marker lane rather than painting over them. Popped just before
+    // the playhead, which spans the full height. Balanced with the nested clip
+    // rects the clip lanes push inside this region.
+    dl->PushClipRect(ImVec2(origin.x, headerBottomY),
+                     ImVec2(origin.x + totalWidth, origin.y + totalHeight),
+                     true);
     const bool gutterHovered =
         windowHovered &&
         mouse.x >= origin.x && mouse.x <= origin.x + gutterWidth &&
@@ -1230,6 +1381,10 @@ void drawTimeline(const document::Edit& edit,
         const std::vector<document::VolumeAutomationPoint>& storedPoints,
         float top, AutomationParameter parameter) {
         const bool isPan = parameter == AutomationParameter::Pan;
+        // The eraser brush half-width, in pixels. Points whose x falls inside
+        // the swept band are removed; 9 px is wide enough to catch a point
+        // without demanding pixel-accurate aim.
+        constexpr float eraseRadiusPx = 9.0f;
         const float bottom = top + automationLaneHeight;
         const float laneLeft = origin.x + gutterWidth;
         const float laneRight = origin.x + totalWidth;
@@ -1249,7 +1404,10 @@ void drawTimeline(const document::Edit& edit,
         ImGui::SetCursorScreenPos(
             ImVec2(origin.x + kGutterContentX - 4.0f, top + 5.0f));
         ImGui::PushID(ownerId.c_str());
-        ImGui::SetNextItemWidth(112.0f);
+        // 90, not the combo's natural width: it shares the gutter with
+        // four tool buttons now, and at 112 the fourth (eraser) spilled
+        // past the gutter edge and was clipped by the lane.
+        ImGui::SetNextItemWidth(90.0f);
         const char* parameterName = isPan ? "Pan" : "Volume";
         if (ImGui::BeginCombo("##automationParameter", parameterName,
                               ImGuiComboFlags_HeightSmall)) {
@@ -1295,7 +1453,7 @@ void drawTimeline(const document::Edit& edit,
         // Derived from where the parameter combo ends, not a fixed pixel:
         // the combo starts at the shared gutter-content origin, so a hardcoded
         // value here silently overlaps it the moment that origin moves.
-        constexpr float kParameterComboWidth = 112.0f;
+        constexpr float kParameterComboWidth = 90.0f;
         const float toolsLeft =
             origin.x + kGutterContentX - 4.0f + kParameterComboWidth + 8.0f;
         auto drawToolButton = [&](const char* id, AutomationTool tool,
@@ -1346,12 +1504,40 @@ void drawTimeline(const document::Edit& edit,
                                 ImDrawFlags_None, 1.8f);
                 dl->AddCircleFilled(curve[0], 1.8f, iconColor);
                 dl->AddCircleFilled(curve[curveSegments], 1.8f, iconColor);
-            } else {
+            } else if (tool == AutomationTool::Line) {
                 const ImVec2 a(buttonMin.x + 6.0f, buttonMin.y + 16.0f);
                 const ImVec2 b(buttonMin.x + 18.0f, buttonMin.y + 6.0f);
                 dl->AddLine(a, b, iconColor, 1.8f);
                 dl->AddCircleFilled(a, 2.0f, iconColor);
                 dl->AddCircleFilled(b, 2.0f, iconColor);
+            } else {
+                // Eraser: a filled rubber block tilted on the page with a
+                // band across it separating the sleeve from the tip. Built
+                // around the button centre from a long/short axis so its
+                // centroid IS the centre — the earlier hand-placed quad and
+                // its shavings sat low and left of centre.
+                const ImVec2 mid(buttonMin.x + toolSize.x * 0.5f,
+                                 buttonMin.y + toolSize.y * 0.5f);
+                const ImVec2 lng(0.85f, -0.53f);   // long axis, up-right
+                const ImVec2 sh(0.53f, 0.85f);     // short axis, perpendicular
+                constexpr float halfLen = 7.6f;
+                constexpr float halfWid = 4.4f;
+                auto corner = [&](float u, float v) {
+                    return ImVec2(mid.x + u * halfLen * lng.x + v * halfWid * sh.x,
+                                  mid.y + u * halfLen * lng.y + v * halfWid * sh.y);
+                };
+                const ImVec2 c1 = corner(+1.0f, +1.0f);
+                const ImVec2 c2 = corner(+1.0f, -1.0f);
+                const ImVec2 c3 = corner(-1.0f, -1.0f);
+                const ImVec2 c4 = corner(-1.0f, +1.0f);
+                dl->AddQuadFilled(c1, c2, c3, c4, iconColor);
+                // The groove: a chord across the block a third of the way in
+                // from the tip, drawn in the button fill so it reads as a seam.
+                auto lerp = [](ImVec2 p, ImVec2 q, float t) {
+                    return ImVec2(p.x + (q.x - p.x) * t, p.y + (q.y - p.y) * t);
+                };
+                dl->AddLine(lerp(c1, c4, 0.4f), lerp(c2, c3, 0.4f),
+                            buttonFill, 1.6f);
             }
             automationMouseOver = automationMouseOver || hovered;
             if (hovered) ImGui::SetTooltip("%s", tooltip);
@@ -1368,6 +1554,9 @@ void drawTimeline(const document::Edit& edit,
                        "Option (Alt): flip it\n"
                        "Shift or Control: hold the end still and sweep how "
                        "steep it is");
+        drawToolButton("##eraser", AutomationTool::Eraser,
+                       toolsLeft + 3.0f * (toolSize.x + toolGap),
+                       "Eraser: drag across the lane to remove points");
         ImGui::PopID();
         ImGui::PopID();
         ImGui::SetCursorScreenPos(savedParameterCursor);
@@ -1442,6 +1631,21 @@ void drawTimeline(const document::Edit& edit,
             if (!view.drawingAutomation ||
                 view.drawingAutomationOwnerId != ownerId ||
                 view.drawingAutomationParameter != parameter) {
+                return;
+            }
+            if (view.drawingAutomationTool == AutomationTool::Eraser) {
+                // No snapping: the band should track the pointer exactly so a
+                // point is erased the instant the brush covers it.
+                const int64_t radius = static_cast<int64_t>(
+                    view.samplesPerPixel * eraseRadiusPx);
+                const int64_t here = static_cast<int64_t>(
+                    view.scrollSamples +
+                    (std::clamp(mouse.x, laneLeft, laneRight) - laneLeft) *
+                        view.samplesPerPixel);
+                view.automationEraseMinSample =
+                    std::min(view.automationEraseMinSample, here - radius);
+                view.automationEraseMaxSample =
+                    std::max(view.automationEraseMaxSample, here + radius);
                 return;
             }
             if (view.drawingAutomationTool == AutomationTool::Line) {
@@ -1580,6 +1784,11 @@ void drawTimeline(const document::Edit& edit,
             });
             return result;
         };
+        auto envelopeWithErase = [&] {
+            return automationErase(view.automationDrawOriginal,
+                                   view.automationEraseMinSample,
+                                   view.automationEraseMaxSample);
+        };
         auto replaceEnvelope = [&](
             const std::vector<document::VolumeAutomationPoint>& points) {
             if (isPan) {
@@ -1670,7 +1879,10 @@ void drawTimeline(const document::Edit& edit,
         } else if (view.drawingAutomation &&
                    view.drawingAutomationOwnerId == ownerId &&
                    view.drawingAutomationParameter == parameter) {
-            previewPoints = envelopeWithStroke();
+            previewPoints =
+                view.drawingAutomationTool == AutomationTool::Eraser
+                    ? envelopeWithErase()
+                    : envelopeWithStroke();
             drawPoints = &previewPoints;
         }
 
@@ -1774,6 +1986,10 @@ void drawTimeline(const document::Edit& edit,
                     "Drag a parabolic ramp; hold Option (Alt on Windows) "
                     "for logarithmic; hold Control to reverse the slope; "
                     "double-click to enter a value; right-click to delete");
+            } else if (view.automationTool == AutomationTool::Eraser) {
+                ImGui::SetTooltip(
+                    "Drag across the lane to erase points; "
+                    "right-click to delete this one");
             } else {
                 ImGui::SetTooltip(isPan
                     ? "Drag to move; double-click to enter pan; right-click to delete"
@@ -1787,6 +2003,8 @@ void drawTimeline(const document::Edit& edit,
                     "Drag a parabolic automation ramp; hold Option "
                     "(Alt on Windows) for logarithmic; hold Control to "
                     "reverse the slope");
+            } else if (view.automationTool == AutomationTool::Eraser) {
+                ImGui::SetTooltip("Drag across the lane to erase points");
             } else {
                 ImGui::SetTooltip(
                     "Drag to draw automation; click to add one point");
@@ -1896,6 +2114,15 @@ void drawTimeline(const document::Edit& edit,
         const bool showPencilCursor =
             laneHovered && view.automationTool == AutomationTool::Pencil &&
             !view.editingAutomationValue && !opensValueEditor;
+        const bool showEraserBrush =
+            laneHovered && view.automationTool == AutomationTool::Eraser &&
+            !view.editingAutomationValue;
+        if (showEraserBrush) {
+            // A hollow ring the width of the erase band, so the reach is
+            // visible before committing to a swipe.
+            dl->AddCircle(mouse, eraseRadiusPx, C(pal.primaryText), 0, 1.4f);
+            dl->AddCircle(mouse, eraseRadiusPx, C(pal.accentDeep), 0, 0.6f);
+        }
         if (showPencilCursor) {
             // Two mechanisms on purpose. ImGui's is what a headless test can
             // observe; the view flag is what actually reaches the screen,
@@ -1914,7 +2141,10 @@ void drawTimeline(const document::Edit& edit,
                    view.drawingAutomationOwnerId == ownerId &&
                    view.drawingAutomationParameter == parameter) {
             if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
-                const auto replacement = envelopeWithStroke();
+                const auto replacement =
+                    view.drawingAutomationTool == AutomationTool::Eraser
+                        ? envelopeWithErase()
+                        : envelopeWithStroke();
                 if (replacement != view.automationDrawOriginal) {
                     replaceEnvelope(replacement);
                 }
@@ -1970,23 +2200,34 @@ void drawTimeline(const document::Edit& edit,
                 view.drawingAutomation = true;
                 view.drawingAutomationParameter = parameter;
                 view.drawingAutomationTool = view.automationTool;
-                view.automationDrawFlipped =
-                    view.automationTool == AutomationTool::Curve &&
-                    ImGui::GetIO().KeyAlt;
-                // Steepness carries over between strokes — it is a tool
-                // setting, like a brush size, not something to relearn every
-                // time. Only the latch resets.
-                view.automationSteepnessLatched = false;
                 view.drawingAutomationOwnerId = ownerId;
                 view.automationDrawOriginal = storedPoints;
                 view.automationDrawStroke.clear();
-                view.automationDrawAnchor = {
-                    {}, xToSample(mouse.x),
-                    clampLaneValue(yToValue(mouse.y))};
-                view.automationDrawLastX = mouse.x;
-                view.automationDrawLastY = mouse.y;
-                upsertStrokePoint(view.automationDrawAnchor.sample,
-                                  view.automationDrawAnchor.db);
+                if (view.automationTool == AutomationTool::Eraser) {
+                    const int64_t radius = static_cast<int64_t>(
+                        view.samplesPerPixel * eraseRadiusPx);
+                    const int64_t here = static_cast<int64_t>(
+                        view.scrollSamples +
+                        (std::clamp(mouse.x, laneLeft, laneRight) - laneLeft) *
+                            view.samplesPerPixel);
+                    view.automationEraseMinSample = here - radius;
+                    view.automationEraseMaxSample = here + radius;
+                } else {
+                    view.automationDrawFlipped =
+                        view.automationTool == AutomationTool::Curve &&
+                        ImGui::GetIO().KeyAlt;
+                    // Steepness carries over between strokes — it is a tool
+                    // setting, like a brush size, not something to relearn
+                    // every time. Only the latch resets.
+                    view.automationSteepnessLatched = false;
+                    view.automationDrawAnchor = {
+                        {}, xToSample(mouse.x),
+                        clampLaneValue(yToValue(mouse.y))};
+                    view.automationDrawLastX = mouse.x;
+                    view.automationDrawLastY = mouse.y;
+                    upsertStrokePoint(view.automationDrawAnchor.sample,
+                                      view.automationDrawAnchor.db);
+                }
             }
             automationConsumedClick = true;
         }
@@ -2022,10 +2263,40 @@ void drawTimeline(const document::Edit& edit,
         ImGuiStyleVar_FramePadding, ImVec2(style.FramePadding.x, 1.0f));
     for (size_t ti = 0; ti < tracks.size(); ++ti) {
         const auto& track = tracks[ti];
+        // Zero-height, so there is nothing to draw and nothing to hit.
+        if (track.hidden) continue;
         float y = tracksTop + audioOffsets[ti];
         if (y > origin.y + totalHeight) break;
 
-        bool selected = view.selectedTrackIndex == static_cast<int>(ti);
+        // A 6px grip on the row's bottom edge (in the gutter) resizes the row.
+        {
+            const float rowTotalH = audioOffsets[ti + 1] - audioOffsets[ti];
+            char resizeId[40];
+            std::snprintf(resizeId, sizeof(resizeId), "##rowresize_%zu", ti);
+            ImGui::SetCursorScreenPos(ImVec2(origin.x, y + rowTotalH - 3.0f));
+            ImGui::SetNextItemAllowOverlap();
+            ImGui::InvisibleButton(resizeId, ImVec2(gutterWidth, 6.0f));
+            if (ImGui::IsItemHovered() || view.resizingTrackId == track.id) {
+                ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+            }
+            if (ImGui::IsItemActive()) {
+                view.resizingTrackId = track.id;
+                const float base = track.instrument.uidString.empty()
+                    ? trackHeight : midiTrackHeight;
+                const float laneExtra =
+                    view.expandedTracks.contains(track.id) ? automationLaneHeight
+                                                           : 0.0f;
+                const float desired =
+                    std::max(minTrackHeight, (mouse.y - y) - laneExtra);
+                view.trackHeightScales[track.id] =
+                    std::clamp(desired / base, 0.5f, 4.0f);
+            } else if (view.resizingTrackId == track.id) {
+                view.resizingTrackId.clear();
+            }
+        }
+
+        bool selected = view.selectedTrackIndex == static_cast<int>(ti) ||
+                        view.selectedTrackIds.count(track.id) > 0;
         // Header and lane get different surfaces rather than one fill across
         // the row. The lane is the darkest surface in the app so clips and
         // waveforms read as content sitting in a well, with the header column
@@ -2070,6 +2341,7 @@ void drawTimeline(const document::Edit& edit,
                                               &mutableTrack.pan,
                                               &mutableTrack.mute,
                                               &mutableTrack.solo,
+                                              &mutableTrack.soloSafe,
                                               &mutableTrack.recordArm},
                             selected);
         }
@@ -2077,9 +2349,16 @@ void drawTimeline(const document::Edit& edit,
         // drawn above, note blobs here — because nothing about the row says
         // which kind it is allowed to carry.
         for (const auto& clip : track.midiClips) {
+            if (edit.clipGroupContaining(track.id, clip.id) != nullptr) {
+                continue;
+            }
             const bool clipIsDragging =
                 view.isDragging(TimelineViewState::DragKind::MidiClip) &&
                 view.selectedClipId == clip.id;
+            // Moved clips are drawn once, on top, at the pointer's row after
+            // every track (below), so they cross tracks freely and leave
+            // nothing on their own row.
+            if (clipIsDragging && !ImGui::GetIO().KeyAlt) continue;
             // A trim previews length and source offset as well as position,
             // and one row carries both clip vectors now — so the preview has
             // to check the dragged clip's kind, not just its id.
@@ -2102,6 +2381,9 @@ void drawTimeline(const document::Edit& edit,
             const ImVec2 clipMax(static_cast<float>(clipX + clipW),
                                  y + midiTrackHeight - 6.0f);
             const bool isSel = view.selectedClipId == clip.id;
+            dl->PushClipRect(ImVec2(origin.x + gutterWidth, y),
+                             ImVec2(origin.x + totalWidth, y + midiTrackHeight),
+                             true);
             ImVec4 body = pal.clipMidi;
             if (isSel) body = ImVec4(body.x + 0.1f, body.y + 0.08f, body.z + 0.05f, 1.0f);
             dl->AddRectFilled(clipMin, clipMax, C(body), 2.0f);
@@ -2165,6 +2447,8 @@ void drawTimeline(const document::Edit& edit,
                 }
             }
 
+            dl->PopClipRect();
+
             const bool clipHovered =
                 mouse.x >= clipMin.x && mouse.x <= clipMax.x &&
                 mouse.y >= clipMin.y && mouse.y <= clipMax.y;
@@ -2174,10 +2458,13 @@ void drawTimeline(const document::Edit& edit,
                 midiGesture != TimelineViewState::DragKind::None) {
                 ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
             }
-            if (areaHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+            if (!selectorMode && areaHovered &&
+                ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
                 clipHovered) {
                 view.selectedClipId = clip.id;
                 view.selectedTrackIndex = static_cast<int>(ti);
+                selectClipRange(view, transport, static_cast<int>(ti),
+                                clip.timelineStart, clip.length);
                 view.dragClipOriginalStart = clip.timelineStart;
                 view.dragPreviewStart = clip.timelineStart;
                 view.dragClipOriginalOffset = clip.sourceOffset;
@@ -2198,6 +2485,74 @@ void drawTimeline(const document::Edit& edit,
                 ImGui::OpenPopup("##midi_clip_ctx");
             }
         }
+        // The group clips. Drawn after the members so a group always sits on
+        // top of anything that is not in it.
+        for (const auto& group : edit.clipGroups()) {
+            if (!group.coversTrack(track.id) || group.length <= 0) continue;
+            // A nested group is recorded but stood in for by the one above
+            // it, the same way a grouped clip is stood in for by its group.
+            if (!edit.clipGroupIsTopLevel(group.id)) continue;
+            const bool dragging =
+                view.isDragging(TimelineViewState::DragKind::AudioClip) &&
+                view.selectedClipId == group.id;
+            const int64_t drawStart =
+                dragging ? view.dragPreviewStart : group.timelineStart;
+            double gx = origin.x + gutterWidth +
+                (drawStart - view.scrollSamples) / view.samplesPerPixel;
+            double gw = static_cast<double>(group.length) / view.samplesPerPixel;
+            if (gw < 2) gw = 2;
+            if (gx + gw < origin.x + gutterWidth) continue;
+            if (gx > origin.x + totalWidth) continue;
+
+            const ImVec2 gMin(static_cast<float>(gx), y + 6.0f);
+            const ImVec2 gMax(static_cast<float>(gx + gw),
+                              y + baseHeightOf(track) - 6.0f);
+            const bool selected = view.selectedClipId == group.id;
+            ImVec4 body = pal.accentDeep;
+            if (selected) {
+                body = ImVec4(body.x + 0.08f, body.y + 0.08f, body.z + 0.08f,
+                              1.0f);
+            }
+            dl->AddRectFilled(gMin, gMax, C(body), 3.0f);
+            dl->AddRect(gMin, gMax,
+                        selected ? C(pal.accent) : C(pal.accentStrong), 3.0f);
+            if (gw > 28.0) {
+                ImFont* groupFont = theme::fonts().small != nullptr
+                    ? theme::fonts().small : ImGui::GetFont();
+                dl->PushClipRect(ImVec2(gMin.x + 6.0f, gMin.y),
+                                 ImVec2(gMax.x - 4.0f, gMax.y), true);
+                dl->AddText(groupFont,
+                            static_cast<float>(theme::typeScale().caption),
+                            ImVec2(gMin.x + 6.0f, gMin.y + 3.0f),
+                            C(pal.primaryText), group.name.c_str());
+                dl->PopClipRect();
+            }
+
+            const bool groupHovered =
+                mouse.x >= gMin.x && mouse.x <= gMax.x &&
+                mouse.y >= gMin.y && mouse.y <= gMax.y;
+            if (!selectorMode && areaHovered && groupHovered &&
+                ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                // The group is the drag target now, so it uses the clip drag
+                // machinery with its own id — one gesture, one code path.
+                view.selectedClipId = group.id;
+                view.selectedTrackIndex = static_cast<int>(ti);
+                selectClipRange(view, transport, static_cast<int>(ti),
+                                group.timelineStart, group.length);
+                view.dragClipOriginalStart = group.timelineStart;
+                view.dragPreviewStart = group.timelineStart;
+                view.dragOriginalTrackId = track.id;
+                view.dragClipIsMidi = false;
+                view.dragKind = TimelineViewState::DragKind::AudioClip;
+            }
+            if (areaHovered && groupHovered &&
+                ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+                view.selectedClipId = group.id;
+                view.selectedTrackIndex = static_cast<int>(ti);
+                ImGui::OpenPopup("##clip_ctx");
+            }
+        }
+
         if (view.expandedTracks.contains(track.id)) {
             drawChannelAutomationLane(track.id, track.volumeAutomation,
                                       track.panAutomation, y + trackHeight);
@@ -2246,6 +2601,13 @@ void drawTimeline(const document::Edit& edit,
         }
 
         for (const auto& clip : track.clips) {
+            // A grouped clip does not draw itself: the group's own clip stands
+            // in for it, over the range the group was made from. The audio is
+            // still there and still plays — this changes what you can see and
+            // grab, not what exists.
+            if (edit.clipGroupContaining(track.id, clip.id) != nullptr) {
+                continue;
+            }
             // A drag previews from view state instead of writing to the clip.
             // Mutating the document during the drag meant MoveClipCommand
             // snapshotted "the old position" after it had already been
@@ -2254,6 +2616,11 @@ void drawTimeline(const document::Edit& edit,
             const bool clipIsDragging =
                 view.isDragging(TimelineViewState::DragKind::AudioClip) &&
                 view.selectedClipId == clip.id;
+            // A clip being moved is drawn once, on top, at the pointer's row
+            // after every track (below) — so it follows the cursor freely
+            // between tracks, leaves nothing behind on its own row, and needs
+            // no separate ghost. A trim stays in place and is drawn here.
+            if (clipIsDragging && !ImGui::GetIO().KeyAlt) continue;
             const bool clipIsTrimming = view.isTrimming() &&
                 !view.dragClipIsMidi && view.selectedClipId == clip.id;
             const int64_t drawStart = (clipIsDragging || clipIsTrimming)
@@ -2273,11 +2640,30 @@ void drawTimeline(const document::Edit& edit,
                 return p.x >= min.x && p.x <= max.x && p.y >= min.y && p.y <= max.y; } };
             Rect clipRect{ImVec2(clipX, y + 6),
                           ImVec2(clipX + clipW, y + trackHeight - 6)};
+            // A grouped clip does not draw itself: the group's own clip
+            // stands in for it, over the range the group was made from. The
+            // audio is still there and still plays — this is what you can see
+            // and grab, not what exists.
+            if (edit.clipGroupContaining(track.id, clip.id) != nullptr) {
+                continue;
+            }
+            // Confine the clip's drawing to the lane: a clip scrolled so its
+            // start sits under the gutter must not paint over the track header
+            // and its controls.
+            dl->PushClipRect(ImVec2(origin.x + gutterWidth, y),
+                             ImVec2(origin.x + totalWidth, y + trackHeight), true);
             bool isSel = view.selectedClipId == clip.id;
             // A distinct header gives a clip its identity without competing
             // with the waveform, which carries the edit-critical detail.
             ImVec4 body = pal.clipAudio;
             if (isSel) body = ImVec4(body.x + 0.1f, body.y + 0.08f, body.z + 0.05f, 1.0f);
+            // A muted clip reads as switched off: desaturated and dimmed, so a
+            // glance tells it apart from one that will play.
+            if (clip.muted) {
+                const float g = (body.x + body.y + body.z) / 3.0f;
+                body = ImVec4(g * 0.6f + body.x * 0.2f, g * 0.6f + body.y * 0.2f,
+                              g * 0.6f + body.z * 0.2f, 0.55f);
+            }
             dl->AddRectFilled(clipRect.min, clipRect.max, C(body), 2.0f);
             dl->AddRect(clipRect.min, clipRect.max,
                         isSel ? C(pal.accent) : C(pal.clipAudioBorder), 2.0f);
@@ -2348,17 +2734,67 @@ void drawTimeline(const document::Edit& edit,
                 }
             }
 
+            // Fades: paint the in/out ramps over the clip so the picture
+            // matches what AudioClipNode plays — same shape function, so the
+            // curve you see is the gain you hear. The darkened wedge is the
+            // attenuated part; the bright line is the envelope.
+            {
+                const float top = clipRect.min.y;
+                const float bottom = clipRect.max.y;
+                const float height = bottom - top;
+                const ImU32 fadeLine = C(pal.accent);
+                const ImU32 fadeFill = IM_COL32(0, 0, 0, 90);
+                constexpr int kFadeSegments = 24;
+                const float clipRight = static_cast<float>(clipX + clipW);
+                auto drawFade = [&](document::FadeShape shape, int64_t lenSamples,
+                                    bool fadeOut) {
+                    if (lenSamples <= 0) return;
+                    float widthPx = static_cast<float>(
+                        static_cast<double>(lenSamples) / view.samplesPerPixel);
+                    if (widthPx < 1.5f) return;  // sub-pixel: not worth drawing
+                    widthPx = std::min(widthPx, static_cast<float>(clipW));
+                    const float edgeX = fadeOut ? clipRight
+                                                : static_cast<float>(clipX);
+                    ImVec2 prev;
+                    for (int s = 0; s <= kFadeSegments; ++s) {
+                        const float t = static_cast<float>(s) / kFadeSegments;
+                        const float g = fadeOut ? document::fadeOutGain(shape, t)
+                                                : document::fadeInGain(shape, t);
+                        const float x = fadeOut ? edgeX - widthPx + widthPx * t
+                                                : edgeX + widthPx * t;
+                        const ImVec2 cur(x, bottom - g * height);
+                        if (s > 0) {
+                            // Trapezoid strip filling the attenuated area above
+                            // the curve — always renders right, unlike a single
+                            // concave polygon fill.
+                            dl->AddQuadFilled(ImVec2(prev.x, top),
+                                              ImVec2(cur.x, top), cur, prev,
+                                              fadeFill);
+                            dl->AddLine(prev, cur, fadeLine, 1.5f);
+                        }
+                        prev = cur;
+                    }
+                };
+                drawFade(clip.fadeInShape, clip.fadeIn, false);
+                drawFade(clip.fadeOutShape, clip.fadeOut, true);
+            }
+
+            dl->PopClipRect();
+
             // Interaction: drag to move.
-            const bool clipHovered = clipRect.contains(mouse);
+                const bool clipHovered = clipRect.contains(mouse);
             const auto audioGesture =
                 clipGestureAt(mouse.x, clipRect.min.x, clipRect.max.x);
             if (areaHovered && clipHovered &&
                 audioGesture != TimelineViewState::DragKind::None) {
                 ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
             }
-            if (areaHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && clipHovered) {
+            if (!selectorMode && areaHovered &&
+                ImGui::IsMouseClicked(ImGuiMouseButton_Left) && clipHovered) {
                 view.selectedClipId = clip.id;
                 view.selectedTrackIndex = static_cast<int>(ti);
+                selectClipRange(view, transport, static_cast<int>(ti),
+                                clip.timelineStart, clip.length);
                 view.dragClipOriginalStart = clip.timelineStart;
                 // Seed the preview so a click without movement draws in place.
                 view.dragPreviewStart = clip.timelineStart;
@@ -2448,6 +2884,15 @@ void drawTimeline(const document::Edit& edit,
         !(hasVideo && mouse.y >= videoLaneY &&
           mouse.y <= videoLaneY + videoLaneHeight);
 
+    // Holding the command modifier switches to the range selector; show the
+    // I-beam over the timeline so the mode is visible before the drag begins.
+    // Set after the clip loops so it wins over their resize cursor — selector
+    // mode suppresses trims, so the pointer should read as "select", not
+    // "resize", even over a clip edge.
+    if (selectorMode && (canvasHovered || rulerHovered)) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_TextInput);
+    }
+
     // Clip context menu (right-click on a clip).
     if (ImGui::BeginPopup("##clip_ctx")) {
         if (!view.selectedClipId.empty() && view.selectedTrackIndex >= 0) {
@@ -2462,6 +2907,48 @@ void drawTimeline(const document::Edit& edit,
                 if (ImGui::MenuItem("Duplicate", "Cmd+D")) {
                     undo.execute(std::make_unique<editing::DuplicateClipCommand>(
                         trk.id, view.selectedClipId));
+                }
+                // Per-clip gain and mute. The gain is seeded from the clip when
+                // the menu opens and committed once the slider is released, so
+                // dragging it is a single undo step rather than one per frame.
+                const document::AudioClip* ac = nullptr;
+                for (const auto& c : trk.clips) {
+                    if (c.id == view.selectedClipId) { ac = &c; break; }
+                }
+                if (ac != nullptr) {
+                    ImGui::Separator();
+                    if (ImGui::IsWindowAppearing()) {
+                        view.contextClipGainDb = ac->gain > 0.0
+                            ? static_cast<float>(20.0 * std::log10(ac->gain))
+                            : -60.0f;
+                    }
+                    ImGui::SetNextItemWidth(150.0f);
+                    ImGui::SliderFloat("Gain", &view.contextClipGainDb, -60.0f,
+                                       12.0f, "%.1f dB");
+                    if (ImGui::IsItemDeactivatedAfterEdit()) {
+                        const double lin = view.contextClipGainDb <= -59.9f
+                            ? 0.0
+                            : std::pow(10.0, view.contextClipGainDb / 20.0);
+                        undo.execute(
+                            std::make_unique<editing::SetClipGainCommand>(
+                                trk.id, view.selectedClipId, lin));
+                    }
+                    if (ImGui::MenuItem(ac->muted ? "Unmute" : "Mute", "Cmd+M")) {
+                        undo.execute(
+                            std::make_unique<editing::SetClipMuteCommand>(
+                                trk.id, view.selectedClipId, !ac->muted));
+                    }
+                }
+                ImGui::Separator();
+                const bool isGroup =
+                    edit.clipGroup(view.selectedClipId) != nullptr;
+                if (ImGui::MenuItem("Group", "Cmd+Opt+G", false, !isGroup)) {
+                    groupSelectedClips(const_cast<document::Edit&>(edit), undo,
+                                       view);
+                }
+                if (ImGui::MenuItem("Ungroup", "Cmd+Opt+U", false, isGroup)) {
+                    ungroupSelectedClips(const_cast<document::Edit&>(edit),
+                                         undo, view);
                 }
                 ImGui::Separator();
                 if (ImGui::MenuItem("Delete Clip")) {
@@ -2489,6 +2976,18 @@ void drawTimeline(const document::Edit& edit,
             if (ImGui::MenuItem("Duplicate", "Cmd+D")) {
                 undo.execute(std::make_unique<editing::DuplicateMidiClipCommand>(
                     trackId, view.selectedClipId));
+            }
+            ImGui::Separator();
+            const bool grouped =
+                edit.clipGroupContaining(trackId, view.selectedClipId) !=
+                nullptr;
+            if (ImGui::MenuItem("Group", "Cmd+Opt+G", false, !grouped)) {
+                groupSelectedClips(const_cast<document::Edit&>(edit), undo,
+                                   view);
+            }
+            if (ImGui::MenuItem("Ungroup", "Cmd+Opt+U", false, grouped)) {
+                ungroupSelectedClips(const_cast<document::Edit&>(edit), undo,
+                                     view);
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Delete Clip")) {
@@ -2522,18 +3021,92 @@ void drawTimeline(const document::Edit& edit,
             static_cast<int64_t>(mouse.x - view.dragStartMouseX);
         int64_t dxSamples = static_cast<int64_t>(dxPx * view.samplesPerPixel);
         {
-            int64_t raw = std::max<int64_t>(0, view.dragClipOriginalStart + dxSamples);
-            view.dragPreviewStart = snapPosition(raw);
+            // A press that hasn't moved leaves the clip exactly where it is:
+            // snapping it to the grid on a mere click would nudge an off-grid
+            // clip, and shift the selection that rides with it off the clip's
+            // own edges — which is what stopped "click a clip, press F" from
+            // reading as the whole clip.
+            if (dxPx == 0) {
+                view.dragPreviewStart = view.dragClipOriginalStart;
+            } else {
+                int64_t raw = std::max<int64_t>(
+                    0, view.dragClipOriginalStart + dxSamples);
+                view.dragPreviewStart = snapPosition(raw);
+            }
         }
-        // Visual hint: highlight the track being hovered during drag.
-        if (targetTrackIndex >= 0) {
-            const float rowHeight =
-                baseHeightOf(tracks[static_cast<size_t>(targetTrackIndex)]);
-            const float ty =
-                tracksTop + audioOffsets[static_cast<size_t>(targetTrackIndex)];
-            dl->AddRectFilled(ImVec2(origin.x + gutterWidth, ty),
-                              ImVec2(origin.x + totalWidth, ty + rowHeight),
-                              C(ImVec4(pal.accent.x, pal.accent.y, pal.accent.z, 0.12f)));
+        // Whether the thing in flight is a group is asked once and reused for
+        // both the selection follow and the draw below.
+        bool draggingGroup = false;
+        for (const auto& g : edit.clipGroups()) {
+            if (g.id == view.selectedClipId) { draggingGroup = true; break; }
+        }
+        // The selection travels with the clip. Clicking a clip selected its
+        // range, so the highlight begins on the clip; as the clip moves, the
+        // range moves the same amount and onto the same track — otherwise it is
+        // left behind pointing at empty timeline.
+        if (view.hasSelection) {
+            const int64_t selLen = view.selectionEnd - view.selectionStart;
+            view.selectionStart = view.dragPreviewStart;
+            view.selectionEnd = view.dragPreviewStart + selLen;
+            view.selectionAnchor = view.selectionStart;
+            view.selectionFocus = view.selectionEnd;
+            // A group slides horizontally and keeps its row; a lone clip follows
+            // the pointer onto whatever track it lands on.
+            if (!draggingGroup && targetTrackIndex >= 0) {
+                view.selectionRow = targetTrackIndex;
+            }
+        }
+        // The dragged clip itself, drawn once here — after every track, so it
+        // stays on top whichever way it moves — on the row under the pointer.
+        // It IS the clip, not a ghost beside a copy: nothing is left on the
+        // original row, and it follows the cursor onto any track.
+        //
+        // A group is exempt: it drags horizontally on its own row (its members
+        // keep their tracks) and is drawn by the group loop above, so relocating
+        // it here would paint a second, wrong-sized clip.
+        if (!draggingGroup) {
+            // Land it on the row under the pointer; off the lanes (e.g. below
+            // the last track) keep it on its own row so it stays visible until
+            // dropped, where it will make a new track.
+            float rowTop;
+            float rowHeight;
+            if (targetTrackIndex >= 0) {
+                rowTop = tracksTop +
+                         audioOffsets[static_cast<size_t>(targetTrackIndex)];
+                rowHeight =
+                    baseHeightOf(tracks[static_cast<size_t>(targetTrackIndex)]);
+            } else {
+                size_t oi = 0;
+                for (; oi < tracks.size(); ++oi) {
+                    if (tracks[oi].id == view.dragOriginalTrackId) break;
+                }
+                rowTop = oi < tracks.size()
+                             ? tracksTop + audioOffsets[oi] : tracksTop;
+                rowHeight =
+                    oi < tracks.size() ? baseHeightOf(tracks[oi]) : trackHeight;
+            }
+            const float cx = origin.x + gutterWidth +
+                static_cast<float>((view.dragPreviewStart - view.scrollSamples) /
+                                   view.samplesPerPixel);
+            const float cw = std::max(2.0f,
+                static_cast<float>(view.dragClipOriginalLength /
+                                   view.samplesPerPixel));
+            const ImVec4 base = draggingMidiClip ? pal.clipMidi : pal.clipAudio;
+            const ImVec4 border = draggingMidiClip ? pal.clipMidiBorder
+                                                   : pal.clipAudioBorder;
+            dl->PushClipRect(ImVec2(origin.x + gutterWidth, rowTop),
+                             ImVec2(origin.x + totalWidth, rowTop + rowHeight),
+                             true);
+            const ImVec2 cmin(cx, rowTop + 6.0f);
+            const ImVec2 cmax(cx + cw, rowTop + rowHeight - 6.0f);
+            dl->AddRectFilled(cmin, cmax, C(base), 2.0f);
+            // The accent border marks it as the live, selected clip.
+            dl->AddRect(cmin, cmax, C(pal.accent), 2.0f);
+            const float headerBottom = std::min(cmax.y - 4.0f, cmin.y + 20.0f);
+            dl->AddRectFilled(cmin, ImVec2(cmax.x, headerBottom),
+                              C(ImVec4(border.x, border.y, border.z, 0.40f)),
+                              2.0f, ImDrawFlags_RoundCornersTop);
+            dl->PopClipRect();
         }
 
         if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
@@ -2548,7 +3121,32 @@ void drawTimeline(const document::Edit& edit,
             // that appears to do nothing when replayed.
             const bool moved = view.dragPreviewStart != view.dragClipOriginalStart ||
                                !newTrackArg.empty();
-            if (moved) {
+            // A clip in a group drags the whole group, by the same amount.
+            // The other members keep their tracks — a group can span lanes,
+            // and dragging one across would have to decide where a member with
+            // no lane to land in goes.
+            // The dragged id is a group's when a group clip was grabbed —
+            // there is nothing else on the timeline it could be.
+            const auto* group = edit.clipGroup(view.selectedClipId);
+            // Option held at the drop leaves the original and drops a copy —
+            // the standard "duplicate by dragging". Groups keep moving (copying
+            // a whole group is a niche the drag machinery doesn't cover yet).
+            const bool altCopy = ImGui::GetIO().KeyAlt && group == nullptr;
+            if (moved && group != nullptr) {
+                undo.execute(std::make_unique<editing::MoveClipGroupCommand>(
+                    group->id,
+                    view.dragPreviewStart - view.dragClipOriginalStart));
+            } else if (moved && altCopy) {
+                if (draggingMidiClip) {
+                    undo.execute(std::make_unique<editing::CopyMidiClipToCommand>(
+                        view.dragOriginalTrackId, view.selectedClipId,
+                        targetTrackId, view.dragPreviewStart));
+                } else {
+                    undo.execute(std::make_unique<editing::CopyClipToCommand>(
+                        view.dragOriginalTrackId, view.selectedClipId,
+                        targetTrackId, view.dragPreviewStart));
+                }
+            } else if (moved) {
                 if (draggingMidiClip) {
                     undo.execute(std::make_unique<editing::MoveMidiClipCommand>(
                         view.dragOriginalTrackId, view.selectedClipId,
@@ -2559,8 +3157,10 @@ void drawTimeline(const document::Edit& edit,
                         view.dragPreviewStart, newTrackArg));
                 }
             }
+            // The clip stays selected after a click, move or trim — that is what
+            // Cmd+D, Cmd+M and the clip inspector all act on. Only the drag
+            // bookkeeping is reset here.
             view.dragKind = TimelineViewState::DragKind::None;
-            view.selectedClipId.clear();
             view.dragOriginalTrackId.clear();
         }
     }
@@ -2631,6 +3231,16 @@ void drawTimeline(const document::Edit& edit,
             view.dragPreviewLength = newEnd - origStart;
         }
 
+        // The selection reshapes with the clip, the same way it follows a move:
+        // clicking the clip selected its range, so trimming an edge should drag
+        // that edge of the selection too rather than leave it on the old one.
+        if (view.hasSelection) {
+            view.selectionStart = view.dragPreviewStart;
+            view.selectionEnd = view.dragPreviewStart + view.dragPreviewLength;
+            view.selectionAnchor = view.selectionStart;
+            view.selectionFocus = view.selectionEnd;
+        }
+
         if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
             // A press that never moved must not push an undo entry that
             // replays as a no-op.
@@ -2683,7 +3293,11 @@ void drawTimeline(const document::Edit& edit,
     // replaces drag-to-scrub: the playhead can follow the mouse or the drag
     // can mark a range, not both.)
     if (rulerHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-        seekToMouseX();
+        // While stopped the press seeks; while playing it only begins a range,
+        // so dragging out a selection never interrupts playback. A plain click
+        // (no drag) still relocates on release, via the click path below. The
+        // selector (command) never seeks — it is for marking, not locating.
+        if (!transport.isPlaying() && !selectorMode) seekToMouseX();
         view.selectionPressSample = selectionSampleAtMouseX();
         const int64_t s = selectionSampleAtMouseX();
         view.selectionStart = s;
@@ -2715,7 +3329,7 @@ void drawTimeline(const document::Edit& edit,
             }
             if (hitClip) break;
         }
-        if (!hitClip) {
+        if (!hitClip || selectorMode) {
             // Start a selection drag (instead of just seeking). The row under
             // the press owns it: a range dragged in one lane stays in that
             // lane no matter how far the pointer wanders vertically.
@@ -2745,12 +3359,14 @@ void drawTimeline(const document::Edit& edit,
     // End selection on mouse release.
     if (view.isSelecting && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
         view.isSelecting = false;
-        // If the selection is tiny (just a click, not a drag), treat as seek + clear selection.
+        // If the selection is tiny (just a click, not a drag), treat as seek +
+        // clear selection — unless the selector (command) is held, whose whole
+        // point is to select without disturbing the playhead.
         if (std::abs(view.selectionEnd - view.selectionStart) <
             static_cast<int64_t>(4 * view.samplesPerPixel)) {
             // Not a drag after all: the cursor uses the same snap mode as the
             // press, so Snap never changes meaning between click and drag.
-            transport.seek(view.selectionPressSample);
+            if (!selectorMode) transport.seek(view.selectionPressSample);
             view.hasSelection = false;
         } else if (view.hasSelection) {
             // A finished selection puts the cursor at its head, so play
@@ -2758,7 +3374,11 @@ void drawTimeline(const document::Edit& edit,
             // the loop. The head is the lower edge whichever direction the
             // drag ran: dragging right to left selects the same range, and
             // dropping the cursor at the pointer would leave it at the tail.
-            transport.seek(std::min(view.selectionStart, view.selectionEnd));
+            // Not while playing, and not under the selector: both cases want
+            // the range marked without the playhead snapping to it.
+            if (!transport.isPlaying() && !selectorMode) {
+                transport.seek(std::min(view.selectionStart, view.selectionEnd));
+            }
         }
     }
     // Clear selection on Escape or clicking elsewhere.
@@ -2804,6 +3424,8 @@ void drawTimeline(const document::Edit& edit,
         }
     }
 
+    dl->PopClipRect();  // end the scrolling track-rows region
+
     // A shaded rail survives both the clip body and the shell, while the thin
     // bright core preserves the precise position needed for edit decisions.
     int64_t pos = transport.position();
@@ -2844,21 +3466,98 @@ void drawTimeline(const document::Edit& edit,
     }
 
     // Scroll / zoom.
-    double wheel = ImGui::GetIO().MouseWheel;
-    if (canvasHovered && wheel != 0.0) {
-        // Cmd or Ctrl. On macOS ImGui reports Command as KeySuper, and the
-        // system claims Ctrl+scroll for its own screen zoom before the app
-        // sees it — testing KeyCtrl alone left wheel zoom unreachable there.
-        if (ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeySuper) {
-            // Scale the wheel step with the current zoom: a fixed 10 spp per
-            // notch takes hundreds of turns to cross the range now that the
-            // ceiling is 1,000,000.
+    // Resolve any audio-file drops against the current track/sample geometry.
+    if (!view.pendingFileDrops.empty()) {
+        const float laneLeft = origin.x + gutterWidth;
+        for (const auto& drop : view.pendingFileDrops) {
+            TimelineViewState::ResolvedFileDrop resolved;
+            resolved.path = drop.path;
+            const int row = indexAtY(drop.y, tracksTop, audioOffsets);
+            if (row >= 0 && row < static_cast<int>(tracks.size()) &&
+                drop.x >= laneLeft) {
+                resolved.trackId = tracks[static_cast<size_t>(row)].id;
+                const int64_t raw = std::max<int64_t>(0,
+                    static_cast<int64_t>(view.scrollSamples +
+                        (drop.x - laneLeft) * view.samplesPerPixel));
+                resolved.sample = snapPosition(raw);
+            }
+            view.resolvedFileDrops.push_back(std::move(resolved));
+        }
+        view.pendingFileDrops.clear();
+    }
+
+    // Live drop preview: a ghost clip under the cursor while a file is dragged
+    // over, so its landing spot is visible before release.
+    if (view.fileDragActive) {
+        const float laneLeft = origin.x + gutterWidth;
+        const int row = indexAtY(view.fileDragY, tracksTop, audioOffsets);
+        if (row >= 0 && row < static_cast<int>(tracks.size()) &&
+            view.fileDragX >= laneLeft) {
+            const float rowHeight =
+                baseHeightOf(tracks[static_cast<size_t>(row)]);
+            const float ty = tracksTop + audioOffsets[static_cast<size_t>(row)];
+            const int64_t startSample = snapPosition(std::max<int64_t>(0,
+                static_cast<int64_t>(view.scrollSamples +
+                    (view.fileDragX - laneLeft) * view.samplesPerPixel)));
+            const float gx = laneLeft +
+                static_cast<float>((startSample - view.scrollSamples) /
+                                   view.samplesPerPixel);
+            // Known length draws the real region; unknown draws a slim insert.
+            const float gw = view.fileDragLengthSamples > 0
+                ? std::max(2.0f, static_cast<float>(
+                      view.fileDragLengthSamples / view.samplesPerPixel))
+                : 3.0f;
+            dl->PushClipRect(ImVec2(laneLeft, ty),
+                             ImVec2(origin.x + totalWidth, ty + rowHeight), true);
+            dl->AddRectFilled(ImVec2(gx, ty + 6.0f),
+                              ImVec2(gx + gw, ty + rowHeight - 6.0f),
+                              C(ImVec4(pal.clipAudio.x, pal.clipAudio.y,
+                                       pal.clipAudio.z, 0.45f)), 2.0f);
+            dl->AddRect(ImVec2(gx, ty + 6.0f),
+                        ImVec2(gx + gw, ty + rowHeight - 6.0f),
+                        C(pal.accentStrong), 2.0f);
+            // A bright insertion line at the exact start, so the drop point is
+            // unambiguous even for a very short or unknown-length file.
+            dl->AddLine(ImVec2(gx, ty + 3.0f), ImVec2(gx, ty + rowHeight - 3.0f),
+                        C(pal.accentStrong), 1.5f);
+            dl->PopClipRect();
+        }
+    }
+
+    const double wheel = ImGui::GetIO().MouseWheel;
+    const double wheelH = ImGui::GetIO().MouseWheelH;
+    const bool timelineHovered = windowHovered || canvasHovered;
+    if (timelineHovered && wheel != 0.0) {
+        if (ImGui::GetIO().KeyCtrl) {
+            // Control: vertical zoom (row height). Taller scrolling up, shorter
+            // down; clamped so a row can neither vanish nor swallow the view.
+            view.trackHeightScale = std::clamp(
+                view.trackHeightScale + static_cast<float>(wheel) * 0.1f,
+                0.6f, 3.0f);
+        } else if (ImGui::GetIO().KeySuper) {
+            // Command: horizontal zoom. (macOS claims Control+scroll for its
+            // own screen zoom, so Command is the reachable modifier here.)
             const double zoomStep = std::max(10.0, view.samplesPerPixel * 0.1);
             zoomAroundSample(view, view.samplesPerPixel - wheel * zoomStep,
                              transport.position());
+        } else if (ImGui::GetIO().KeyShift) {
+            // Shift: scroll the timeline left/right.
+            view.scrollSamples = std::max(
+                0.0, view.scrollSamples - wheel * view.samplesPerPixel * 20.0);
         } else {
-            view.scrollSamples = std::max(0.0, view.scrollSamples - wheel * view.samplesPerPixel * 20.0);
+            // Plain wheel: scroll the track rows (not the window, whose scroll
+            // would drag the pinned header off the top with them).
+            view.verticalScroll = std::clamp(
+                view.verticalScroll - static_cast<float>(wheel) * 42.0f, 0.0f,
+                maxVerticalScroll);
         }
+    }
+    // A trackpad's (or a shift-translated) horizontal wheel also scrolls the
+    // timeline sideways.
+    if (timelineHovered && wheelH != 0.0 &&
+        !ImGui::GetIO().KeyCtrl && !ImGui::GetIO().KeySuper) {
+        view.scrollSamples = std::max(
+            0.0, view.scrollSamples - wheelH * view.samplesPerPixel * 20.0);
     }
 
     // Adding reallocates the track vector, so it happens only after every
@@ -2927,6 +3626,206 @@ const char* markerKindLabel(document::MarkerKind k) {
 
 } // namespace
 
+void selectClipRange(TimelineViewState& view, engine::Transport& transport,
+                     int row, int64_t start, int64_t length) {
+    if (length <= 0) return;
+    view.hasSelection = true;
+    view.selectionRow = row;
+    view.selectionStart = start;
+    view.selectionEnd = start + length;
+    // Anchor and focus matter for Shift+Tab, which moves whichever edge is
+    // not anchored; a clip's head is the natural anchor.
+    view.selectionAnchor = view.selectionStart;
+    view.selectionFocus = view.selectionEnd;
+    // The head of the range, so play starts from the top of what is selected
+    // — and, with loop on, so does the loop. Not while already playing, though:
+    // selecting mid-playback marks the range without yanking the playhead back.
+    if (!transport.isPlaying()) transport.seek(view.selectionStart);
+}
+
+std::vector<document::ClipGroup::Member> clipsInRange(
+    const document::Edit& edit, int64_t start, int64_t end, int row) {
+    std::vector<document::ClipGroup::Member> members;
+    if (end <= start) return members;
+
+    const auto& tracks = edit.tracks();
+    for (size_t index = 0; index < tracks.size(); ++index) {
+        // -1 is a ruler drag, which means every track. Anything else is one
+        // lane, and a range dragged in a lane stays in it.
+        if (row >= 0 && row != static_cast<int>(index)) continue;
+        const auto& track = tracks[index];
+        const auto overlaps = [&](int64_t clipStart, int64_t length) {
+            return clipStart < end && clipStart + length > start;
+        };
+        for (const auto& clip : track.clips) {
+            if (overlaps(clip.timelineStart, clip.length)) {
+                members.push_back({track.id, clip.id, false});
+            }
+        }
+        for (const auto& clip : track.midiClips) {
+            if (overlaps(clip.timelineStart, clip.length)) {
+                members.push_back({track.id, clip.id, true});
+            }
+        }
+    }
+    return members;
+}
+
+std::vector<document::ClipGroup::Member> clipsInSelection(
+    const document::Edit& edit, const TimelineViewState& view) {
+    if (!view.hasSelection) return {};
+    return clipsInRange(edit, std::min(view.selectionStart, view.selectionEnd),
+                        std::max(view.selectionStart, view.selectionEnd),
+                        view.selectionRow);
+}
+
+bool groupSelectedClips(document::Edit& edit, editing::UndoStack& undo,
+                        TimelineViewState& view) {
+    // The selection is what makes the group, so an empty range is fine: it
+    // gives an empty group over it, which is a placeholder you can drag and
+    // fill later. What is refused is a group with no extent at all.
+    int64_t start = std::min(view.selectionStart, view.selectionEnd);
+    int64_t end = std::max(view.selectionStart, view.selectionEnd);
+
+    // With no range dragged, the selected clip is the group. Pressing the
+    // shortcut with a clip selected and getting nothing is the same silence
+    // as pressing it with nothing selected, and one of those is a mistake.
+    if (!view.hasSelection || end <= start) {
+        if (view.selectedClipId.empty() || view.selectedTrackIndex < 0 ||
+            view.selectedTrackIndex >= static_cast<int>(edit.tracks().size())) {
+            return false;
+        }
+        const auto& track =
+            edit.tracks()[static_cast<size_t>(view.selectedTrackIndex)];
+        const auto extentOf = [&](int64_t clipStart, int64_t length) {
+            start = clipStart;
+            end = clipStart + length;
+        };
+        bool found = false;
+        for (const auto& clip : track.clips) {
+            if (clip.id != view.selectedClipId) continue;
+            extentOf(clip.timelineStart, clip.length);
+            found = true;
+            break;
+        }
+        if (!found) {
+            for (const auto& clip : track.midiClips) {
+                if (clip.id != view.selectedClipId) continue;
+                extentOf(clip.timelineStart, clip.length);
+                found = true;
+                break;
+            }
+        }
+        if (!found || end <= start) return false;
+    }
+
+    auto members = clipsInRange(edit, start, end,
+                                view.hasSelection ? view.selectionRow
+                                                  : view.selectedTrackIndex);
+    // Clips already in a group stay in it — addClipGroup would drop them
+    // anyway, and taking them silently would leave the old group short.
+    members.erase(std::remove_if(members.begin(), members.end(),
+                                 [&](const document::ClipGroup::Member& m) {
+                                     return edit.clipGroupContaining(
+                                                m.trackId, m.clipId) != nullptr;
+                                 }),
+                  members.end());
+    // The rows the selection covers, so a group over silence still has
+    // somewhere to draw. A ruler drag (-1) spans every track.
+    std::vector<std::string> trackIds;
+    const int scopeRow = view.hasSelection ? view.selectionRow
+                                           : view.selectedTrackIndex;
+    for (size_t row = 0; row < edit.tracks().size(); ++row) {
+        if (scopeRow >= 0 && scopeRow != static_cast<int>(row)) continue;
+        trackIds.push_back(edit.tracks()[row].id);
+    }
+    if (trackIds.empty()) return false;
+
+    // Groups already under the selection become children rather than being
+    // ignored, so grouping two groups gives one group containing two — and
+    // ungrouping it gives them back.
+    std::vector<std::string> childGroupIds;
+    for (const auto& group : edit.clipGroups()) {
+        if (group.timelineStart >= end || group.end() <= start) continue;
+        if (!edit.clipGroupIsTopLevel(group.id)) continue;
+        if (scopeRow >= 0) {
+            if (scopeRow >= static_cast<int>(edit.tracks().size())) continue;
+            const auto& row = edit.tracks()[static_cast<size_t>(scopeRow)];
+            if (!group.coversTrack(row.id)) continue;
+        }
+        childGroupIds.push_back(group.id);
+    }
+
+    auto command = std::make_unique<editing::GroupClipsCommand>(
+        std::move(members), start, end - start, std::move(trackIds),
+        std::move(childGroupIds));
+    auto* raw = command.get();
+    undo.execute(std::move(command));
+    return !raw->groupId().empty();
+}
+
+bool ungroupSelectedClips(document::Edit& edit, editing::UndoStack& undo,
+                          TimelineViewState& view) {
+    std::vector<std::string> groupIds;
+    const auto take = [&](const std::string& id) {
+        if (id.empty()) return;
+        if (std::find(groupIds.begin(), groupIds.end(), id) ==
+            groupIds.end()) {
+            groupIds.push_back(id);
+        }
+    };
+
+    // Groups are found by their own range, not through their members. An empty
+    // group has no members and would otherwise be impossible to ungroup — the
+    // same mistake that made one impossible to see.
+    if (view.hasSelection) {
+        const int64_t start = std::min(view.selectionStart, view.selectionEnd);
+        const int64_t end = std::max(view.selectionStart, view.selectionEnd);
+        if (end > start) {
+            const auto& tracks = edit.tracks();
+            for (const auto& group : edit.clipGroups()) {
+                if (group.timelineStart >= end || group.end() <= start) {
+                    continue;
+                }
+                // Only the outermost layer. Taking every group in range would
+                // flatten the whole tree in one keystroke instead of peeling
+                // one layer off it.
+                if (!edit.clipGroupIsTopLevel(group.id)) continue;
+                // Scoped to the selection's lane, like every other range edit.
+                if (view.selectionRow >= 0) {
+                    if (view.selectionRow >=
+                        static_cast<int>(tracks.size())) continue;
+                    const auto& row =
+                        tracks[static_cast<size_t>(view.selectionRow)];
+                    if (!group.coversTrack(row.id)) continue;
+                }
+                take(group.id);
+            }
+        }
+    }
+
+    // A selected group clip is the obvious target, and its id IS the group's.
+    take(edit.clipGroup(view.selectedClipId) != nullptr ? view.selectedClipId
+                                                        : std::string{});
+    // Otherwise the group holding the selected clip.
+    if (groupIds.empty() && !view.selectedClipId.empty() &&
+        view.selectedTrackIndex >= 0 &&
+        view.selectedTrackIndex < static_cast<int>(edit.tracks().size())) {
+        const auto& track = edit.tracks()[
+            static_cast<size_t>(view.selectedTrackIndex)];
+        if (const auto* group =
+                edit.clipGroupContaining(track.id, view.selectedClipId)) {
+            take(group->id);
+        }
+    }
+
+    if (groupIds.empty()) return false;
+    for (const auto& id : groupIds) {
+        undo.execute(std::make_unique<editing::UngroupClipsCommand>(id));
+    }
+    return true;
+}
+
 bool deleteAutomationInSelection(document::Edit& edit,
                                  editing::UndoStack& undo,
                                  TimelineViewState& view) {
@@ -2965,6 +3864,109 @@ bool deleteAutomationInSelection(document::Edit& edit,
     return true;
 }
 
+bool trimClipsInSelection(document::Edit& edit, editing::UndoStack& undo,
+                          TimelineViewState& view) {
+    if (!view.hasSelection) return false;
+    const int64_t lo = std::min(view.selectionStart, view.selectionEnd);
+    const int64_t hi = std::max(view.selectionStart, view.selectionEnd);
+    if (hi <= lo) return false;
+
+    const auto& tracks = edit.tracks();
+
+    // The selection's own row when it has one; otherwise every track, so a
+    // range dragged across the whole arrangement clears time on all of them.
+    std::vector<size_t> rows;
+    if (view.selectionRow >= 0 &&
+        view.selectionRow < static_cast<int>(tracks.size())) {
+        rows.push_back(static_cast<size_t>(view.selectionRow));
+    } else {
+        for (size_t i = 0; i < tracks.size(); ++i) rows.push_back(i);
+    }
+
+    std::vector<std::unique_ptr<editing::Command>> ops;
+
+    // One clip's four cases, shared by audio and MIDI. `makeTrim`/`makeRemove`/
+    // `makeAddRight` are the only things that differ between the two, so the
+    // decision lives here once and cannot drift between the clip types.
+    auto planClip = [&](const std::string& trackId, int64_t start, int64_t length,
+                        const auto& makeRemove, const auto& makeTrim,
+                        const auto& makeAddRight) {
+        const int64_t clipEnd = start + length;
+        if (clipEnd <= lo || start >= hi) return;             // no overlap
+        if (lo <= start && hi >= clipEnd) {                   // whole clip
+            ops.push_back(makeRemove());
+        } else if (lo <= start) {                             // head (hi<clipEnd)
+            const int64_t cut = hi - start;
+            ops.push_back(makeTrim(hi, cut, clipEnd - hi));
+        } else if (hi >= clipEnd) {                           // tail (lo>start)
+            ops.push_back(makeTrim(start, 0, lo - start));
+        } else {                                              // interior split
+            ops.push_back(makeTrim(start, 0, lo - start));    // left piece
+            ops.push_back(makeAddRight(hi, hi - start, clipEnd - hi));
+        }
+    };
+
+    for (size_t ti : rows) {
+        const auto& track = tracks[ti];
+        const std::string trackId = track.id;
+
+        for (const auto& clip : track.clips) {
+            const document::AudioClip captured = clip;
+            planClip(trackId, clip.timelineStart, clip.length,
+                [&] {
+                    return std::make_unique<editing::RemoveClipCommand>(
+                        trackId, captured.id);
+                },
+                [&](int64_t newStart, int64_t offsetAdd, int64_t newLength) {
+                    return std::make_unique<editing::TrimClipCommand>(
+                        trackId, captured.id, newStart,
+                        captured.sourceOffset + offsetAdd, newLength);
+                },
+                [&](int64_t newStart, int64_t offsetAdd, int64_t newLength) {
+                    document::AudioClip right = captured;
+                    right.id.clear();
+                    right.timelineStart = newStart;
+                    right.sourceOffset = captured.sourceOffset + offsetAdd;
+                    right.length = newLength;
+                    return std::make_unique<editing::AddClipCommand>(
+                        trackId, std::move(right));
+                });
+        }
+
+        for (const auto& clip : track.midiClips) {
+            const document::MidiClip captured = clip;
+            planClip(trackId, clip.timelineStart, clip.length,
+                [&] {
+                    return std::make_unique<editing::RemoveMidiClipCommand>(
+                        trackId, captured.id);
+                },
+                [&](int64_t newStart, int64_t offsetAdd, int64_t newLength) {
+                    return std::make_unique<editing::TrimMidiClipCommand>(
+                        trackId, captured.id, newStart,
+                        captured.sourceOffset + offsetAdd, newLength);
+                },
+                [&](int64_t newStart, int64_t offsetAdd, int64_t newLength) {
+                    document::MidiClip right = captured;
+                    right.id.clear();
+                    right.timelineStart = newStart;
+                    right.sourceOffset = captured.sourceOffset + offsetAdd;
+                    right.length = newLength;
+                    return std::make_unique<editing::AddMidiClipCommand>(
+                        trackId, std::move(right));
+                });
+        }
+    }
+
+    if (ops.empty()) return false;
+    if (ops.size() == 1) {
+        undo.execute(std::move(ops.front()));
+    } else {
+        undo.execute(std::make_unique<editing::CompoundCommand>(
+            std::move(ops), "Delete Range"));
+    }
+    return true;
+}
+
 bool duplicateSelectedClip(const document::Edit& edit,
                            editing::UndoStack& undo,
                            TimelineViewState& view) {
@@ -2991,6 +3993,249 @@ bool duplicateSelectedClip(const document::Edit& edit,
     return false;
 }
 
+bool toggleSelectedClipMute(const document::Edit& edit,
+                            editing::UndoStack& undo, TimelineViewState& view) {
+    if (view.selectedClipId.empty() || view.selectedTrackIndex < 0) return false;
+    const auto& tracks = edit.tracks();
+    if (view.selectedTrackIndex >= static_cast<int>(tracks.size())) return false;
+    const auto& track = tracks[static_cast<size_t>(view.selectedTrackIndex)];
+    for (const auto& clip : track.clips) {
+        if (clip.id != view.selectedClipId) continue;
+        undo.execute(std::make_unique<editing::SetClipMuteCommand>(
+            track.id, view.selectedClipId, !clip.muted));
+        return true;
+    }
+    return false;
+}
+
+namespace {
+// The selected audio clip, or nullptr — shared by the keyboard clip edits.
+const document::AudioClip* selectedAudioClip(const document::Edit& edit,
+                                             const TimelineViewState& view,
+                                             std::string& trackIdOut) {
+    if (view.selectedClipId.empty() || view.selectedTrackIndex < 0) return nullptr;
+    const auto& tracks = edit.tracks();
+    if (view.selectedTrackIndex >= static_cast<int>(tracks.size())) return nullptr;
+    const auto& track = tracks[static_cast<size_t>(view.selectedTrackIndex)];
+    for (const auto& c : track.clips) {
+        if (c.id == view.selectedClipId) { trackIdOut = track.id; return &c; }
+    }
+    return nullptr;
+}
+}  // namespace
+
+bool trimSelectedClipToSelection(const document::Edit& edit,
+                                 editing::UndoStack& undo, TimelineViewState& view,
+                                 bool keepAfter) {
+    if (!view.hasSelection) return false;
+    std::string trackId;
+    const document::AudioClip* clip = selectedAudioClip(edit, view, trackId);
+    if (clip == nullptr) return false;
+    const int64_t clipStart = clip->timelineStart;
+    const int64_t clipEnd = clipStart + clip->length;
+    // keepAfter (A): cut everything before the selection's start; keep from
+    // there on. Otherwise (S): cut everything after the selection's end.
+    const int64_t cut = keepAfter
+        ? std::min(view.selectionStart, view.selectionEnd)
+        : std::max(view.selectionStart, view.selectionEnd);
+    if (cut <= clipStart || cut >= clipEnd) return false;  // nothing to cut
+    if (keepAfter) {
+        const int64_t delta = cut - clipStart;
+        undo.execute(std::make_unique<editing::TrimClipCommand>(
+            trackId, clip->id, cut, clip->sourceOffset + delta,
+            clip->length - delta));
+    } else {
+        undo.execute(std::make_unique<editing::TrimClipCommand>(
+            trackId, clip->id, clipStart, clip->sourceOffset,
+            cut - clipStart));
+    }
+    return true;
+}
+
+bool fadeSelectedClipToPlayhead(const document::Edit& edit,
+                                editing::UndoStack& undo, TimelineViewState& view,
+                                int64_t playhead, bool fadeIn,
+                                document::FadeShape shape) {
+    std::string trackId;
+    const document::AudioClip* clip = selectedAudioClip(edit, view, trackId);
+    if (clip == nullptr) return false;
+    const int64_t clipStart = clip->timelineStart;
+    const int64_t clipEnd = clipStart + clip->length;
+    if (playhead <= clipStart || playhead >= clipEnd) return false;
+    // D fades in up to the playhead; G fades out from it. The other end keeps
+    // whatever fade it had, and the pair can't overlap.
+    int64_t newIn = clip->fadeIn;
+    int64_t newOut = clip->fadeOut;
+    document::FadeShape inShape = clip->fadeInShape;
+    document::FadeShape outShape = clip->fadeOutShape;
+    if (fadeIn) {
+        newIn = playhead - clipStart;
+        inShape = shape;
+        if (newIn + newOut > clip->length) newOut = clip->length - newIn;
+    } else {
+        newOut = clipEnd - playhead;
+        outShape = shape;
+        if (newIn + newOut > clip->length) newIn = clip->length - newOut;
+    }
+    undo.execute(std::make_unique<editing::SetClipFadeCommand>(
+        trackId, clip->id, newIn, inShape, newOut, outShape));
+    return true;
+}
+
+int64_t parseTimecodeToSamples(
+    const char* text, TimecodeMode mode, double sr, double fps,
+    const std::vector<document::TempoChange>* tempo,
+    const std::vector<document::TimeSignature>* meter) {
+    if (text == nullptr) return -1;
+    switch (mode) {
+        case TimecodeMode::MinSec: {
+            int mm; double ss;
+            if (std::sscanf(text, "%d:%lf", &mm, &ss) == 2)
+                return static_cast<int64_t>((mm * 60 + ss) * sr);
+            break;
+        }
+        case TimecodeMode::Smpte: {
+            int hh, mm, ss2, ff;
+            if (std::sscanf(text, "%d:%d:%d:%d", &hh, &mm, &ss2, &ff) == 4)
+                return static_cast<int64_t>(
+                    (hh * 3600 + mm * 60 + ss2 + ff / fps) * sr);
+            break;
+        }
+        case TimecodeMode::BarsBeats: {
+            int bars = 1, beats = 1, ticks = 0;
+            const bool parsed =
+                std::sscanf(text, "%d|%d|%d", &bars, &beats, &ticks) == 3 ||
+                std::sscanf(text, "%d.%d.%d", &bars, &beats, &ticks) == 3;
+            if (parsed && tempo != nullptr && meter != nullptr)
+                return document::sampleAtBarsBeats(
+                    document::BarsBeats{bars, beats, ticks}, sr, *tempo, *meter);
+            break;
+        }
+        case TimecodeMode::FeetFrames: {
+            int feet, ff2;
+            if (std::sscanf(text, "%d+%d", &feet, &ff2) == 2)
+                return static_cast<int64_t>((feet * 16 + ff2) / fps * sr);
+            break;
+        }
+        case TimecodeMode::Samples: {
+            long long s;
+            if (std::sscanf(text, "%lld", &s) == 1) return s;
+            break;
+        }
+    }
+    return -1;
+}
+
+bool adjustSelectedTrackHeight(const document::Edit& edit,
+                               TimelineViewState& view, float factor) {
+    if (view.selectedTrackIndex < 0) return false;
+    const auto& tracks = edit.tracks();
+    if (view.selectedTrackIndex >= static_cast<int>(tracks.size())) return false;
+    const std::string& id = tracks[static_cast<size_t>(view.selectedTrackIndex)].id;
+    const auto it = view.trackHeightScales.find(id);
+    const float current = it != view.trackHeightScales.end() ? it->second : 1.0f;
+    view.trackHeightScales[id] = std::clamp(current * factor, 0.5f, 4.0f);
+    return true;
+}
+
+bool createFadeFromSelection(const document::Edit& edit,
+                             editing::UndoStack& undo, TimelineViewState& view,
+                             document::FadeShape inShape,
+                             document::FadeShape outShape,
+                             int64_t defaultFadeSamples) {
+    if (!view.hasSelection) return false;
+    const int64_t selStart = std::min(view.selectionStart, view.selectionEnd);
+    const int64_t selEnd = std::max(view.selectionStart, view.selectionEnd);
+    if (selEnd <= selStart) return false;
+
+    const auto members = clipsInSelection(edit, view);
+    const auto& tracks = edit.tracks();
+
+    std::vector<std::unique_ptr<editing::Command>> commands;
+    for (const auto& member : members) {
+        if (member.midi) continue;  // fades are audio-only for now
+        // Read the clip's current state (the mutation happens in the command).
+        const document::AudioClip* clip = nullptr;
+        for (const auto& t : tracks) {
+            if (t.id != member.trackId) continue;
+            for (const auto& c : t.clips) {
+                if (c.id == member.clipId) { clip = &c; break; }
+            }
+            break;
+        }
+        if (clip == nullptr || clip->length <= 0) continue;
+
+        const int64_t clipStart = clip->timelineStart;
+        const int64_t clipEnd = clipStart + clip->length;
+        const int64_t ovStart = std::max(selStart, clipStart);
+        const int64_t ovEnd = std::min(selEnd, clipEnd);
+        if (ovEnd <= ovStart) continue;
+
+        // The overlap is already clamped to the clip, so reaching an edge just
+        // means the selection ran to (or past) it — within a few pixels, so a
+        // selection that rounds a hair inside still counts as reaching it and a
+        // whole-clip selection top-and-tails.
+        const int64_t edgeTol =
+            static_cast<int64_t>(view.samplesPerPixel * 4.0);
+        const bool atHead = ovStart <= clipStart + edgeTol;
+        const bool atTail = ovEnd >= clipEnd - edgeTol;
+
+        int64_t newFadeIn = clip->fadeIn;
+        int64_t newFadeOut = clip->fadeOut;
+        document::FadeShape newInShape = clip->fadeInShape;
+        document::FadeShape newOutShape = clip->fadeOutShape;
+
+        if (atHead && atTail) {
+            // Whole clip selected: top-and-tail with the default length rather
+            // than turning the clip into one long ramp.
+            const int64_t half = clip->length / 2;
+            const int64_t len = std::clamp<int64_t>(defaultFadeSamples, 0, half);
+            newFadeIn = len;
+            newFadeOut = len;
+            newInShape = inShape;
+            newOutShape = outShape;
+        } else {
+            bool doIn = atHead;
+            if (!atHead && !atTail) {
+                // Interior range: the nearer edge owns the fade.
+                doIn = (ovStart - clipStart) <= (clipEnd - ovEnd);
+            }
+            if (doIn) {
+                newFadeIn = ovEnd - clipStart;
+                newInShape = inShape;
+            } else {
+                newFadeOut = clipEnd - ovStart;
+                newOutShape = outShape;
+            }
+        }
+
+        // A fade-in and a fade-out cannot overlap. Clamp each to the clip, then
+        // give the edge the gesture just set priority over the other.
+        newFadeIn = std::clamp<int64_t>(newFadeIn, 0, clip->length);
+        newFadeOut = std::clamp<int64_t>(newFadeOut, 0, clip->length);
+        if (newFadeIn + newFadeOut > clip->length) {
+            if (atTail && !atHead) {
+                newFadeIn = clip->length - newFadeOut;
+            } else {
+                newFadeOut = clip->length - newFadeIn;
+            }
+        }
+
+        commands.push_back(std::make_unique<editing::SetClipFadeCommand>(
+            member.trackId, member.clipId, newFadeIn, newInShape, newFadeOut,
+            newOutShape));
+    }
+
+    if (commands.empty()) return false;
+    if (commands.size() == 1) {
+        undo.execute(std::move(commands.front()));
+    } else {
+        undo.execute(std::make_unique<editing::CompoundCommand>(
+            std::move(commands), "Set Fades"));
+    }
+    return true;
+}
+
 float drawMarkerLane(const document::Edit& edit,
                      editing::UndoStack& undo,
                      engine::Transport& transport,
@@ -3003,12 +4248,15 @@ float drawMarkerLane(const document::Edit& edit,
     const auto& pal = theme::palette();
     auto snapPosition = [&](int64_t sample) -> int64_t {
         sample = std::max<int64_t>(0, sample);
-        return view.snapEnabled
-            ? snapSampleToFormat(sample, view.tcMode, samplesPerPixel,
-                                 static_cast<double>(edit.sampleRate()),
-                                 24.0, edit.tempoBpm(), &edit.meterMap(),
-                                 &edit.tempoMap())
-            : sample;
+        if (!view.snapEnabled) return sample;
+        if (view.snapIncrementSamples > 0) {
+            const int64_t inc = view.snapIncrementSamples;
+            return ((sample + inc / 2) / inc) * inc;
+        }
+        return snapSampleToFormat(sample, view.tcMode, samplesPerPixel,
+                                  static_cast<double>(edit.sampleRate()),
+                                  24.0, edit.tempoBpm(), &edit.meterMap(),
+                                  &edit.tempoMap());
     };
 
     // Background — distinct from the ruler above and tracks below.
@@ -3206,8 +4454,10 @@ float drawMarkerLane(const document::Edit& edit,
                     }
                 }
             }
+            // The clip stays selected after a click, move or trim — that is what
+            // Cmd+D, Cmd+M and the clip inspector all act on. Only the drag
+            // bookkeeping is reset here.
             view.dragKind = TimelineViewState::DragKind::None;
-            view.selectedClipId.clear();
             view.dragOriginalTrackId.clear();
         }
     }
@@ -3312,12 +4562,15 @@ float drawVideoLane(const document::Edit& edit,
     const auto& pal = theme::palette();
     auto snapPosition = [&](int64_t sample) -> int64_t {
         sample = std::max<int64_t>(0, sample);
-        return view.snapEnabled
-            ? snapSampleToFormat(sample, view.tcMode, samplesPerPixel,
-                                 static_cast<double>(edit.sampleRate()),
-                                 24.0, edit.tempoBpm(), &edit.meterMap(),
-                                 &edit.tempoMap())
-            : sample;
+        if (!view.snapEnabled) return sample;
+        if (view.snapIncrementSamples > 0) {
+            const int64_t inc = view.snapIncrementSamples;
+            return ((sample + inc / 2) / inc) * inc;
+        }
+        return snapSampleToFormat(sample, view.tcMode, samplesPerPixel,
+                                  static_cast<double>(edit.sampleRate()),
+                                  24.0, edit.tempoBpm(), &edit.meterMap(),
+                                  &edit.tempoMap());
     };
 
     // No picture, no lane. The video panel owns onboarding, so an empty strip
@@ -3376,7 +4629,7 @@ float drawVideoLane(const document::Edit& edit,
                             C(pal.text), clip.name.c_str());
             }
             // Drag to move: start drag on click.
-            if (laneHovered && mouse.x >= clipX && mouse.x <= clipX + clipW &&
+            if (!ImGui::GetIO().KeyCtrl && laneHovered && mouse.x >= clipX && mouse.x <= clipX + clipW &&
                 ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
                 view.selectedClipId = clip.id;
                 view.dragKind = TimelineViewState::DragKind::VideoClip;

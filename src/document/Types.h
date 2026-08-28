@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "document/Fade.h"
+
 #include <cstdint>
 #include <algorithm>
 #include <cmath>
@@ -38,9 +40,12 @@ struct AudioClip {
     int64_t timelineStart = 0;   // where on the timeline (samples, playback rate)
     int64_t sourceOffset = 0;    // where in the source file (samples)
     int64_t length = 0;          // how long to play (samples)
-    double gain = 1.0;
+    double gain = 1.0;           // per-clip linear gain
+    bool muted = false;          // clip silenced (Cmd+M), independent of track
     int64_t fadeIn = 0;          // fade-in length in samples
     int64_t fadeOut = 0;         // fade-out length in samples
+    FadeShape fadeInShape = FadeShape::Linear;
+    FadeShape fadeOutShape = FadeShape::Linear;
 };
 
 // A plugin slot is one entry in a track's effect chain. It references the
@@ -106,6 +111,66 @@ struct RouteTarget {
 };
 
 enum class SendTap { PreFader, PostFader };
+
+// A set of clips that becomes a single clip on the timeline.
+//
+// Grouping does not merge the audio: the member clips stay exactly where they
+// are on their own tracks, which is what keeps them playing and what makes
+// ungrouping exact rather than a reconstruction. What changes is what you see
+// and what you can grab — the members stop drawing individually and the group
+// draws as one clip covering the range it was made from, on every track that
+// has a member in it.
+//
+// The range is the selection the group was made from, not the union of its
+// clips. Selecting four bars around three clips and grouping them gives a
+// four-bar object, which is what was asked for and what makes two groups butt
+// up against each other cleanly.
+struct ClipGroup {
+    struct Member {
+        std::string trackId;
+        std::string clipId;
+        // Which of the track's two clip vectors the id names.
+        bool midi = false;
+
+        bool operator==(const Member& other) const {
+            return trackId == other.trackId && clipId == other.clipId &&
+                   midi == other.midi;
+        }
+    };
+
+    std::string id;
+    std::string name;
+    int64_t timelineStart = 0;
+    int64_t length = 0;
+    std::vector<Member> members;
+    // Groups inside this one. A nested group keeps its own record intact and
+    // simply stops being the outermost thing over its clips, which is what
+    // makes ungrouping one layer put the layer below back rather than
+    // flattening everything at once.
+    std::vector<std::string> childGroupIds;
+    // The rows the group occupies, taken from the selection rather than
+    // derived from the members. An empty group has no members and still has to
+    // draw somewhere — deriving this made a group over silence invisible,
+    // which looked exactly like the shortcut doing nothing.
+    std::vector<std::string> trackIds;
+
+    int64_t end() const { return timelineStart + length; }
+    // One group clip per track it spans, so a group across three tracks reads
+    // as three clips that move together rather than one floating over lanes it
+    // does not belong to.
+    bool coversTrack(const std::string& id) const {
+        for (const auto& trackId : trackIds) {
+            if (trackId == id) return true;
+        }
+        // Files written before trackIds existed only knew their members.
+        if (trackIds.empty()) {
+            for (const auto& member : members) {
+                if (member.trackId == id) return true;
+            }
+        }
+        return false;
+    }
+};
 
 // One position in a channel's signal chain.
 //
@@ -318,6 +383,14 @@ struct Track {
     // goes to hardware. A flag rather than a type, so graph construction and
     // the mixer need no special DSP path.
     bool isMain = false;
+    // Hidden from the timeline. A view state, not a mute: a hidden track goes
+    // on playing, recording and receiving sends exactly as before — which is
+    // the whole point of hiding one rather than muting it.
+    bool hidden = false;
+    // Exempt from other tracks' solos. A talkback, a click, a reverb return
+    // you always want to hear — soloing a guitar should not silence the
+    // reverb that guitar is feeding.
+    bool soloSafe = false;
     std::vector<PluginSlot> plugins;
     // The order everything above happens in. Holds one entry per plugin, one
     // per send, one Meter and one Fader; `plugins` and `sends` are storage,
@@ -357,13 +430,17 @@ inline bool clampTrackInputToCaptureChannels(Track& track,
 // without constructing a graph, and so the GUI's dimming and the engine's
 // gain-zeroing are provably reading the same rule instead of two hand-written
 // conditions that can drift apart.
-inline bool trackAudible(bool mute, bool solo, bool anySoloed) {
+inline bool trackAudible(bool mute, bool solo, bool anySoloed,
+                         bool soloSafe = false) {
+    // Mute still wins. Solo-safe means "another track's solo does not silence
+    // me"; it does not mean "I cannot be switched off" — a safe track you
+    // muted on purpose should stay off.
     if (mute) return false;
-    return !anySoloed || solo;
+    return !anySoloed || solo || soloSafe;
 }
 
 inline bool trackAudible(const Track& t, bool anySoloed) {
-    return trackAudible(t.mute, t.solo, anySoloed);
+    return trackAudible(t.mute, t.solo, anySoloed, t.soloSafe);
 }
 
 

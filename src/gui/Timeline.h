@@ -67,10 +67,17 @@ enum class TimecodeMode {
 };
 
 enum class AutomationParameter { Volume, Pan };
-enum class AutomationTool { Pencil, Line, Curve };
+enum class AutomationTool { Pencil, Line, Curve, Eraser };
 
 std::string formatAutomationDrawValue(AutomationParameter parameter,
                                       double value);
+
+// Remove every automation point whose sample lies within the closed band
+// [loSample, hiSample]. Pure so the eraser's core — what survives a swipe —
+// is testable without driving the lane's geometry. Order is preserved.
+std::vector<document::VolumeAutomationPoint> automationErase(
+    const std::vector<document::VolumeAutomationPoint>& points,
+    int64_t loSample, int64_t hiSample);
 
 // TimelineViewState holds the user's view: horizontal scroll + zoom level.
 // Timeline itself is a pure function of (Edit, viewState) and reports any
@@ -85,7 +92,19 @@ constexpr double kMaxSamplesPerPixel = 1'000'000.0;   // ~5.8 hours / 1000 px
 struct TimelineViewState {
     double samplesPerPixel = 200.0;  // zoom; lower = zoomed in
     double scrollSamples = 0.0;      // leftmost visible sample
+    // Vertical scroll of the track rows, in pixels. Managed by the timeline
+    // itself rather than the host window's scroll, so the ruler, marker lane
+    // and add-track button stay pinned at the top instead of sliding off.
+    float verticalScroll = 0.0f;
     int selectedTrackIndex = -1;
+    // Multi-track selection (Shift-click a range in the track list). Held as
+    // ids so it survives reordering. selectedTrackIndex stays the "primary"
+    // row that single-track views (the channel strip, the plugins panel) act
+    // on; this set is the highlighted group. Reconciled each frame: when the
+    // primary is not in the set, an ordinary single-select happened elsewhere
+    // and the set collapses to it.
+    std::unordered_set<std::string> selectedTrackIds;
+    int trackSelectAnchor = -1;
     std::string selectedClipId;
     // UI-only recording preview. The document does not receive a clip until
     // the WAV is closed and hashed; armed lanes still show the growing take.
@@ -143,6 +162,19 @@ struct TimelineViewState {
     // A track asking for the channel strip. The strip is opt-in, so the E
     // button on a row is how it opens — the app selects that row and shows it.
     std::string requestChannelStripTrackId;
+    // A track asking to be hidden, and a request to bring every hidden one
+    // back. Serviced by the application, which owns the undo stack.
+    std::string requestHideTrackId;
+    // A track whose eye was clicked in the list — toggled rather than set, so
+    // the one control does both directions.
+    std::string requestToggleHiddenTrackId;
+    // A track the list asked to delete (right-click -> Delete), and the row the
+    // list's context menu is currently for.
+    std::string requestRemoveTrackId;
+    std::string trackListContextId;
+    // A track whose Solo was Cmd-clicked.
+    std::string requestToggleSoloSafeTrackId;
+    bool requestShowAllTracks = false;
     std::string requestTrackColorId;
     std::string requestTrackColor;               // empty restores default
     bool deferRecordArmRequests = false;
@@ -167,6 +199,23 @@ struct TimelineViewState {
     LevelMeterOptions meterOptions;
     bool meterOptionsChanged = false;
     bool snapEnabled = false;
+    // Snap increment in samples. 0 means "follow the ruler's timecode grid"
+    // (the format-aware default); a positive value snaps to that fixed spacing
+    // instead — a preset or a custom value chosen in the toolbar.
+    int64_t snapIncrementSamples = 0;
+    // Visual grid-line increment in samples, chosen the same way. 0 follows the
+    // timecode format; a positive value draws lines at that fixed spacing —
+    // but only while they stay far enough apart to read (below that the format
+    // grid is drawn instead, so the view never fills with lines).
+    int64_t gridIncrementSamples = 0;
+    // Vertical zoom for the track rows: Control+scroll grows or shrinks it.
+    float trackHeightScale = 1.0f;
+    // Per-track height multiplier (Ctrl+Up/Down on the selected track, or drag
+    // its bottom edge). Absent = 1.0. View state, so resizing a row does not
+    // rebuild the audio graph.
+    std::unordered_map<std::string, float> trackHeightScales;
+    // The track whose bottom edge is being dragged to resize, or empty.
+    std::string resizingTrackId;
     // Timeline keyboard ownership is remembered from the previous frame so
     // the application can route Tab before the immediate-mode widget draws.
     bool timelineKeyboardFocus = true;
@@ -228,6 +277,11 @@ struct TimelineViewState {
         AutomationParameter::Volume;
     AutomationTool drawingAutomationTool = AutomationTool::Pencil;
     std::string drawingAutomationOwnerId;
+    // The eraser sweeps a band across the lane and removes every breakpoint
+    // inside it, committing one bulk replace on release like the other tools.
+    // The band is kept in samples so it survives horizontal scroll mid-drag.
+    int64_t automationEraseMinSample = 0;
+    int64_t automationEraseMaxSample = 0;
     document::VolumeAutomationPoint automationDrawAnchor;
     std::vector<document::VolumeAutomationPoint> automationDrawOriginal;
     std::vector<document::VolumeAutomationPoint> automationDrawStroke;
@@ -265,11 +319,44 @@ struct TimelineViewState {
     // outside the widget (a keyboard shortcut has no other way to know how
     // wide the visible span is).
     float laneWidthPixels = 0.0f;
+    // Audio-file drop onto the timeline. The app records the path and the drop
+    // point (screen coords) on drop; the timeline — which owns the track/sample
+    // geometry — resolves each to a track and a snapped sample; the app then
+    // imports the WAV and places the clip. Two phases because import lives in
+    // the app and layout lives here.
+    struct PendingFileDrop { std::string path; float x = 0.0f; float y = 0.0f; };
+    struct ResolvedFileDrop {
+        std::string path;
+        std::string trackId;   // empty = dropped off the lanes, make a new track
+        int64_t sample = 0;
+    };
+    std::vector<PendingFileDrop> pendingFileDrops;
+    std::vector<ResolvedFileDrop> resolvedFileDrops;
+    // Live drop preview while a file is dragged over (before release). Set by
+    // the app from the platform drag tracker; the timeline draws a ghost clip
+    // at the track and sample under the cursor.
+    bool fileDragActive = false;
+    float fileDragX = 0.0f;
+    float fileDragY = 0.0f;
+    int64_t fileDragLengthSamples = 0;   // 0 when unknown; a marker is drawn
     // Timecode display mode for the ruler + position readout.
     TimecodeMode tcMode = TimecodeMode::MinSec;
+    // Clip gain being edited in the clip context menu (dB), seeded when the
+    // menu opens and committed on release so a drag is one undo step.
+    float contextClipGainDb = 0.0f;
     // Editable position display state.
     bool editingPosition = false;
     char positionInput[64] = {};
+    // Editable selection start/end fields in the toolbar (smaller than the main
+    // counter). The buffers reflect the selection until the field is focused.
+    bool editingSelStart = false;
+    bool editingSelEnd = false;
+    char selStartInput[32] = {};
+    char selEndInput[32] = {};
+    // Set the frame the editor opens so focus is grabbed once. Grabbing it
+    // every frame would re-steal it, so a click outside could never land — the
+    // field would refuse to close.
+    bool positionEditFocusPending = false;
 };
 
 // Change zoom while preserving `anchorSample` at its current screen X when it
@@ -297,6 +384,13 @@ std::string formatTimecode(int64_t samples, TimecodeMode mode,
                            const std::vector<document::TimeSignature>* meter = nullptr,
                            const std::vector<document::TempoChange>* tempo =
                                nullptr);
+
+// Parse a timecode string in `mode` back to a sample position, or -1 if it does
+// not parse. The inverse of formatTimecode for the editable time fields.
+int64_t parseTimecodeToSamples(
+    const char* text, TimecodeMode mode, double sr, double fps,
+    const std::vector<document::TempoChange>* tempo,
+    const std::vector<document::TimeSignature>* meter);
 
 // The grid divisions for a timing format, in samples. `major` is the labelled
 // one; `minor` is its subdivision.
@@ -369,6 +463,39 @@ void drawTimeline(const document::Edit& edit,
 // This lives here rather than in the key handler because DaveApp is not in the
 // test target — the dispatch is the part that can be got wrong, so it belongs
 // somewhere a test can reach it. Returns false when nothing is selected.
+// The clips the timeline selection covers, as group members.
+//
+// A clip counts when it OVERLAPS the range rather than when it is contained by
+// it: a selection dragged roughly around three clips is the gesture people
+// actually make, and requiring full containment would silently drop the ones
+// whose tails stick out. The selection's lane scopes it — a range dragged on
+// one track cannot group its neighbours' clips, which is the same rule every
+// other selection edit follows.
+std::vector<document::ClipGroup::Member> clipsInSelection(
+    const document::Edit& edit, const TimelineViewState& view);
+
+// The same, for a range the caller already has. `row` scopes it to one track,
+// or -1 for every track.
+std::vector<document::ClipGroup::Member> clipsInRange(
+    const document::Edit& edit, int64_t start, int64_t end, int row);
+
+// Group whatever the selection covers, or ungroup the group under it. Return
+// false when there is nothing to do, so the shortcut can stay quiet.
+bool groupSelectedClips(document::Edit& edit, editing::UndoStack& undo,
+                        TimelineViewState& view);
+bool ungroupSelectedClips(document::Edit& edit, editing::UndoStack& undo,
+                          TimelineViewState& view);
+
+// Point the timeline selection at one clip's extent, on its own row. Clicking
+// a clip is how you say "this one" — and the range edits (group, delete,
+// loop) all read the selection, so leaving it untouched meant a clicked clip
+// was selected for some purposes and not for others.
+// The playhead goes to the head of the selection, the same as it does when a
+// dragged range finishes — a selection made by clicking and one made by
+// dragging should leave the cursor in the same place.
+void selectClipRange(TimelineViewState& view, engine::Transport& transport,
+                     int row, int64_t start, int64_t length);
+
 // Delete every automation point inside the timeline selection, on the lane
 // the selected track currently shows. Returns false when there is nothing to
 // act on — no selection, no open lane, or no points inside it — so the caller
@@ -380,6 +507,16 @@ void drawTimeline(const document::Edit& edit,
 bool deleteAutomationInSelection(document::Edit& edit,
                                  editing::UndoStack& undo,
                                  TimelineViewState& view);
+
+// Delete the time range the user has selected out of the clips it covers,
+// trimming rather than removing: a selection over a clip's head or tail
+// shortens it, a selection covering the whole clip removes it, and a selection
+// inside a clip splits it in two around the gap. Audio and MIDI clips both.
+// Acts on the selection's own row, or on every track when the selection spans
+// them. Returns false when there is no range or nothing under it.
+bool trimClipsInSelection(document::Edit& edit,
+                          editing::UndoStack& undo,
+                          TimelineViewState& view);
 
 // The points that survive removing everything in [start, end] inclusive.
 // Exposed because the range arithmetic is the whole of the decision.
@@ -398,6 +535,51 @@ std::vector<Point> pointsOutsideRange(const std::vector<Point>& points,
 bool duplicateSelectedClip(const document::Edit& edit,
                            editing::UndoStack& undo,
                            TimelineViewState& view);
+
+// Toggle the mute of the selected audio clip (Cmd+M). Returns false when no
+// audio clip is selected. Here, not in the key handler, so it is testable.
+bool toggleSelectedClipMute(const document::Edit& edit,
+                            editing::UndoStack& undo, TimelineViewState& view);
+
+// Scale the selected track's row height by `factor` (Ctrl+Up/Down), clamped.
+// Per-track and view-only, so it neither rebuilds the graph nor needs undo.
+bool adjustSelectedTrackHeight(const document::Edit& edit,
+                               TimelineViewState& view, float factor);
+
+// Trim the selected audio clip to the selection: `keepAfter` (A key) cuts
+// everything before the selection's start; otherwise (S key) everything after
+// its end. Returns false when there is nothing to cut.
+bool trimSelectedClipToSelection(const document::Edit& edit,
+                                 editing::UndoStack& undo, TimelineViewState& view,
+                                 bool keepAfter);
+
+// Fade the selected audio clip to the playhead: `fadeIn` (D key) fades in up to
+// it, otherwise (G key) fades out from it. Returns false when the playhead is
+// not inside the selected clip.
+bool fadeSelectedClipToPlayhead(const document::Edit& edit,
+                                editing::UndoStack& undo, TimelineViewState& view,
+                                int64_t playhead, bool fadeIn,
+                                document::FadeShape shape);
+
+// Fade the audio clips the timeline selection covers. A fade always grows from
+// a clip edge, so the selection sets its length: a range that reaches a clip's
+// head becomes a fade-in ending where the selection ends, one that reaches its
+// tail a fade-out starting where the selection begins, and an interior range
+// fades from whichever edge is nearer. A selection covering a whole clip — what
+// a single click leaves behind — instead drops `defaultFadeSamples` on both
+// ends, so "click a clip, press F" is a one-key top-and-tail. `inShape`/
+// `outShape` are the preset curves to stamp on. Batches into one undo step when
+// it touches several clips. Returns false when there is no range, or nothing
+// audio under it — so the shortcut can report why nothing happened. MIDI clips
+// are skipped (no fades).
+//
+// Here rather than in the key handler because DaveApp is not in the test
+// target, and mapping a range onto per-clip fade lengths is the part to test.
+bool createFadeFromSelection(const document::Edit& edit,
+                             editing::UndoStack& undo, TimelineViewState& view,
+                             document::FadeShape inShape,
+                             document::FadeShape outShape,
+                             int64_t defaultFadeSamples);
 
 // Draw the marker lane (a strip above the track rows showing markers as flags
 // and regions). Returns the height it consumed (caller reserves that much

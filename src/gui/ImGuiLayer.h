@@ -26,6 +26,13 @@ public:
     // Call at the start of each frame, after glfwPollEvents.
     void newFrame();
 
+    // Enable ImGui multi-viewport (detached OS windows) for this frame. Off is
+    // the everyday state: viewports add an OS-window focus layer that makes
+    // macOS swallow the first click after the app is reactivated. Turned on
+    // only while the picture is popped out, which is the one thing that needs
+    // to leave the main window. No-op in screenshot mode.
+    void setViewportsEnabled(bool enabled);
+
     // Call after all ImGui:: widgets are issued, to build the draw data and
     // render via the GL3 backend.
     void render();

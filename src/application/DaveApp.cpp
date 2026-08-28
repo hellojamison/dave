@@ -5,12 +5,17 @@
 #include "document/ProjectFile.h"
 #include "editing/Commands.h"
 #include "gui/Theme.h"
+#include "platform/FileDrag.h"
 #include "platform/MacMenuBar.h"
+
+#define DR_WAV_NO_IMPLEMENTATION
+#include <dr_wav.h>
 
 #include <glad.h>
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 #include <imgui.h>
+#include <imgui_internal.h>  // RenderArrow, to match the combo boxes' own arrow
 #include <nfd.h>
 
 #include <algorithm>
@@ -18,6 +23,7 @@
 #include <cfloat>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -158,7 +164,15 @@ bool DaveApp::init(bool startAudio) {
                              path.c_str());
                 continue;
             }
-            loadWavIntoNewTrack(path);
+            // Record where it was dropped; the timeline resolves that to a
+            // track and sample next frame, then the clip is placed there. The
+            // cursor comes from GLFW because ImGui's own position can lag a
+            // frame behind an OS drag.
+            double cursorX = 0.0;
+            double cursorY = 0.0;
+            window_.cursorPos(cursorX, cursorY);
+            view_.pendingFileDrops.push_back(
+                {path, static_cast<float>(cursorX), static_cast<float>(cursorY)});
         }
     });
 
@@ -234,6 +248,7 @@ bool DaveApp::init(bool startAudio) {
     view_.transientSensitivity = editorPreferences_.transientSensitivity;
     view_.meterOptions.preFader = editorPreferences_.meterPreFader;
     view_.meterOptions.rmsBody = editorPreferences_.meterRmsBody;
+    view_.meterOptions.belowFader = editorPreferences_.meterBelowFader;
     view_.meterOptions.peakHoldSeconds =
         editorPreferences_.meterPeakHoldSeconds;
     if (startAudio) {
@@ -265,6 +280,10 @@ bool DaveApp::init(bool startAudio) {
     // this is one extra harmless rebuild.
 
     window_.setFrameCallback([this] {
+        // Detached OS windows (multi-viewport) only while the picture is popped
+        // out; off otherwise so the first click after reactivating the app hits
+        // the control instead of merely focusing the window.
+        imgui_.setViewportsEnabled(videoPoppedOut_);
         imgui_.newFrame();
         handleShortcuts();
         drawUI();
@@ -290,7 +309,12 @@ void DaveApp::handleShortcuts() {
     if (io.WantTextInput) return;
 
 #ifdef __APPLE__
-    const bool primaryModifier = io.KeySuper;
+    // io.KeyCtrl, not io.KeySuper. ImGui swaps the two on macOS inside
+    // AddKeyEvent, so physical Command arrives as KeyCtrl and physical Control
+    // arrives as KeySuper. Reading KeySuper here bound every "Cmd" shortcut in
+    // this block to the Control key instead — unnoticed because the ones that
+    // matter most also have native menu items, which do use real Command.
+    const bool primaryModifier = io.KeyCtrl;
 #else
     const bool primaryModifier = io.KeyCtrl;
 #endif
@@ -311,7 +335,7 @@ void DaveApp::handleShortcuts() {
     } else
 #endif
     if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
-        transport.toggle();
+        togglePlayback();
     } else if (ImGui::IsKeyPressed(ImGuiKey_Enter, false)) {
         // Return/Enter: jump playhead to start (standard DAW shortcut).
         transport.seek(0);
@@ -344,15 +368,75 @@ void DaveApp::handleShortcuts() {
         preferencesJustOpened_ = true;
     } else if (ImGui::IsKeyPressed(ImGuiKey_Delete, false) ||
                ImGui::IsKeyPressed(ImGuiKey_Backspace, false)) {
-        // Delete clears automation inside the selection when a lane is open.
-        // It returns false when there is nothing to act on, which leaves the
-        // key free to mean something else here later.
-        gui::deleteAutomationInSelection(edit_, undo_, view_);
+        // Delete acts on whatever the selection is over. An open automation
+        // lane takes it first, since a range on that row means the points;
+        // otherwise a range over clips trims them (a partial selection
+        // shortens the clip rather than deleting it whole). Each returns false
+        // when it had nothing to act on, so the fallback chain is honest.
+        if (!gui::deleteAutomationInSelection(edit_, undo_, view_)) {
+            gui::trimClipsInSelection(edit_, undo_, view_);
+        }
+    } else if (primaryModifier && alt &&
+               ImGui::IsKeyPressed(ImGuiKey_G, false)) {
+        // A shortcut that silently does nothing is indistinguishable from one
+        // that is not wired up, which is exactly how this looked.
+        if (!gui::groupSelectedClips(edit_, undo_, view_)) {
+            showStatus("Select a range or a clip to group", true);
+        }
+    } else if (primaryModifier && alt &&
+               ImGui::IsKeyPressed(ImGuiKey_U, false)) {
+        if (!gui::ungroupSelectedClips(edit_, undo_, view_)) {
+            showStatus("Nothing grouped in the selection", true);
+        }
     } else if (primaryModifier && ImGui::IsKeyPressed(ImGuiKey_D, false)) {
         // Cmd+D duplicates the selected clip, audio or MIDI. The dispatch
         // lives in Timeline.cpp so a test can reach it — this file isn't in
         // the test target.
         gui::duplicateSelectedClip(edit_, undo_, view_);
+    } else if (primaryModifier && ImGui::IsKeyPressed(ImGuiKey_M, false)) {
+        // Cmd+M mutes/unmutes the selected clip. (The native Window menu's
+        // Minimize no longer claims Cmd+M, so it reaches here.)
+        gui::toggleSelectedClipMute(edit_, undo_, view_);
+    } else if (primaryModifier && ImGui::IsKeyPressed(ImGuiKey_UpArrow, true)) {
+        // Ctrl+Up/Down grows/shrinks the selected track's row (repeat allowed).
+        gui::adjustSelectedTrackHeight(edit_, view_, 1.12f);
+    } else if (primaryModifier && ImGui::IsKeyPressed(ImGuiKey_DownArrow, true)) {
+        gui::adjustSelectedTrackHeight(edit_, view_, 1.0f / 1.12f);
+    } else if (!primaryModifier && !shift && !alt &&
+               ImGui::IsKeyPressed(ImGuiKey_F, false)) {
+        // F: fade the selection. A range at a clip's head becomes a fade-in, at
+        // its tail a fade-out; a whole-clip selection (what a click leaves)
+        // gets default fades on both ends. Shapes and the default length come
+        // from the Fades preferences. Dispatch lives in Timeline.cpp for the
+        // test.
+        const int64_t defaultFade = static_cast<int64_t>(
+            editorPreferences_.defaultFadeMs *
+            static_cast<double>(edit_.sampleRate()) / 1000.0);
+        if (!gui::createFadeFromSelection(
+                edit_, undo_, view_, editorPreferences_.defaultFadeInShape,
+                editorPreferences_.defaultFadeOutShape, defaultFade)) {
+            showStatus("Select part of an audio clip to fade", true);
+        }
+    } else if (!primaryModifier && !shift && !alt &&
+               ImGui::IsKeyPressed(ImGuiKey_A, false)) {
+        // A: cut the selected clip back to the selection's start (drop the head).
+        gui::trimSelectedClipToSelection(edit_, undo_, view_, /*keepAfter=*/true);
+    } else if (!primaryModifier && !shift && !alt &&
+               ImGui::IsKeyPressed(ImGuiKey_S, false)) {
+        // S: cut the selected clip off at the selection's end (drop the tail).
+        gui::trimSelectedClipToSelection(edit_, undo_, view_, /*keepAfter=*/false);
+    } else if (!primaryModifier && !shift && !alt &&
+               ImGui::IsKeyPressed(ImGuiKey_D, false)) {
+        // D: fade the selected clip in, up to the playhead.
+        gui::fadeSelectedClipToPlayhead(edit_, undo_, view_, transport.position(),
+                                        /*fadeIn=*/true,
+                                        editorPreferences_.defaultFadeInShape);
+    } else if (!primaryModifier && !shift && !alt &&
+               ImGui::IsKeyPressed(ImGuiKey_G, false)) {
+        // G: fade the selected clip out, from the playhead.
+        gui::fadeSelectedClipToPlayhead(edit_, undo_, view_, transport.position(),
+                                        /*fadeIn=*/false,
+                                        editorPreferences_.defaultFadeOutShape);
     } else if (primaryModifier && ImGui::IsKeyPressed(ImGuiKey_Q, false)) {
         window_.close();
     } else if (primaryModifier && !shift && ImGui::IsKeyPressed(ImGuiKey_R, false)) {
@@ -542,6 +626,7 @@ void DaveApp::saveEditorPreferences() {
         std::clamp(view_.transientSensitivity, 0, 100);
     editorPreferences_.meterPreFader = view_.meterOptions.preFader;
     editorPreferences_.meterRmsBody = view_.meterOptions.rmsBody;
+    editorPreferences_.meterBelowFader = view_.meterOptions.belowFader;
     editorPreferences_.meterPeakHoldSeconds =
         view_.meterOptions.peakHoldSeconds;
     if (!editorPreferencesStore_.save(editorPreferences_)) {
@@ -722,6 +807,81 @@ void DaveApp::drawPreferencesWindow() {
             "How long the peak marker sits at its maximum before it falls.");
 
         ImGui::EndTabItem();
+        }
+
+        // Fades: the presets the F key stamps on a selection, and the default
+        // length. Kept apart from "Editing" because it is one self-contained
+        // idea a user goes looking for by that name.
+        if (ImGui::BeginTabItem("Fades")) {
+            ImGui::Dummy(ImVec2(0.0f, 2.0f));
+            ImGui::TextUnformatted("Press F to fade the timeline selection.");
+            ImGui::TextDisabled(
+                "A range at a clip's start fades in, at its end fades out; "
+                "selecting a whole clip fades both ends.");
+            ImGui::Separator();
+
+            static const char* kShapeNames[] = {"Linear", "Equal power", "Slow",
+                                                "Fast", "S-curve"};
+            // A small live preview of the chosen curve, drawn from the same
+            // functions the timeline and audio use.
+            auto previewCurve = [&](document::FadeShape shape, bool fadeOut) {
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                const ImVec2 p = ImGui::GetCursorScreenPos();
+                const ImVec2 size(64.0f, 34.0f);
+                dl->AddRectFilled(p, ImVec2(p.x + size.x, p.y + size.y),
+                                  ImGui::GetColorU32(ImGuiCol_FrameBg), 3.0f);
+                ImVec2 prev;
+                for (int s = 0; s <= 24; ++s) {
+                    const float t = static_cast<float>(s) / 24.0f;
+                    const float g = fadeOut ? document::fadeOutGain(shape, t)
+                                            : document::fadeInGain(shape, t);
+                    const ImVec2 cur(p.x + size.x * t,
+                                     p.y + size.y - 2.0f - g * (size.y - 4.0f));
+                    if (s > 0) {
+                        dl->AddLine(prev, cur,
+                                    ImGui::GetColorU32(ImGuiCol_Text), 1.5f);
+                    }
+                    prev = cur;
+                }
+                ImGui::Dummy(size);
+            };
+
+            int inShape = static_cast<int>(editorPreferences_.defaultFadeInShape);
+            ImGui::TextUnformatted("Fade in");
+            ImGui::SetNextItemWidth(160.0f);
+            if (ImGui::Combo("##fadeInShape", &inShape, kShapeNames,
+                             IM_ARRAYSIZE(kShapeNames))) {
+                editorPreferences_.defaultFadeInShape =
+                    static_cast<document::FadeShape>(inShape);
+                saveEditorPreferences();
+            }
+            ImGui::SameLine();
+            previewCurve(editorPreferences_.defaultFadeInShape, false);
+
+            int outShape =
+                static_cast<int>(editorPreferences_.defaultFadeOutShape);
+            ImGui::TextUnformatted("Fade out");
+            ImGui::SetNextItemWidth(160.0f);
+            if (ImGui::Combo("##fadeOutShape", &outShape, kShapeNames,
+                             IM_ARRAYSIZE(kShapeNames))) {
+                editorPreferences_.defaultFadeOutShape =
+                    static_cast<document::FadeShape>(outShape);
+                saveEditorPreferences();
+            }
+            ImGui::SameLine();
+            previewCurve(editorPreferences_.defaultFadeOutShape, true);
+
+            ImGui::Separator();
+            ImGui::TextUnformatted("Default length");
+            ImGui::SetNextItemWidth(200.0f);
+            ImGui::SliderInt("##fadeMs", &editorPreferences_.defaultFadeMs, 0,
+                             200, "%d ms");
+            if (ImGui::IsItemDeactivatedAfterEdit()) saveEditorPreferences();
+            ImGui::TextDisabled(
+                "Used when F fades a whole clip, and to soften the edges of "
+                "imported clips.");
+
+            ImGui::EndTabItem();
         }
 
         // Device selection lives here rather than in the arrangement window:
@@ -1114,6 +1274,19 @@ void DaveApp::endCapture() {
     }
 }
 
+void DaveApp::togglePlayback() {
+    auto& tr = audio_.transport();
+    // Rewind by the pre-roll before starting, so playback rolls in ahead of the
+    // cursor. Stopping is unchanged — the pre-roll is a lead-in, not a jump.
+    if (!tr.isPlaying() && editorPreferences_.preRollEnabled) {
+        const int64_t pre = static_cast<int64_t>(
+            editorPreferences_.preRollMs *
+            static_cast<double>(edit_.sampleRate()) / 1000.0);
+        tr.seek(std::max<int64_t>(0, tr.position() - pre));
+    }
+    tr.toggle();
+}
+
 void DaveApp::toggleRecording() {
     if (recordingActive()) punchOut();
     else punchIn();
@@ -1285,8 +1458,14 @@ bool DaveApp::loadWavIntoEdit(const std::string& path) {
     clip.timelineStart = placeAt;
     clip.sourceOffset = 0;
     clip.length = asset->lengthSamples;
-    clip.fadeIn = 64;
-    clip.fadeOut = 64;
+    // A short de-click fade on both edges, from the Fades preference. Capped at
+    // half the clip so a tiny import can't ask for more fade than it has.
+    const int64_t declick = std::min<int64_t>(
+        clip.length / 2,
+        static_cast<int64_t>(editorPreferences_.defaultFadeMs *
+                             static_cast<double>(edit_.sampleRate()) / 1000.0));
+    clip.fadeIn = declick;
+    clip.fadeOut = declick;
     undo_.execute(std::make_unique<editing::AddClipCommand>(trackId, clip));
 
     // Make the clip immediately playable/visible: seek to its start and reset
@@ -1299,6 +1478,52 @@ bool DaveApp::loadWavIntoEdit(const std::string& path) {
                  asset->lengthSamples / static_cast<double>(asset->sampleRate),
                  asset->channels,
                  static_cast<long long>(placeAt));
+    return true;
+}
+
+int64_t DaveApp::wavLengthSamples(const std::string& path) {
+    if (path == fileDragLenPath_) return fileDragLenSamples_;
+    fileDragLenPath_ = path;
+    fileDragLenSamples_ = 0;
+    drwav wav;
+    if (drwav_init_file(&wav, path.c_str(), nullptr)) {
+        fileDragLenSamples_ = static_cast<int64_t>(wav.totalPCMFrameCount);
+        drwav_uninit(&wav);
+    }
+    return fileDragLenSamples_;
+}
+
+bool DaveApp::placeWavOnTrack(const std::string& path,
+                             const std::string& trackId, int64_t sample) {
+    auto assetId = edit_.importAsset(path);
+    if (!assetId.valid()) {
+        std::fprintf(stderr, "Dave: dropped WAV import failed: %s\n", path.c_str());
+        return false;
+    }
+    const auto* asset = edit_.asset(assetId);
+    if (asset == nullptr) return false;
+    document::AudioClip clip;
+    clip.asset = assetId;
+    clip.timelineStart = std::max<int64_t>(0, sample);
+    clip.sourceOffset = 0;
+    clip.length = asset->lengthSamples;
+    // A short de-click fade on both edges, from the Fades preference. Capped at
+    // half the clip so a tiny import can't ask for more fade than it has.
+    const int64_t declick = std::min<int64_t>(
+        clip.length / 2,
+        static_cast<int64_t>(editorPreferences_.defaultFadeMs *
+                             static_cast<double>(edit_.sampleRate()) / 1000.0));
+    clip.fadeIn = declick;
+    clip.fadeOut = declick;
+    undo_.execute(std::make_unique<editing::AddClipCommand>(trackId, clip));
+    for (size_t i = 0; i < edit_.tracks().size(); ++i) {
+        if (edit_.tracks()[i].id == trackId) {
+            view_.selectedTrackIndex = static_cast<int>(i);
+            break;
+        }
+    }
+    std::fprintf(stderr, "Dave: dropped %s onto %s at %lld\n", path.c_str(),
+                 trackId.c_str(), static_cast<long long>(clip.timelineStart));
     return true;
 }
 
@@ -1323,8 +1548,14 @@ bool DaveApp::loadWavIntoNewTrack(const std::string& path) {
     clip.timelineStart = 0;
     clip.sourceOffset = 0;
     clip.length = asset->lengthSamples;
-    clip.fadeIn = 64;
-    clip.fadeOut = 64;
+    // A short de-click fade on both edges, from the Fades preference. Capped at
+    // half the clip so a tiny import can't ask for more fade than it has.
+    const int64_t declick = std::min<int64_t>(
+        clip.length / 2,
+        static_cast<int64_t>(editorPreferences_.defaultFadeMs *
+                             static_cast<double>(edit_.sampleRate()) / 1000.0));
+    clip.fadeIn = declick;
+    clip.fadeOut = declick;
     undo_.execute(std::make_unique<editing::AddClipCommand>(trackId, clip));
     view_.selectedTrackIndex = static_cast<int>(edit_.tracks().size()) - 1;
     view_.scrollSamples = 0;
@@ -1338,6 +1569,22 @@ void DaveApp::drawUI() {
     const auto& pal = gui::theme::palette();
     // Cleared before drawing and set by whichever tool draws its own cursor.
     view_.wantsHiddenCursor = false;
+
+    // Live file-drag preview. Only WAVs get a ghost; the length is read from the
+    // header (cached) so the ghost is the file's real width.
+    {
+        const platform::FileDragInfo di = platform::fileDragInfo();
+        auto isWav = [](const std::string& p) {
+            return p.size() > 4 &&
+                   (p.compare(p.size() - 4, 4, ".wav") == 0 ||
+                    p.compare(p.size() - 4, 4, ".WAV") == 0);
+        };
+        view_.fileDragActive = di.active && isWav(di.path);
+        view_.fileDragX = static_cast<float>(di.x);
+        view_.fileDragY = static_cast<float>(di.y);
+        view_.fileDragLengthSamples =
+            view_.fileDragActive ? wavLengthSamples(di.path) : 0;
+    }
 
     // Capture follows the transport. Watching the edge here rather than
     // hooking every place that can start or stop playback means Space, the
@@ -1423,14 +1670,33 @@ void DaveApp::drawUI() {
     constexpr float minEditorH = 120.0f;
     // Picture is opt-in and so is the strip; with neither showing there is no
     // sidebar to size, and the timeline takes the whole window.
+    showChannelStrip_ = rightPanel_ == RightPanel::Strip;
     const bool sidebarVisible =
-        showChannelStrip_ || (!edit_.videoTracks().empty() && !videoPoppedOut_);
+        rightPanel_ != RightPanel::None ||
+        (!edit_.videoTracks().empty() && !videoPoppedOut_);
+    // The rails are permanent, so their width comes off before anything else
+    // is sized. Everything below lays out in the space between them.
+    const float railW = gui::kSideRailWidth;
+    const float innerW = std::max(0.0f, vp->WorkSize.x - railW * 2.0f);
     const auto mainLayout = application::calculateMainEditorLayout(
-        vp->WorkSize.x, contentH, splitterSize, sidebarWidth_, mixerHeight_,
-        showMixer_, minEditorW, minEditorH, sidebarVisible);
+        innerW, contentH, splitterSize, sidebarWidth_, mixerHeight_,
+        showMixer_, minEditorW, minEditorH, sidebarVisible, trackListWidth_,
+        showTrackList_);
     const float sidebarW = mainLayout.sidebarWidth;
     const float timelineW = mainLayout.editorWidth;
-    const float sidebarX = baseX + timelineW + splitterSize;
+    const float leftPanelW = mainLayout.leftPanelWidth;
+    // Everything to the right of the track list starts past it and its
+    // splitter, so opening the list slides the whole editor rather than
+    // overlapping it.
+    // The rails hug the arrangement editor rather than the window. Opening a
+    // panel pushes its rail inward with it, so the buttons stay next to the
+    // thing they act on instead of ending up across a panel from it.
+    const float railLeftX = baseX + leftPanelW +
+                            (showTrackList_ ? splitterSize : 0.0f);
+    const float editorX = railLeftX + railW;
+    const float railRightX = editorX + timelineW;
+    const float sidebarX = railRightX + railW +
+                           (sidebarVisible ? splitterSize : 0.0f);
     const float availablePanelW =
         std::max(0.0f, vp->WorkSize.x - splitterSize);
     const float maxSidebarW =
@@ -1518,21 +1784,30 @@ void DaveApp::drawUI() {
             if (ImGui::MenuItem("Next Transient or Boundary", "Tab")) {
                 navigateTimeline(gui::NavigationDirection::Next, false);
             }
-            if (ImGui::MenuItem("Previous Transient or Boundary", "Ctrl+Tab")) {
+            if (ImGui::MenuItem("Previous Transient or Boundary",
+#ifdef __APPLE__
+                                "Opt+Tab")) {
+#else
+                                "Ctrl+Tab")) {
+#endif
                 navigateTimeline(gui::NavigationDirection::Previous, false);
             }
             if (ImGui::MenuItem("Extend Selection to Next", "Shift+Tab")) {
                 navigateTimeline(gui::NavigationDirection::Next, true);
             }
             if (ImGui::MenuItem("Extend Selection to Previous",
+#ifdef __APPLE__
+                                "Opt+Shift+Tab")) {
+#else
                                 "Ctrl+Shift+Tab")) {
+#endif
                 navigateTimeline(gui::NavigationDirection::Previous, true);
             }
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Transport")) {
             if (ImGui::MenuItem(transport.isPlaying() ? "Stop" : "Play", "Space"))
-                recordingActive() ? stopRecording() : transport.toggle();
+                recordingActive() ? stopRecording() : togglePlayback();
             if (ImGui::MenuItem(recordingActive() ? "Stop Recording" : "Record",
                                 "Ctrl+R"))
                 toggleRecording();
@@ -1543,11 +1818,10 @@ void DaveApp::drawUI() {
         if (ImGui::BeginMenu("Window")) {
             if (ImGui::MenuItem("Mixer", "Ctrl+=", showMixer_))
                 showMixer_ = !showMixer_;
-            if (ImGui::MenuItem("Channel Strip", nullptr, showChannelStrip_)) {
-                showChannelStrip_ = !showChannelStrip_;
-                if (showChannelStrip_ && pluginHost_.descriptors().empty()) {
-                    pluginHost_.scan();
-                }
+            if (ImGui::MenuItem("Channel Strip", nullptr,
+                                rightPanel_ == RightPanel::Strip)) {
+                rightPanel_ = rightPanel_ == RightPanel::Strip
+                    ? RightPanel::None : RightPanel::Strip;
             }
             if (ImGui::MenuItem("Audio I/O...")) {
                 showPreferences_ = true;
@@ -1654,7 +1928,7 @@ void DaveApp::drawUI() {
                 ImVec2(controlH, controlH),
                 wasPlaying ? gui::theme::ButtonVariant::Primary
                            : gui::theme::ButtonVariant::Normal)) {
-            transport.toggle();
+            togglePlayback();
         }
 
         ImGui::SameLine(0.0f, kGap);
@@ -1699,6 +1973,9 @@ void DaveApp::drawUI() {
         const char* tcModes[] = {"min:sec", "timecode", "bars|beats", "feet+frames", "samples"};
         int tcIdx = static_cast<int>(view_.tcMode);
         const float counterW = compactToolbar ? 132.0f : 150.0f;
+        // The box's own left edge, so the editable field can be centred on it
+        // and the format caret can sit at its right edge either way.
+        const ImVec2 counterOrigin = ImGui::GetCursorScreenPos();
         if (!view_.editingPosition) {
             std::string tcStr = gui::formatTimecode(
                 pos, view_.tcMode, static_cast<double>(edit_.sampleRate()),
@@ -1726,20 +2003,56 @@ void DaveApp::drawUI() {
             ImGui::GetWindowDrawList()->PopClipRect();
             if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
                 view_.editingPosition = true;
+                view_.positionEditFocusPending = true;
                 // Pre-fill the input with the current timecode.
                 std::strncpy(view_.positionInput, tcStr.c_str(), sizeof(view_.positionInput) - 1);
                 view_.positionInput[sizeof(view_.positionInput) - 1] = '\0';
             }
         } else {
-            // Editable input. Enter = seek, Escape = cancel.
-            ImGui::SetNextItemWidth(counterW);
-            ImGui::SetKeyboardFocusHere();
-            if (gui::theme::fonts().monoSmall != nullptr) {
-                ImGui::PushFont(gui::theme::fonts().monoSmall, 13.0f);
+            // Editable input. Enter = seek, Escape = cancel. Same font and size
+            // as the readout, in a frame sized to the same box, so switching to
+            // edit changes neither the number's size nor its position — only
+            // that a caret now blinks in it.
+            constexpr float editFontSize = 20.0f;
+            const bool haveMono = gui::theme::fonts().monoLarge != nullptr;
+            if (haveMono) {
+                ImGui::PushFont(gui::theme::fonts().monoLarge, editFontSize);
             }
-            if (ImGui::InputText("##posedit", view_.positionInput,
-                                 sizeof(view_.positionInput),
-                                 ImGuiInputTextFlags_EnterReturnsTrue)) {
+            ImGui::PushStyleVar(
+                ImGuiStyleVar_FramePadding,
+                ImVec2(ImGui::GetStyle().FramePadding.x,
+                       std::max(0.0f, (controlH - editFontSize) * 0.5f)));
+            const float framePadX = ImGui::GetStyle().FramePadding.x;
+            const float editTextW = ImGui::CalcTextSize(view_.positionInput).x;
+            const float inputW = std::clamp(
+                editTextW + framePadX * 2.0f + 10.0f, 40.0f, counterW);
+            // Centre the TEXT in the box, not the frame. InputText draws its
+            // text one FramePadding in from the frame's left edge, and the
+            // frame is deliberately wider than the text (the +10 leaves room
+            // for the caret at the end); centring the frame would therefore
+            // pull the number a few pixels left of where the read-only readout
+            // sits, which is the shift you see on entering edit. Backing the
+            // frame off by one FramePadding lands the glyphs on the same x.
+            ImGui::SetCursorScreenPos(ImVec2(
+                counterOrigin.x + (counterW - editTextW) * 0.5f - framePadX,
+                counterOrigin.y));
+            ImGui::SetNextItemWidth(inputW);
+            // Grab focus only on the frame the editor opened. Doing it every
+            // frame re-steals focus, so a click elsewhere could never
+            // deactivate the field — it would reopen on the spot.
+            if (view_.positionEditFocusPending) {
+                ImGui::SetKeyboardFocusHere();
+                view_.positionEditFocusPending = false;
+            }
+            const bool posEntered = ImGui::InputText(
+                "##posedit", view_.positionInput, sizeof(view_.positionInput),
+                ImGuiInputTextFlags_EnterReturnsTrue);
+            // A click outside the field commits the same as Enter: the typed
+            // value takes effect. Escape is the one exit that discards, so the
+            // commit path is gated to exclude it.
+            const bool posEscaped = ImGui::IsKeyPressed(ImGuiKey_Escape);
+            const bool posDeactivated = ImGui::IsItemDeactivated();
+            if (posEntered || (posDeactivated && !posEscaped)) {
                 // Parse the timecode back to samples based on the current mode.
                 int64_t target = -1;
                 double sr = static_cast<double>(edit_.sampleRate());
@@ -1794,12 +2107,11 @@ void DaveApp::drawUI() {
                 }
                 if (target >= 0) transport.seek(target);
                 view_.editingPosition = false;
-            }
-            if (gui::theme::fonts().monoSmall != nullptr) {
-                ImGui::PopFont();
-            }
-            if (ImGui::IsKeyPressed(ImGuiKey_Escape))
+            } else if (posEscaped) {
                 view_.editingPosition = false;
+            }
+            ImGui::PopStyleVar();   // FramePadding
+            if (haveMono) ImGui::PopFont();
         }
         // The format is a property of the counter beside it, so it hangs off
         // the counter as a disclosure arrow rather than restating the current
@@ -1810,7 +2122,8 @@ void DaveApp::drawUI() {
         // no frame of its own; putting a boxed control against it made the
         // format look like a second, equally important thing rather than a
         // property of the number.
-        ImGui::SameLine(0.0f, 1.0f);
+        ImGui::SetCursorScreenPos(
+            ImVec2(counterOrigin.x + counterW + 1.0f, counterOrigin.y));
         const float arrowW = 14.0f;
         const ImVec2 caretMin = ImGui::GetCursorScreenPos();
         ImGui::InvisibleButton("##tcmode", ImVec2(arrowW, controlH));
@@ -1819,16 +2132,19 @@ void DaveApp::drawUI() {
             ImGui::OpenPopup("##tcmodeMenu");
         }
         {
-            const float cx = caretMin.x + arrowW * 0.5f;
-            // Sits on the counter's baseline rather than the control's centre,
-            // so it reads as attached to the digits.
-            const float cy = caretMin.y + controlH * 0.5f + 3.0f;
-            constexpr float half = 3.5f;
-            ImGui::GetWindowDrawList()->AddTriangleFilled(
-                ImVec2(cx - half, cy - half * 0.6f),
-                ImVec2(cx + half, cy - half * 0.6f),
-                ImVec2(cx, cy + half * 0.8f),
-                ImGui::GetColorU32(caretHovered ? pal.text : pal.textMuted));
+            // Draw the format caret with ImGui's own arrow renderer, placed the
+            // way a combo places its arrow (one FramePadding down from the top,
+            // centred across the box). Before, a hand-rolled triangle dropped
+            // low onto the digits — a different shape from the Grid/Snap arrows
+            // and visibly off-centre.
+            const float fontSize = ImGui::GetFontSize();
+            const ImVec2 arrowPos(
+                caretMin.x + (arrowW - fontSize) * 0.5f,
+                caretMin.y + ImGui::GetStyle().FramePadding.y);
+            ImGui::RenderArrow(
+                ImGui::GetWindowDrawList(), arrowPos,
+                ImGui::GetColorU32(caretHovered ? pal.text : pal.textMuted),
+                ImGuiDir_Down, 1.0f);
         }
         if (caretHovered) {
             ImGui::SetTooltip("Counter format (%s)", tcModes[tcIdx]);
@@ -1865,43 +2181,283 @@ void DaveApp::drawUI() {
         }
         groupSeparator();
 
-        // No +Track here: the timeline carries a + above its topmost row,
-        // which is where a track gets added and where the new one appears.
-        ImGui::Checkbox("Snap", &view_.snapEnabled);
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Snap timeline edits to the current %s grid",
-                              tcModes[tcIdx]);
+        // Editable selection start/end — smaller than the main counter. Each
+        // field mirrors the selection until you focus it, then parses on blur.
+        {
+            const double selSr = static_cast<double>(edit_.sampleRate());
+            auto fmtSel = [&](int64_t s) {
+                return gui::formatTimecode(s, view_.tcMode, selSr, 24.0,
+                                           edit_.tempoBpm(), &edit_.meterMap(),
+                                           &edit_.tempoMap());
+            };
+            const float selFieldW = compactToolbar ? 74.0f : 92.0f;
+            auto timeField = [&](const char* id, char* buf, bool& editing,
+                                 int64_t& value) {
+                if (!editing) {
+                    const std::string t = fmtSel(value);
+                    std::strncpy(buf, t.c_str(), 31);
+                    buf[31] = '\0';
+                }
+                ImGui::SetNextItemWidth(selFieldW);
+                ImGui::InputText(id, buf, 32,
+                                 ImGuiInputTextFlags_EnterReturnsTrue);
+                if (ImGui::IsItemActivated()) editing = true;
+                if (ImGui::IsItemDeactivated()) {
+                    editing = false;
+                    const int64_t parsed = gui::parseTimecodeToSamples(
+                        buf, view_.tcMode, selSr, 24.0, &edit_.tempoMap(),
+                        &edit_.meterMap());
+                    if (parsed >= 0) value = parsed;
+                }
+            };
+            int64_t selS = std::min(view_.selectionStart, view_.selectionEnd);
+            int64_t selE = std::max(view_.selectionStart, view_.selectionEnd);
+            label("Sel");
+            timeField("##selStart", view_.selStartInput, view_.editingSelStart,
+                      selS);
+            ImGui::SameLine(0.0f, 3.0f);
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextColored(pal.textMuted, "\xe2\x80\x93");  // en dash
+            ImGui::SameLine(0.0f, 3.0f);
+            timeField("##selEnd", view_.selEndInput, view_.editingSelEnd, selE);
+            view_.selectionStart = selS;
+            view_.selectionEnd = selE;
+            if (selE > selS) view_.hasSelection = true;
+            groupSeparator();
         }
 
+        // Pre-roll / post-roll. The button tints when either is on; it opens a
+        // popup for the toggles and lengths. Pre-roll rewinds before playback
+        // starts (see togglePlayback).
+        {
+            const bool anyRoll = editorPreferences_.preRollEnabled ||
+                                 editorPreferences_.postRollEnabled;
+            if (anyRoll) ImGui::PushStyleColor(ImGuiCol_Text, pal.accent);
+            if (ImGui::Button("Roll", ImVec2(0.0f, controlH))) {
+                ImGui::OpenPopup("##rollopts");
+            }
+            if (anyRoll) ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Pre-roll / post-roll");
+            }
+            if (ImGui::BeginPopup("##rollopts")) {
+                bool pre = editorPreferences_.preRollEnabled;
+                if (ImGui::Checkbox("Pre-roll", &pre)) {
+                    editorPreferences_.preRollEnabled = pre;
+                    saveEditorPreferences();
+                }
+                ImGui::SetNextItemWidth(130.0f);
+                ImGui::SliderInt("##prems", &editorPreferences_.preRollMs, 0,
+                                 10000, "%d ms");
+                if (ImGui::IsItemDeactivatedAfterEdit()) saveEditorPreferences();
+                ImGui::Separator();
+                bool post = editorPreferences_.postRollEnabled;
+                if (ImGui::Checkbox("Post-roll", &post)) {
+                    editorPreferences_.postRollEnabled = post;
+                    saveEditorPreferences();
+                }
+                ImGui::SetNextItemWidth(130.0f);
+                ImGui::SliderInt("##postms", &editorPreferences_.postRollMs, 0,
+                                 10000, "%d ms");
+                if (ImGui::IsItemDeactivatedAfterEdit()) saveEditorPreferences();
+                ImGui::EndPopup();
+            }
+            groupSeparator();
+        }
+
+        // No +Track here: the timeline carries a + above its topmost row,
+        // which is where a track gets added and where the new one appears.
+
+        // Snap and grid increments, chosen the same way. The first entry
+        // follows the ruler's timecode format; the presets and Custom\u2026 are
+        // fixed spacings. `followLabel` names that first entry per combo, and
+        // `autoSamples` is the value it currently resolves to — shown in the
+        // preview so the grid combo reads as a real increment ("250 ms") rather
+        // than the circular word "Grid".
+        auto formatIncrement = [](std::int64_t samples, char* out, size_t n) {
+            const double sec = samples / 48000.0;
+            if (sec >= 1.0) std::snprintf(out, n, "%.3g s", sec);
+            else            std::snprintf(out, n, "%.3g ms", samples / 48.0);
+        };
+
+        // Increment presets follow the ruler's format: bars|beats offers bar
+        // and beat divisions, SMPTE offers frames, samples offers sample
+        // counts, and so on. Computed from the document's own tempo/meter so a
+        // "1 beat" grid lands on the beats the counter shows.
+        struct IncrementChoice { const char* label; std::int64_t samples; };
+        std::vector<IncrementChoice> presets;
+        {
+            const double sr = static_cast<double>(edit_.sampleRate());
+            const double fps = 24.0;
+            const double frame = fps > 0.0 ? sr / fps : sr;
+            auto R = [](double v) {
+                return static_cast<std::int64_t>(std::llround(v));
+            };
+            switch (view_.tcMode) {
+                case gui::TimecodeMode::MinSec:
+                    presets = {{"1 s", R(sr)}, {"1/2 s", R(sr / 2)},
+                               {"1/4 s", R(sr / 4)}, {"100 ms", R(sr * 0.1)},
+                               {"10 ms", R(sr * 0.01)}, {"1 ms", R(sr * 0.001)}};
+                    break;
+                case gui::TimecodeMode::Smpte:
+                    presets = {{"1 s", R(sr)}, {"10 fr", R(10 * frame)},
+                               {"5 fr", R(5 * frame)}, {"2 fr", R(2 * frame)},
+                               {"1 fr", R(frame)}};
+                    break;
+                case gui::TimecodeMode::FeetFrames:
+                    presets = {{"1 ft", R(16 * frame)}, {"1/2 ft", R(8 * frame)},
+                               {"4 fr", R(4 * frame)}, {"1 fr", R(frame)}};
+                    break;
+                case gui::TimecodeMode::BarsBeats: {
+                    const double perBar = document::samplesPerBarAtBar(
+                        1, sr, edit_.tempoMap(), edit_.meterMap());
+                    const double perBeat = document::samplesPerBeatAtBar(
+                        1, sr, edit_.tempoMap(), edit_.meterMap());
+                    presets = {{"1 bar", R(perBar)}, {"1/2 bar", R(perBar / 2)},
+                               {"1 beat", R(perBeat)}, {"1/2 beat", R(perBeat / 2)},
+                               {"1/4 beat", R(perBeat / 4)}};
+                    break;
+                }
+                case gui::TimecodeMode::Samples:
+                    presets = {{"48000", 48000}, {"4800", 4800}, {"1000", 1000},
+                               {"480", 480}, {"100", 100}, {"10", 10}, {"1", 1}};
+                    break;
+            }
+        }
+
+        auto incrementCombo = [&](const char* comboId, const char* popupId,
+                                  std::int64_t& target, double& customMs,
+                                  bool enablesSnap, const char* followLabel,
+                                  std::int64_t autoSamples,
+                                  std::int64_t formatSamples, const char* tip) {
+            // The label to show for a given sample count: a matching preset's
+            // name, else a formatted duration.
+            auto labelFor = [&](std::int64_t samples, char* out, size_t n) {
+                for (const auto& c : presets) {
+                    if (c.samples == samples) {
+                        std::snprintf(out, n, "%s", c.label);
+                        return;
+                    }
+                }
+                formatIncrement(samples, out, n);
+            };
+            char preview[24];
+            if (target <= 0) {
+                if (autoSamples > 0) labelFor(autoSamples, preview, sizeof(preview));
+                else std::snprintf(preview, sizeof(preview), "%s", followLabel);
+            } else {
+                labelFor(target, preview, sizeof(preview));
+            }
+            ImGui::SetNextItemWidth(compactToolbar ? 80.0f : 98.0f);
+            // Selecting "Custom\u2026" only records the intent: the combo closes
+            // on any selection, so its popup can't be opened from inside it —
+            // OpenPopup and BeginPopup have to sit at this level, after the
+            // combo, or the popup's Begin never runs and the entry does nothing.
+            bool openCustom = false;
+            if (ImGui::BeginCombo(comboId, preview)) {
+                if (ImGui::Selectable(followLabel, target <= 0)) target = 0;
+                for (const auto& c : presets) {
+                    if (ImGui::Selectable(c.label, target == c.samples)) {
+                        target = c.samples;
+                        if (enablesSnap) view_.snapEnabled = true;
+                    }
+                }
+                if (ImGui::Selectable("Custom\u2026")) {
+                    // Seed the field with the increment currently in force: the
+                    // chosen value, or the format-resolved one when following.
+                    const std::int64_t current =
+                        target > 0 ? target
+                                   : (formatSamples > 0 ? formatSamples : 4800);
+                    customMs = current / 48.0;
+                    openCustom = true;
+                }
+                ImGui::EndCombo();
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+            if (openCustom) ImGui::OpenPopup(popupId);
+            if (ImGui::BeginPopup(popupId)) {
+                ImGui::TextUnformatted("Custom increment");
+                ImGui::SetNextItemWidth(120.0f);
+                ImGui::InputDouble("ms", &customMs, 0.0, 0.0, "%.3f");
+                if (ImGui::Button("Set")) {
+                    target = static_cast<std::int64_t>(
+                        std::llround(std::max(0.001, customMs) * 48.0));
+                    if (enablesSnap) view_.snapEnabled = true;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndPopup();
+            }
+        };
+
+        // The value the format grid resolves to at the current zoom, so the
+        // grid combo can show it instead of a bare label.
+        const gui::GridStep autoGrid = gui::gridStepFor(
+            view_.tcMode, view_.samplesPerPixel,
+            static_cast<double>(edit_.sampleRate()), 24.0, edit_.tempoBpm(),
+            &edit_.meterMap(), &edit_.tempoMap());
+        // The snap step the format resolves to now, for the snap combo's
+        // custom-field default (its preview stays "Grid").
+        const std::int64_t snapAuto = gui::snapStepFor(
+            view_.tcMode, view_.samplesPerPixel,
+            static_cast<double>(edit_.sampleRate()), 24.0, edit_.tempoBpm(),
+            &edit_.meterMap(), &edit_.tempoMap());
+
+        // Grid first, then Snap (swapped from before). AlignTextToFramePadding
+        // centres the label vertically against the taller combo beside it.
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Grid");
+        ImGui::SameLine(0.0f, 4.0f);
+        incrementCombo("##gridIncrement", "##gridCustom",
+                       view_.gridIncrementSamples, gridCustomMs_, false,
+                       "Auto", autoGrid.minor, autoGrid.minor,
+                       "Grid line increment \u2014 Auto follows the ruler format");
+
         ImGui::SameLine(0.0f, kGap);
+        ImGui::Checkbox("Snap", &view_.snapEnabled);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Snap timeline edits to the increment beside this");
+        }
+        ImGui::SameLine(0.0f, 4.0f);
+        incrementCombo("##snapIncrement", "##snapCustom",
+                       view_.snapIncrementSamples, snapCustomMs_, true,
+                       "Grid", 0, snapAuto,
+                       "Snap increment \u2014 Grid follows the ruler format");
+
+        ImGui::SameLine(0.0f, kGap);
+        // A slightly more compact toggle than the transport buttons — it is a
+        // secondary switch, not a transport action, and at the full control
+        // height it read as the tallest thing on the bar. Nudged down a pixel
+        // so the shorter button stays centred in the row.
+        const ImVec2 transientCursor = ImGui::GetCursorScreenPos();
+        ImGui::SetCursorScreenPos(
+            ImVec2(transientCursor.x, transientCursor.y + 1.0f));
         if (gui::theme::iconButton(
                 "##transientNavigation",
                 gui::theme::TransportIcon::Transient,
 #ifdef __APPLE__
                 "Transient navigation (Cmd+Option+Tab)\n"
                 "Tab: next  Option+Tab: previous\n"
-                "Add Shift to extend the selection",
+                "Add Shift to extend the selection\n"
+                "Right-click for display and sensitivity",
 #else
                 "Transient navigation (Ctrl+Alt+T)\n"
                 "Tab: next  Ctrl+Tab: previous\n"
-                "Add Shift to extend the selection",
+                "Add Shift to extend the selection\n"
+                "Right-click for display and sensitivity",
 #endif
-                ImVec2(controlH, controlH),
+                ImVec2(controlH - 2.0f, controlH - 2.0f),
                 view_.transientNavigationEnabled
                     ? gui::theme::ButtonVariant::Primary
                     : gui::theme::ButtonVariant::Normal)) {
             toggleTransientNavigation();
         }
-        ImGui::SameLine(0.0f, 2.0f);
-        if (ImGui::Button("...##transientOptions",
-                          ImVec2(controlH, controlH))) {
+        // Right-click the toggle for display + sensitivity, rather than a
+        // second button beside it doing what a context menu is for.
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
             ImGui::OpenPopup("Transient options");
         }
         if (openTransientOptions_) {
             ImGui::OpenPopup("Transient options");
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Transient display and sensitivity");
         }
         if (ImGui::BeginPopup("Transient options")) {
             openTransientOptions_ = false;
@@ -1932,6 +2488,121 @@ void DaveApp::drawUI() {
     }
     ImGui::End();
 
+    // ─── Side rails ──────────────────────────────────────────────────────
+    // Always present, whatever is open. A panel that can be closed needs a
+    // permanent place to be reopened from, and a toolbar button stops being
+    // one as soon as there are several — the toolbar then carries controls
+    // for things that are not on screen.
+    {
+        const ImGuiWindowFlags railFlags =
+            panelFlags | ImGuiWindowFlags_NoScrollbar |
+            ImGuiWindowFlags_NoScrollWithMouse;
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+
+        ImGui::SetNextWindowPos(ImVec2(railLeftX, contentY), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(railW, contentH), ImGuiCond_Always);
+        ImGui::Begin("##railLeft", nullptr, railFlags);
+        {
+            const float x = railLeftX + (railW - gui::kSideRailButtonSize) * 0.5f;
+            const float y = gui::sideRailButtonY(contentY, 0);
+            size_t hidden = 0;
+            for (const auto& t : edit_.tracks()) {
+                if (t.hidden) ++hidden;
+            }
+            char tip[64];
+            if (hidden > 0) {
+                std::snprintf(tip, sizeof(tip), "Tracks — %zu hidden", hidden);
+            } else {
+                std::snprintf(tip, sizeof(tip), "Tracks");
+            }
+            if (gui::sideRailButton("tracks", ImVec2(x, y), showTrackList_,
+                                    tip)) {
+                showTrackList_ = !showTrackList_;
+            }
+            // Eye open while the panel is open — the mark shows the state,
+            // the same way the eyes inside the list show whether each track is
+            // visible. (It used to show the inverse, as "what clicking does",
+            // which made opening the panel appear to shut the eye.)
+            gui::drawTrackListEye(
+                ImGui::GetWindowDrawList(),
+                ImVec2(x + gui::kSideRailButtonSize * 0.5f,
+                       y + gui::kSideRailButtonSize * 0.5f),
+                showTrackList_,
+                ImGui::GetColorU32(showTrackList_ ? pal.primaryText
+                                                  : pal.textMuted));
+        }
+        ImGui::End();
+
+        ImGui::SetNextWindowPos(ImVec2(railRightX, contentY), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(railW, contentH), ImGuiCond_Always);
+        ImGui::Begin("##railRight", nullptr, railFlags);
+        {
+            const float x = railRightX + (railW - gui::kSideRailButtonSize) * 0.5f;
+            const float stripY = gui::sideRailButtonY(contentY, 0);
+            const bool stripOpen = rightPanel_ == RightPanel::Strip;
+            if (gui::sideRailButton("strip", ImVec2(x, stripY), stripOpen,
+                                    "Channel strip")) {
+                rightPanel_ = stripOpen ? RightPanel::None : RightPanel::Strip;
+            }
+            gui::drawStripIcon(
+                ImGui::GetWindowDrawList(),
+                ImVec2(x + gui::kSideRailButtonSize * 0.5f,
+                       stripY + gui::kSideRailButtonSize * 0.5f),
+                ImGui::GetColorU32(stripOpen ? pal.primaryText
+                                             : pal.textMuted));
+
+        }
+        ImGui::End();
+        ImGui::PopStyleVar();
+    }
+
+    // ─── Track list (far left) ───────────────────────────────────────────
+    // Hiding a track is only safe if there is somewhere it is still listed,
+    // and this is the only place that says WHICH tracks are hidden.
+    if (showTrackList_) {
+        ImGui::SetNextWindowPos(ImVec2(baseX, contentY), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(leftPanelW, contentH), ImGuiCond_Always);
+        ImGui::Begin("Tracks", nullptr, panelFlags);
+        // No header: the rail eye is the only control this panel needs, and the
+        // list itself says how many tracks are hidden.
+        gui::drawTrackList(edit_, view_);
+        ImGui::End();
+
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+        ImGui::SetNextWindowPos(ImVec2(baseX + leftPanelW, contentY),
+                                ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(splitterSize, contentH),
+                                 ImGuiCond_Always);
+        ImGui::Begin("##trackListSplitter", nullptr,
+                     panelFlags | ImGuiWindowFlags_NoBackground |
+                         ImGuiWindowFlags_NoScrollbar |
+                         ImGuiWindowFlags_NoScrollWithMouse |
+                         ImGuiWindowFlags_NoSavedSettings);
+        const ImVec2 listSplitterOrigin = ImGui::GetCursorScreenPos();
+        ImGui::InvisibleButton("##dragTrackList",
+                               ImVec2(splitterSize, contentH));
+        const bool listSplitterHovered =
+            ImGui::IsItemHovered() || ImGui::IsItemActive();
+        if (listSplitterHovered) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+        }
+        if (ImGui::IsItemActive()) {
+            trackListWidth_ = std::clamp(
+                trackListWidth_ + ImGui::GetIO().MouseDelta.x, 120.0f, 420.0f);
+        }
+        ImGui::GetWindowDrawList()->AddLine(
+            ImVec2(listSplitterOrigin.x + splitterSize * 0.5f,
+                   listSplitterOrigin.y),
+            ImVec2(listSplitterOrigin.x + splitterSize * 0.5f,
+                   listSplitterOrigin.y + contentH),
+            ImGui::GetColorU32(listSplitterHovered ? pal.accent
+                                                   : pal.borderStrong),
+            1.0f);
+        ImGui::End();
+        ImGui::PopStyleVar(2);
+    }
+
     // ─── Timeline + mixer (left column, split horizontally) ──────────────
     // The mixer takes the bottom of the timeline column rather than a slot in
     // the sidebar: strips sit side by side, so the panel needs width, and the
@@ -1943,9 +2614,14 @@ void DaveApp::drawUI() {
     const float mixerH = mainLayout.mixerHeight;
     const float timelineH = mainLayout.timelineHeight;
 
-    ImGui::SetNextWindowPos(ImVec2(baseX, contentY), ImGuiCond_Always);
+    ImGui::SetNextWindowPos(ImVec2(editorX, contentY), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(timelineW, timelineH), ImGuiCond_Always);
-    ImGui::Begin("Timeline", nullptr, panelFlags);
+    // NoScrollWithMouse: the timeline handles the wheel itself (vertical scroll,
+    // Shift for horizontal, Ctrl/Cmd for zoom), so ImGui must not also
+    // auto-scroll the window and double it. The scrollbar stays draggable.
+    ImGui::Begin("Timeline", nullptr,
+                 panelFlags | ImGuiWindowFlags_NoScrollWithMouse |
+                     ImGuiWindowFlags_NoScrollbar);
     gui::theme::panelHeader("Timeline");
     // Taller windows can afford more waveform detail; the gutter itself
     // computes a content minimum so both values remain overlap-safe.
@@ -1976,7 +2652,7 @@ void DaveApp::drawUI() {
     // ─── Mixer (bottom of the timeline column) ───────────────────────────
     if (showMixer_) {
         const float mixerY = contentY + timelineH + splitterSize;
-        ImGui::SetNextWindowPos(ImVec2(baseX, mixerY), ImGuiCond_Always);
+        ImGui::SetNextWindowPos(ImVec2(editorX, mixerY), ImGuiCond_Always);
         ImGui::SetNextWindowSize(ImVec2(timelineW, mixerH), ImGuiCond_Always);
         ImGui::Begin("Mixer", nullptr, panelFlags);
         if (panelHeaderAction("Mixer", "Hide",
@@ -2006,6 +2682,20 @@ void DaveApp::drawUI() {
         if (node) node->setPeakHoldSeconds(hold);
     }
     serviceViewRequests();
+
+    // Place any audio-file drops the timeline resolved this frame.
+    if (!view_.resolvedFileDrops.empty()) {
+        for (const auto& drop : view_.resolvedFileDrops) {
+            if (drop.trackId.empty()) {
+                loadWavIntoNewTrack(drop.path);
+            } else {
+                placeWavOnTrack(drop.path, drop.trackId, drop.sample);
+            }
+        }
+        view_.resolvedFileDrops.clear();
+        platform::clearFileDrag();
+        view_.fileDragActive = false;
+    }
     // The loop follows the live selection, which the timeline has just
     // finished updating — so this runs every frame rather than only on
     // document changes. Dragging a new range while looping re-points the loop
@@ -2031,6 +2721,7 @@ void DaveApp::drawUI() {
         ImGui::End();
     }
 
+
     if (showChannelStrip_) {
         ImGui::SetNextWindowPos(
             ImVec2(sidebarX,
@@ -2038,7 +2729,11 @@ void DaveApp::drawUI() {
                                : sidebarContentY),
             ImGuiCond_Always);
         ImGui::SetNextWindowSize(ImVec2(sidebarW, pluginsH), ImGuiCond_Always);
-        ImGui::Begin("Channel Strip", nullptr, panelFlags);
+        // No scrollbar: the strip sizes its fader to fit, so it must never
+        // scroll — a scrolling channel strip hides the fader or the output.
+        ImGui::Begin("Channel Strip", nullptr,
+                     panelFlags | ImGuiWindowFlags_NoScrollbar |
+                         ImGuiWindowFlags_NoScrollWithMouse);
         // No panel header: the strip's own coloured header already names the
         // track, and a second title above it said only what the panel is —
         // which the E button that opened it had just answered. Closing is the
@@ -2060,7 +2755,7 @@ void DaveApp::drawUI() {
 
     if (sidebarVisible) {
     ImGui::SetNextWindowPos(
-        ImVec2(baseX + timelineW, contentY), ImGuiCond_Always);
+        ImVec2(railRightX + railW, contentY), ImGuiCond_Always);
     ImGui::SetNextWindowSize(
         ImVec2(splitterSize, contentH), ImGuiCond_Always);
     ImGui::Begin("##timelineSidebarSplitter", nullptr, splitterFlags);
@@ -2091,7 +2786,7 @@ void DaveApp::drawUI() {
     // is nothing to size.
     if (showMixer_) {
         ImGui::SetNextWindowPos(
-            ImVec2(baseX, contentY + timelineH), ImGuiCond_Always);
+            ImVec2(editorX, contentY + timelineH), ImGuiCond_Always);
         ImGui::SetNextWindowSize(
             ImVec2(timelineW, splitterSize), ImGuiCond_Always);
         ImGui::Begin("##timelineMixerSplitter", nullptr, splitterFlags);
@@ -2271,16 +2966,28 @@ bool DaveApp::importMidiFile(const std::string& path) {
         return false;
     }
 
-    const size_t firstNew = edit_.tracks().size();
-    undo_.execute(std::make_unique<editing::ImportMidiFileCommand>(
-        std::move(tracks), fileName));
-    // Select the first imported row so the instrument picker in the gutter is
-    // the obvious next step rather than something to go hunting for.
-    view_.selectedTrackIndex =
-        static_cast<int>(edit_.tracks().size() + firstNew);
+    const size_t before = edit_.tracks().size();
+    auto command = std::make_unique<editing::ImportMidiFileCommand>(
+        std::move(tracks), fileName);
+    auto* commandPtr = command.get();
+    undo_.execute(std::move(command));
+    // Select the first imported row by id, so the instrument picker in the
+    // gutter is the obvious next step. By id rather than by index because Main
+    // sorts to the end of the list, so the imported rows do not simply sit at
+    // the old end — an index computed from the old size lands on Main instead.
+    if (!commandPtr->trackIds().empty()) {
+        const std::string& firstImported = commandPtr->trackIds().front();
+        const auto& rows = edit_.tracks();
+        for (size_t i = 0; i < rows.size(); ++i) {
+            if (rows[i].id == firstImported) {
+                view_.selectedTrackIndex = static_cast<int>(i);
+                break;
+            }
+        }
+    }
     std::fprintf(stderr, "Dave: imported %s (%zu track%s)\n", fileName.c_str(),
-                 edit_.tracks().size() - firstNew,
-                 (edit_.tracks().size() - firstNew) == 1 ? "" : "s");
+                 edit_.tracks().size() - before,
+                 (edit_.tracks().size() - before) == 1 ? "" : "s");
     return true;
 }
 
@@ -3224,6 +3931,48 @@ void DaveApp::serviceViewRequests() {
         }
         view_.requestPluginEditorSlotId.clear();
     }
+    if (!view_.requestHideTrackId.empty()) {
+        const std::string trackId = std::move(view_.requestHideTrackId);
+        view_.requestHideTrackId.clear();
+        undo_.execute(std::make_unique<editing::SetTrackHiddenCommand>(
+            trackId, true));
+        showStatus("Track hidden — right-click a track name to show all");
+    }
+    if (!view_.requestToggleHiddenTrackId.empty()) {
+        const std::string trackId =
+            std::move(view_.requestToggleHiddenTrackId);
+        view_.requestToggleHiddenTrackId.clear();
+        if (const auto* track = edit_.track(trackId)) {
+            undo_.execute(std::make_unique<editing::SetTrackHiddenCommand>(
+                trackId, !track->hidden));
+        }
+    }
+    if (!view_.requestRemoveTrackId.empty()) {
+        const std::string trackId = std::move(view_.requestRemoveTrackId);
+        view_.requestRemoveTrackId.clear();
+        if (const auto* track = edit_.track(trackId); track && !track->isMain) {
+            undo_.execute(
+                std::make_unique<editing::RemoveTrackCommand>(trackId));
+            view_.selectedTrackIndex = std::min(
+                view_.selectedTrackIndex,
+                static_cast<int>(edit_.tracks().size()) - 1);
+        }
+    }
+    if (!view_.requestToggleSoloSafeTrackId.empty()) {
+        const std::string trackId =
+            std::move(view_.requestToggleSoloSafeTrackId);
+        view_.requestToggleSoloSafeTrackId.clear();
+        if (const auto* track = edit_.track(trackId)) {
+            const bool safe = !track->soloSafe;
+            undo_.execute(std::make_unique<editing::SetTrackSoloSafeCommand>(
+                trackId, safe));
+            showStatus(safe ? "Solo safe on" : "Solo safe off");
+        }
+    }
+    if (view_.requestShowAllTracks) {
+        view_.requestShowAllTracks = false;
+        undo_.execute(std::make_unique<editing::ShowAllTracksCommand>());
+    }
     if (!view_.requestChannelStripTrackId.empty()) {
         const std::string trackId =
             std::move(view_.requestChannelStripTrackId);
@@ -3236,14 +3985,15 @@ void DaveApp::serviceViewRequests() {
             // already showing closes it, which is the only way the button can
             // read as a toggle without holding state of its own.
             const int row = static_cast<int>(i);
-            showChannelStrip_ =
-                !(showChannelStrip_ && view_.selectedTrackIndex == row);
-            // The strip's pickers list what has been scanned, and the scan is
-            // cached — so this runs once, the first time a strip is opened,
-            // instead of costing every session that never opens one.
-            if (showChannelStrip_ && pluginHost_.descriptors().empty()) {
-                pluginHost_.scan();
-            }
+            const bool alreadyShowing = rightPanel_ == RightPanel::Strip &&
+                                        view_.selectedTrackIndex == row;
+            rightPanel_ = alreadyShowing ? RightPanel::None
+                                         : RightPanel::Strip;
+            showChannelStrip_ = rightPanel_ == RightPanel::Strip;
+            // The plugin scan is deferred to the first time a picker is opened
+            // (openPluginBrowser), not to opening the strip — a strip opens
+            // instantly, and the scan (which loads every VST3, hundreds of ms)
+            // only runs when the user actually reaches for a plugin.
             view_.selectedTrackIndex = row;
             break;
         }

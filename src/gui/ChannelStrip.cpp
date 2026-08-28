@@ -32,82 +32,10 @@ constexpr float kFaderHeight = 132.0f;
 // Pan is a trim, not the channel's main gesture; at full width it read as the
 // more important of the two.
 constexpr float kPanWidth = 110.0f;
-// The send bar at rest, and while held.
-constexpr float kSendFaderWidth = 62.0f;
-constexpr float kSendExpandedWidth = 210.0f;
 // The meter reads continuously and is the row least in need of a label, so it
 // gets the height the labelled rows do not need.
 constexpr float kMeterRowHeight = 56.0f;
 
-// A send's level, as a compact bar that grows while you hold it.
-//
-// A send is one row in the chain, so its fader has to fit on that row — but a
-// 60 px bar is far too coarse to set a level with. Holding it expands the bar
-// across the strip and doubles its height, drawn over the rows either side,
-// so the gesture that needs the resolution is the one that gets it. Pro Tools
-// does the same thing for the same reason.
-//
-// The drag is relative rather than absolute: an expanding control whose value
-// jumped to the cursor would move the moment it grew.
-bool sendFader(const char* id, float& db, float width, float height) {
-    const auto& pal = theme::palette();
-    const ImVec2 pos = ImGui::GetCursorScreenPos();
-    ImGui::PushID(id);
-    ImGui::InvisibleButton("##send", ImVec2(width, height));
-    const bool active = ImGui::IsItemActive();
-    const bool hovered = ImGui::IsItemHovered();
-
-    bool changed = false;
-    if (active) {
-        const float travel = ImGui::GetIO().MouseDelta.x;
-        if (travel != 0.0f) {
-            // Expanded width sets the resolution, so the value tracks the
-            // pointer at the size the user is actually looking at.
-            db = std::clamp(db + travel * (66.0f / kSendExpandedWidth),
-                            -60.0f, 6.0f);
-            changed = true;
-        }
-    }
-    if (theme::altClickedReset()) {
-        db = -60.0f;
-        changed = true;
-    }
-
-    const float drawWidth = active ? kSendExpandedWidth : width;
-    const float drawHeight = active ? height * 2.0f : height;
-    const float drawX = active
-        ? pos.x + width - drawWidth   // grows leftward, staying under the cursor
-        : pos.x;
-    const float drawY = active ? pos.y - (drawHeight - height) * 0.5f : pos.y;
-    ImDrawList* dl = active ? ImGui::GetForegroundDrawList()
-                            : ImGui::GetWindowDrawList();
-    const ImVec2 barMin(drawX, drawY);
-    const ImVec2 barMax(drawX + drawWidth, drawY + drawHeight);
-    dl->AddRectFilled(barMin, barMax, ImGui::GetColorU32(pal.surfaceBase), 2.0f);
-    const float filled = std::clamp((db + 60.0f) / 66.0f, 0.0f, 1.0f);
-    dl->AddRectFilled(
-        barMin, ImVec2(drawX + drawWidth * filled, barMax.y),
-        ImGui::GetColorU32(active || hovered ? pal.accentStrong : pal.accent),
-        2.0f);
-    dl->AddRect(barMin, barMax, ImGui::GetColorU32(pal.border), 2.0f);
-
-    // The number only while it is being set: at rest the bar is the readout,
-    // and a value printed on a 60 px bar is unreadable anyway.
-    if (active) {
-        char text[16];
-        std::snprintf(text, sizeof(text), "%+.1f dB", db);
-        const ImVec2 size = ImGui::CalcTextSize(text);
-        dl->AddText(ImVec2(drawX + (drawWidth - size.x) * 0.5f,
-                           drawY + (drawHeight - size.y) * 0.5f),
-                    ImGui::GetColorU32(pal.primaryText), text);
-    }
-    if (hovered && !active) {
-        ImGui::SetTooltip("Send level %+.1f dB \xe2\x80\x94 drag to set, "
-                          "Option-click for off", db);
-    }
-    ImGui::PopID();
-    return changed;
-}
 
 // Where the dragged row would land, drawn across the list so a drag in
 // progress shows its result instead of only its outcome.
@@ -243,6 +171,25 @@ size_t dropIndexAmongRows(float mouseY, const std::vector<float>& rowTops,
     // has left the list entirely.
     (void)listBottom;
     return rowTops.size() - 1;
+}
+
+float verticalSliderGrabCenterY(float trackTopY, float trackHeight,
+                                float grabMinSize, float value, float vMin,
+                                float vMax) {
+    // Mirrors imgui_widgets.cpp SliderBehaviorT: grab_padding is a hardcoded
+    // 2px, the grab is at least grabMinSize but never taller than the track,
+    // and the grab CENTRE travels within the track inset by half the grab at
+    // each end.
+    constexpr float grabPadding = 2.0f;
+    const float sliderSz = trackHeight - grabPadding * 2.0f;
+    const float grabSz = std::min(grabMinSize, sliderSz);
+    const float usableMin = trackTopY + grabPadding + grabSz * 0.5f;
+    const float usableMax = trackTopY + trackHeight - grabPadding - grabSz * 0.5f;
+    const float ratio = vMax > vMin ? (value - vMin) / (vMax - vMin) : 0.0f;
+    // Vertical sliders draw the maximum at the top, so the grab travel is
+    // inverted relative to the value ratio.
+    const float grabT = 1.0f - ratio;
+    return usableMin + (usableMax - usableMin) * grabT;
 }
 
 void drawChannelStrip(document::Edit& edit,
@@ -483,6 +430,11 @@ void drawChannelStrip(document::Edit& edit,
         const auto it = meterTaps->find(ownerId);
         if (it != meterTaps->end()) tapNode = it->second.get();
     }
+    // When the meter is set to live below the fader, the chain's fader row keeps
+    // its position rule but drops the meter — the bar is drawn once, at the
+    // bottom, rather than in two places reading the same signal.
+    const bool meterBelowFader =
+        meterOptions != nullptr && meterOptions->belowFader;
 
     for (size_t row = 0; row < chain.size(); ++row) {
         const auto& slot = chain[row];
@@ -517,7 +469,7 @@ void drawChannelStrip(document::Edit& edit,
                     strip.draggingChainRow = static_cast<int>(row);
                 }
                 if (ImGui::IsItemHovered()) {
-                    ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+                    ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
                     ImGui::SetTooltip(found->bypass
                         ? "Bypassed — Cmd-click to enable, drag to reorder"
                         : "Click to open, Cmd-click to bypass, drag to reorder");
@@ -546,9 +498,9 @@ void drawChannelStrip(document::Edit& edit,
                 const std::string targetLabel =
                     routeTargetLabel(edit, send.target, playbackChannels);
                 const std::string rowLabel = "\xe2\x86\x92 " + targetLabel;
-                const float labelWidth = std::max(
-                    60.0f, fullWidth - kSendFaderWidth - kRemoveWidth -
-                               kGutter * 2.0f);
+                // Target picker stays compact — the level fader is the wide
+                // element on the row, not the destination label.
+                const float labelWidth = 84.0f;
                 if (ImGui::Button(rowLabel.c_str(),
                                   ImVec2(labelWidth, kRowHeight))) {
                     if (!strip.draggingChain()) ImGui::OpenPopup("##sendRetarget");
@@ -558,7 +510,7 @@ void drawChannelStrip(document::Edit& edit,
                     strip.draggingChainRow = static_cast<int>(row);
                 }
                 if (ImGui::IsItemHovered()) {
-                    ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+                    ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
                     ImGui::SetTooltip("Send — click to retarget, drag to move "
                                       "it through the chain");
                 }
@@ -578,13 +530,26 @@ void drawChannelStrip(document::Edit& edit,
                     }
                     ImGui::EndPopup();
                 }
-                // One row: target, level, remove. A send used to draw as two
-                // lines and read as two things.
+                // One row: target, level, remove. The level is a plain
+                // horizontal fader — it tracks the pointer absolutely (the old
+                // relative bar drifted off the cursor) and fills the row so it
+                // has the resolution a send needs.
                 ImGui::SameLine(0.0f, kGutter);
                 float db = static_cast<float>(gainToDb(send.gain));
-                if (sendFader(found->id.c_str(), db, kSendFaderWidth,
-                              kRowHeight)) {
+                const float faderWidth = std::max(
+                    60.0f, fullWidth - labelWidth - kRemoveWidth - kGutter * 2.0f);
+                ImGui::SetNextItemWidth(faderWidth);
+                ImGui::PushStyleVar(ImGuiStyleVar_GrabMinSize, 14.0f);
+                std::string sendSliderId = "##sendlvl_" + found->id;
+                if (ImGui::SliderFloat(sendSliderId.c_str(), &db, -60.0f, 6.0f,
+                                       "%.1f dB")) {
                     send.gain = dbToGain(db);
+                    updatedSend = send;
+                    sendChanged = true;
+                }
+                ImGui::PopStyleVar();
+                if (theme::altClickedReset()) {
+                    send.gain = dbToGain(-60.0);
                     updatedSend = send;
                     sendChanged = true;
                 }
@@ -611,6 +576,10 @@ void drawChannelStrip(document::Edit& edit,
                 style.showTooltip = true;
                 const float meterW = levelMeterWidth(style);
                 const ImVec2 rowPos = ImGui::GetCursorScreenPos();
+                // The meter is drawn on top of this row and must take the drag
+                // (to move itself below the fader); without allowing overlap
+                // this earlier button would swallow it.
+                ImGui::SetNextItemAllowOverlap();
                 ImGui::InvisibleButton("##faderRow",
                                        ImVec2(fullWidth, kMeterRowHeight));
                 if (ImGui::IsItemActive() &&
@@ -618,7 +587,7 @@ void drawChannelStrip(document::Edit& edit,
                     strip.draggingChainRow = static_cast<int>(row);
                 }
                 if (ImGui::IsItemHovered()) {
-                    ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+                    ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
                 }
                 // A rule through the row: everything above it is pre-fader,
                 // everything below is post. The meter sits on the line because
@@ -632,11 +601,25 @@ void drawChannelStrip(document::Edit& edit,
                             rule, 1.0f);
                 dl->AddLine(ImVec2(rowPos.x + fullWidth * 0.5f + halfGap, midY),
                             ImVec2(rowPos.x + fullWidth, midY), rule, 1.0f);
-                drawLevelMeter(
-                    tapNode,
-                    ImVec2(rowPos.x + (fullWidth - meterW) * 0.5f, rowPos.y),
-                    kMeterRowHeight, tapOptions, 2, style,
-                    sessionHasFloatHeadroom(edit.bitDepth()));
+                if (meterBelowFader) {
+                    // Just a label where the meter was, so the row still reads
+                    // as the fader position in the chain.
+                    const char* tag = "FADER";
+                    const ImVec2 ts = ImGui::CalcTextSize(tag);
+                    dl->AddText(ImVec2(rowPos.x + (fullWidth - ts.x) * 0.5f,
+                                       midY - ts.y - 3.0f),
+                                ImGui::GetColorU32(pal.textSubtle), tag);
+                } else if (drawLevelMeter(
+                        tapNode,
+                        ImVec2(rowPos.x + (fullWidth - meterW) * 0.5f, rowPos.y),
+                        kMeterRowHeight, tapOptions, 2, style,
+                        sessionHasFloatHeadroom(edit.bitDepth()), true)) {
+                    // tapOptions is a copy (pre-fader is forced on it), so a
+                    // placement flip it makes has to be written back to the
+                    // real options or the drag does nothing.
+                    options.belowFader = tapOptions.belowFader;
+                    view.meterOptionsChanged = true;
+                }
                 break;
             }
         }
@@ -645,6 +628,9 @@ void drawChannelStrip(document::Edit& edit,
 
     const float chainBottom = ImGui::GetCursorScreenPos().y;
     if (strip.draggingChain()) {
+        // Hold the hand cursor for the whole drag, not only while the pointer
+        // is still over the row it grabbed.
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
         const size_t target = dropIndexAmongRows(ImGui::GetIO().MousePos.y,
                                                  chainRowTops, chainBottom);
         strip.chainDropIndex = static_cast<int>(target);
@@ -701,11 +687,28 @@ void drawChannelStrip(document::Edit& edit,
 
         float gainDb = track.gain > 0.0
             ? static_cast<float>(20.0 * std::log10(track.gain)) : -60.0f;
+        // The fader is the one flexible element: it shrinks so the whole strip
+        // fits its panel without a scrollbar, and grows no further than its
+        // natural height (the pin below takes any remaining slack). Everything
+        // that follows it — the readout, an optional below-fader meter, and the
+        // OUTPUT section — is reserved for here so none of it is pushed off the
+        // bottom.
+        constexpr float kBelowMeterHeight = 96.0f;
+        const float reserveAfterFader =
+            ImGui::GetTextLineHeightWithSpacing() +                 // gain readout
+            (meterBelowFader ? (kSectionGap + kBelowMeterHeight +
+                                ImGui::GetStyle().ItemSpacing.y) : 0.0f) +
+            ImGui::GetTextLineHeightWithSpacing() +                 // OUTPUT label
+            ImGui::GetFrameHeightWithSpacing() +                    // OUTPUT combo
+            16.0f;                                                  // + bottom pad
+        const float faderH = std::clamp(
+            ImGui::GetContentRegionAvail().y - reserveAfterFader,
+            56.0f, kFaderHeight);
         centre(kFaderWidth);
         const ImVec2 faderPos = ImGui::GetCursorScreenPos();
         ImGui::PushStyleVar(ImGuiStyleVar_GrabMinSize, 18.0f);
         const bool dragged = ImGui::VSliderFloat(
-            "##fader", ImVec2(kFaderWidth, kFaderHeight), &gainDb,
+            "##fader", ImVec2(kFaderWidth, faderH), &gainDb,
             -60.0f, 6.0f, "");
         ImGui::PopStyleVar();
         // Option-click resets to unity, matching the timeline's gutter fader.
@@ -725,8 +728,10 @@ void drawChannelStrip(document::Edit& edit,
         // feel, which is most of what a fader is for.
         {
             ImDrawList* dl = ImGui::GetWindowDrawList();
-            const float unityY =
-                faderPos.y + (1.0f - (0.0f - (-60.0f)) / 66.0f) * kFaderHeight;
+            // Line the tick up with where the grab actually sits at 0 dB. The
+            // 18.0f matches the GrabMinSize pushed around the slider above.
+            const float unityY = verticalSliderGrabCenterY(
+                faderPos.y, faderH, 18.0f, 0.0f, -60.0f, 6.0f);
             const ImU32 tick = ImGui::GetColorU32(pal.textMuted);
             dl->AddLine(ImVec2(faderPos.x - 7.0f, unityY),
                         ImVec2(faderPos.x - 2.0f, unityY), tick, 1.0f);
@@ -739,9 +744,47 @@ void drawChannelStrip(document::Edit& edit,
         std::snprintf(gainText, sizeof(gainText), "%+.1f dB", gainDb);
         centre(ImGui::CalcTextSize(gainText).x);
         ImGui::TextUnformatted(gainText);
+
+        // The meter, when the user has moved it here. Post-fader — what leaves
+        // the channel, which is the level worth reading beneath the fader that
+        // sets it. drawLevelMeter restores the cursor, so its space is
+        // reserved by hand.
+        if (meterBelowFader) {
+            ImGui::Dummy(ImVec2(0.0f, kSectionGap));
+            LevelMeterOptions belowOptions = *meterOptions;
+            belowOptions.preFader = false;
+            LevelMeterStyle style;
+            style.channelWidth = 14.0f;
+            style.channelGap = 4.0f;
+            style.showTooltip = true;
+            const float meterW = levelMeterWidth(style);
+            centre(meterW);
+            const ImVec2 meterPos = ImGui::GetCursorScreenPos();
+            if (drawLevelMeter(tapNode, meterPos, kBelowMeterHeight,
+                               belowOptions, 2, style,
+                               sessionHasFloatHeadroom(edit.bitDepth()), true)) {
+                meterOptions->belowFader = belowOptions.belowFader;
+                view.meterOptionsChanged = true;
+            }
+            ImGui::Dummy(ImVec2(meterW, kBelowMeterHeight));
+        }
     }
 
     // ─── Output (bottom) ──────────────────────────────────────────────────
+    // Pinned to the base of the panel: a console's output routing lives at the
+    // bottom of the strip, not floating wherever the content above happens to
+    // end. Any spare height goes into the gap above it.
+    {
+        constexpr float bottomPad = 10.0f;
+        const float outputHeight =
+            ImGui::GetTextLineHeightWithSpacing() +   // the OUTPUT label
+            ImGui::GetFrameHeightWithSpacing();       // the combo
+        // Leave a little air beneath the combo instead of pressing it against
+        // the panel's bottom edge.
+        const float spare =
+            ImGui::GetContentRegionAvail().y - outputHeight - bottomPad;
+        if (spare > 0.0f) ImGui::Dummy(ImVec2(0.0f, spare));
+    }
     sectionLabel("OUTPUT");
     const std::string route =
         routeTargetLabel(edit, track.mainOutput, playbackChannels);

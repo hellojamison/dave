@@ -45,7 +45,7 @@ constexpr float kTrackHeight = 58.0f;
 // click the band and every one of them used to carry the same magic number.
 constexpr float kBandCenterX = 17.0f;
 constexpr float kGutterContentX = 54.0f;
-constexpr float kAutomationToolsLeft = kGutterContentX - 4.0f + 112.0f + 8.0f;
+constexpr float kAutomationToolsLeft = kGutterContentX - 4.0f + 90.0f + 8.0f;
 constexpr float automationToolCenter(int index) {
     return kAutomationToolsLeft + static_cast<float>(index) * 28.0f + 12.0f;
 }
@@ -1774,3 +1774,85 @@ TEST_CASE("Option-clicking a gutter fader resets it and stays reset",
     // Unity, not "wherever the cursor ended up 40 px later".
     CHECK(sawReset);
 }
+
+TEST_CASE("the eraser tool selects and wipes points under a drag",
+          "[timelinelayout][automation][tools][eraser]") {
+    LayoutRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string track = rig.edit.addTrack("Dialog");
+    // Five points at 0, 50k, 100k, 150k, 200k samples. At 500 spp those sit at
+    // gutter-relative x of 0, 100, 200, 300, 400 px.
+    rig.edit.addVolumeAutomationPoint(track, 0, -6.0);
+    rig.edit.addVolumeAutomationPoint(track, 50000, -12.0);
+    rig.edit.addVolumeAutomationPoint(track, 100000, -3.0);
+    rig.edit.addVolumeAutomationPoint(track, 150000, -18.0);
+    rig.edit.addVolumeAutomationPoint(track, 200000, -1.0);
+    REQUIRE(rig.edit.track(track)->volumeAutomation.size() == 5);
+    rig.settle();
+
+    const float tracksTop = rig.origin.y + kRulerHeight + kMarkerLaneHeight;
+    const float automationTop = tracksTop + effectiveTrackHeight();
+
+    // Open the lane, then pick the eraser — the FOURTH tool button. Selecting
+    // it through the real toolbar is the point: it proves the button is wired,
+    // not just that the enum has a fourth value.
+    rig.clickTimelineAt(rig.origin.x + kBandCenterX,
+                        tracksTop + kTrackHeight * 0.5f);
+    rig.clickTimelineAt(rig.origin.x + automationToolCenter(3),
+                        automationTop + 16.0f);
+    REQUIRE(rig.view.automationTool == gui::AutomationTool::Eraser);
+
+    // Swipe from x≈90px to x≈210px (samples ~45k–105k), covering the 50k and
+    // 100k points while leaving 0, 150k and 200k alone.
+    const float laneY = automationTop + kAutomationLaneHeight * 0.5f;
+    const float xStart = rig.origin.x + kGutterWidth + 90.0f;
+    const float xEnd = rig.origin.x + kGutterWidth + 210.0f;
+    rig.tick(xStart, laneY, false);
+    rig.tick(xStart, laneY, true);
+    rig.tick((xStart + xEnd) * 0.5f, laneY, true);
+    rig.tick(xEnd, laneY, true);
+    rig.tick(xEnd, laneY, false);
+
+    const auto& after = rig.edit.track(track)->volumeAutomation;
+    REQUIRE(after.size() == 3);
+    CHECK(after[0].sample == 0);
+    CHECK(after[1].sample == 150000);
+    CHECK(after[2].sample == 200000);
+    // One swipe is one undo step, however many points it took.
+    CHECK(rig.undo.undoDepth() == 1);
+
+    rig.undo.undo();
+    CHECK(rig.edit.track(track)->volumeAutomation.size() == 5);
+}
+
+TEST_CASE("an eraser swipe over empty lane commits nothing",
+          "[timelinelayout][automation][tools][eraser]") {
+    LayoutRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string track = rig.edit.addTrack("Dialog");
+    rig.edit.addVolumeAutomationPoint(track, 0, -6.0);
+    rig.edit.addVolumeAutomationPoint(track, 200000, -1.0);
+    rig.settle();
+
+    const float tracksTop = rig.origin.y + kRulerHeight + kMarkerLaneHeight;
+    const float automationTop = tracksTop + effectiveTrackHeight();
+    rig.clickTimelineAt(rig.origin.x + kBandCenterX,
+                        tracksTop + kTrackHeight * 0.5f);
+    rig.clickTimelineAt(rig.origin.x + automationToolCenter(3),
+                        automationTop + 16.0f);
+    REQUIRE(rig.view.automationTool == gui::AutomationTool::Eraser);
+
+    // Swipe across a gap between the two points: nothing to erase, so no undo
+    // entry should be pushed.
+    const float laneY = automationTop + kAutomationLaneHeight * 0.5f;
+    const float xStart = rig.origin.x + kGutterWidth + 120.0f;
+    const float xEnd = rig.origin.x + kGutterWidth + 260.0f;
+    rig.tick(xStart, laneY, false);
+    rig.tick(xStart, laneY, true);
+    rig.tick(xEnd, laneY, true);
+    rig.tick(xEnd, laneY, false);
+
+    CHECK(rig.edit.track(track)->volumeAutomation.size() == 2);
+    CHECK(rig.undo.undoDepth() == 0);
+}
+// temporary probe appended

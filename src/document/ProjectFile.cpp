@@ -334,8 +334,11 @@ std::string serializeEdit(const Edit& edit) {
                              {"sourceOffset", c.sourceOffset},
                              {"length", c.length},
                              {"gain", c.gain},
+                             {"muted", c.muted},
                              {"fadeIn", c.fadeIn},
-                             {"fadeOut", c.fadeOut}});
+                             {"fadeOut", c.fadeOut},
+                             {"fadeInShape", static_cast<int>(c.fadeInShape)},
+                             {"fadeOutShape", static_cast<int>(c.fadeOutShape)}});
         }
         jt["clips"] = std::move(clips);
 
@@ -378,10 +381,31 @@ std::string serializeEdit(const Edit& edit) {
                                                          : "fader";
                 chain.push_back(json{{"kind", kind}, {"id", slot.id}});
             }
+            jt["hidden"] = t.hidden;
+            jt["soloSafe"] = t.soloSafe;
             jt["chain"] = std::move(chain);
         }
         jt["plugins"] = std::move(plugins);
         tracks.push_back(std::move(jt));
+    }
+    {
+        json groups = json::array();
+        for (const auto& group : edit.clipGroups()) {
+            json members = json::array();
+            for (const auto& member : group.members) {
+                members.push_back(json{{"trackId", member.trackId},
+                                       {"clipId", member.clipId},
+                                       {"midi", member.midi}});
+            }
+            groups.push_back(json{{"id", group.id},
+                                  {"name", group.name},
+                                  {"timelineStart", group.timelineStart},
+                                  {"length", group.length},
+                                  {"trackIds", group.trackIds},
+                                  {"childGroupIds", group.childGroupIds},
+                                  {"members", std::move(members)}});
+        }
+        j["clipGroups"] = std::move(groups);
     }
     j["tracks"] = std::move(tracks);
 
@@ -595,8 +619,13 @@ ProjectResult deserializeEdit(const std::string& text, Edit& edit) {
                     c.sourceOffset = jc.value("sourceOffset", int64_t(0));
                     c.length = jc.value("length", int64_t(0));
                     c.gain = jc.value("gain", 1.0);
+                    c.muted = jc.value("muted", false);
                     c.fadeIn = jc.value("fadeIn", int64_t(0));
                     c.fadeOut = jc.value("fadeOut", int64_t(0));
+                    c.fadeInShape = static_cast<FadeShape>(
+                        jc.value("fadeInShape", 0));
+                    c.fadeOutShape = static_cast<FadeShape>(
+                        jc.value("fadeOutShape", 0));
                     t.clips.push_back(std::move(c));
                 }
             }
@@ -650,6 +679,8 @@ ProjectResult deserializeEdit(const std::string& text, Edit& edit) {
                 }
             }
         }
+            t.hidden = jt.value("hidden", false);
+            t.soloSafe = jt.value("soloSafe", false);
             t.isMain = t.id == kMainBusId && jt.value("isMain", true);
             if (jt.contains("plugins")) {
                 for (const auto& jp : jt["plugins"]) {
@@ -736,6 +767,43 @@ ProjectResult deserializeEdit(const std::string& text, Edit& edit) {
             edit.loadAsset_(std::move(a));
         }
     }
+
+    // Clip groups. Loaded after the tracks so pruning can see the clips.
+    edit.clearClipGroups_();
+    if (j.contains("clipGroups") && j["clipGroups"].is_array()) {
+        for (const auto& jg : j["clipGroups"]) {
+            ClipGroup group;
+            group.id = jg.value("id", "");
+            group.name = jg.value("name", "");
+            group.timelineStart = jg.value("timelineStart", 0LL);
+            group.length = jg.value("length", 0LL);
+            if (jg.contains("childGroupIds") &&
+                jg["childGroupIds"].is_array()) {
+                for (const auto& jc : jg["childGroupIds"]) {
+                    group.childGroupIds.push_back(jc.get<std::string>());
+                }
+            }
+            if (jg.contains("trackIds") && jg["trackIds"].is_array()) {
+                for (const auto& jt : jg["trackIds"]) {
+                    group.trackIds.push_back(jt.get<std::string>());
+                }
+            }
+            if (jg.contains("members") && jg["members"].is_array()) {
+                for (const auto& jm : jg["members"]) {
+                    ClipGroup::Member member;
+                    member.trackId = jm.value("trackId", "");
+                    member.clipId = jm.value("clipId", "");
+                    member.midi = jm.value("midi", false);
+                    group.members.push_back(std::move(member));
+                }
+            }
+            if (!group.id.empty()) edit.loadClipGroup_(std::move(group));
+        }
+    }
+    // A file edited by hand, or written by a build whose clip ids differ, can
+    // name clips that are not here. Dropping them on load beats carrying a
+    // group that moves nothing.
+    edit.pruneClipGroups_();
 
     // Marker tracks.
     edit.clearMarkerTracks_();

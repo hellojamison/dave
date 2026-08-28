@@ -110,6 +110,11 @@ public:
     // Applies to audio tracks, MIDI tracks, and buses. Empty restores the
     // type-specific default; malformed colors are refused.
     bool setTrackColor(const std::string& ownerId, std::string color);
+    // Hide a track from the timeline. Main is refused: it is where everything
+    // ends up, and a session with no visible Main has no visible output.
+    bool setTrackHidden(const std::string& trackId, bool hidden);
+    // Exempt a track from other tracks' solos.
+    bool setTrackSoloSafe(const std::string& trackId, bool safe);
     std::vector<VolumeAutomationPoint>* volumeAutomation(
         const std::string& ownerId);
     const std::vector<VolumeAutomationPoint>* volumeAutomation(
@@ -174,6 +179,50 @@ public:
     // instrument. Returns false if the track doesn't exist.
     bool setMidiInstrument(const std::string& trackId, PluginSlot slot);
 
+
+    // --- Clip groups --------------------------------------------------------
+    // Several clips treated as one object. The clips stay where they are; a
+    // group only records which of them belong together, so ungrouping is the
+    // removal of that record rather than a reconstruction.
+    const std::vector<ClipGroup>& clipGroups() const { return clipGroups_; }
+    // Returns the new group's id, or empty when there is nothing to group:
+    // fewer than two members, or members naming clips that do not exist.
+    // `start` and `length` are the selection the group was made from; the
+    // group draws over exactly that range rather than over its clips' extent.
+    // `trackIds` are the rows the group occupies. Passing none falls back to
+    // the members' tracks, which is only right when there are members.
+    std::string addClipGroup(std::vector<ClipGroup::Member> members,
+                             int64_t start, int64_t length,
+                             std::vector<std::string> trackIds = {},
+                             std::vector<std::string> childGroupIds = {},
+                             std::string name = {});
+    // The group this one is nested in, or null when it is the outermost.
+    const ClipGroup* clipGroupParent(const std::string& groupId) const;
+    // Only the outermost groups draw and only they answer a selection; the
+    // ones inside them are recorded but stood in for.
+    bool clipGroupIsTopLevel(const std::string& groupId) const {
+        return clipGroupParent(groupId) == nullptr;
+    }
+    // Slide a whole group, range and members together.
+    bool moveClipGroup(const std::string& groupId, int64_t deltaSamples);
+    // Replay helper: re-inserts an already-identified group so redo cannot
+    // mint a different id.
+    bool restoreClipGroup_(ClipGroup group, size_t index);
+    bool removeClipGroup(const std::string& groupId);
+    const ClipGroup* clipGroup(const std::string& groupId) const;
+    // The group a clip belongs to, or null. A clip is in at most one.
+    const ClipGroup* clipGroupContaining(const std::string& trackId,
+                                         const std::string& clipId) const;
+    // Drop members whose clips have gone, and any group left with fewer than
+    // two. Called after clip removal so a group never names a clip that no
+    // longer exists.
+    void pruneClipGroups_();
+    void shiftClipGroup_(const std::string& groupId, int64_t delta);
+    int64_t earliestInClipGroup_(const std::string& groupId) const;
+    void loadClipGroup_(ClipGroup group) {
+        clipGroups_.push_back(std::move(group));
+    }
+    void clearClipGroups_() { clipGroups_.clear(); }
 
     // --- Solo ---------------------------------------------------------------
     // Is anything in the edit soloed? Solo is only meaningful relative to every
@@ -306,6 +355,7 @@ private:
 
     // One list. Row order is the user's; Main is pinned last.
     std::vector<Track> tracks_;
+    std::vector<ClipGroup> clipGroups_;
     std::vector<MarkerTrack> markerTracks_;
     std::vector<VideoTrack> videoTracks_;
     std::unordered_map<AssetId, AudioAsset> assets_;

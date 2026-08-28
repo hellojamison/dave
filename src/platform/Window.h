@@ -56,6 +56,11 @@ public:
     void close();
 
     GLFWwindow* handle() { return window_; }
+    // Current cursor position in window content coordinates (points), which
+    // match ImGui screen coordinates for the single main viewport. Valid to
+    // call from the file-drop callback, where ImGui's own mouse position may
+    // be a frame stale.
+    void cursorPos(double& x, double& y) const;
 
     // Hide or show the system cursor over this window's content.
     //

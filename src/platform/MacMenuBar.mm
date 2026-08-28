@@ -167,7 +167,9 @@ void setupMacMenuBar() {
     // ─── Window menu (standard macOS) ────────────────────────────────────
     NSMenuItem* winMenuItem = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
     NSMenu* winMenu = [[NSMenu alloc] initWithTitle:@"Window"];
-    [winMenu addItemWithTitle:@"Minimize" action:@selector(performMiniaturize:) keyEquivalent:@"m"];
+    // Minimize keeps its menu item but gives up Cmd+M — the app binds that to
+    // "mute clip". Minimize stays reachable via the window's own button.
+    [winMenu addItemWithTitle:@"Minimize" action:@selector(performMiniaturize:) keyEquivalent:@""];
     [winMenu addItemWithTitle:@"Zoom" action:@selector(performZoom:) keyEquivalent:@""];
     [winMenu addItem:[NSMenuItem separatorItem]];
     [winMenu addItem:makeItem(@"I/O Panel", 16)];

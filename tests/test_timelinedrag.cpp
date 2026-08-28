@@ -89,6 +89,16 @@ struct TimelineRig : ImGuiRig {
         return -1.0f;
     }
 
+    // Transport::seek only requests a move; the RT thread commits it. Nothing
+    // pumps audio here, so the test does one block itself — otherwise
+    // position() stays at 0 and a playhead assertion passes for the wrong
+    // reason.
+    int64_t committedPosition() {
+        engine::TimeInfo time{};
+        transport.advanceAndFill(time, 0, 48000.0);
+        return transport.position();
+    }
+
     gui::PeakCache peaks;
     std::unordered_map<std::string, audio::DecodedAudioAssetPtr> assetBuffers;
 };
@@ -297,6 +307,34 @@ TEST_CASE("dragging a clip's left edge trims its head", "[timelinedrag]") {
     CHECK(restored->length == 480'000);
 }
 
+TEST_CASE("the selection follows a clip as it is trimmed",
+          "[timelinedrag][selection]") {
+    // Clicking a clip selected its range; trimming an edge should drag that
+    // edge of the selection too, not leave it on the clip's old extent.
+    TimelineRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string t = rig.edit.addTrack("Audio");
+    document::AudioClip clip;
+    clip.timelineStart = 0;
+    clip.length = 480000;
+    rig.edit.addClip(t, clip);
+
+    const float midX = rig.xOfSample(240000);
+    const float rowY =
+        rig.findRowY(midX, gui::TimelineViewState::DragKind::AudioClip);
+    REQUIRE(rowY > 0.0f);
+
+    // Trim the tail inward by 100 px.
+    const float edgeX = rig.xOfSample(480000) - 2.0f;
+    rig.dragFrom(ImVec2(edgeX, rowY), ImVec2(edgeX - 100.0f, rowY));
+
+    const auto& trimmed = rig.edit.track(t)->clips.front();
+    REQUIRE(trimmed.length < 480000);  // it shrank
+    CHECK(rig.view.hasSelection);
+    CHECK(rig.view.selectionStart == trimmed.timelineStart);
+    CHECK(rig.view.selectionEnd == trimmed.timelineStart + trimmed.length);
+}
+
 TEST_CASE("a head trim stops at the start of the source", "[timelinedrag]") {
     // Dragging the head left past the file's own beginning would ask for audio
     // that does not exist. The clip's box has to stop where its source does.
@@ -347,4 +385,365 @@ TEST_CASE("grabbing the middle of a clip still moves it", "[timelinedrag]") {
     REQUIRE(moved != nullptr);
     CHECK(moved->timelineStart == 50'000);
     CHECK(moved->length == 9000);   // moved, not trimmed
+}
+
+TEST_CASE("dragging one clip of a group drags the whole group",
+          "[timelinedrag][clipgroups]") {
+    // The point of a group, and the thing that has to go through the real
+    // widget: the drag commits a group move rather than a clip move, and the
+    // members that were never touched come along.
+    TimelineRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string a = rig.edit.addTrack("A");
+    const std::string b = rig.edit.addTrack("B");
+    document::AudioClip clip;
+    clip.timelineStart = 0;
+    clip.length = 480000;
+    const std::string ca = rig.edit.addClip(a, clip);
+    clip.timelineStart = 240000;
+    const std::string cb = rig.edit.addClip(b, clip);
+    REQUIRE_FALSE(rig.edit.addClipGroup({{a, ca, false}, {b, cb, false}},
+                                        0, 720000).empty());
+
+    const float grabX = rig.xOfSample(48000);
+    const float rowCenterY =
+        rig.findRowY(grabX, gui::TimelineViewState::DragKind::AudioClip);
+    REQUIRE(rowCenterY > 0.0f);
+
+    rig.dragFrom(ImVec2(grabX, rowCenterY), ImVec2(grabX + 200.0f, rowCenterY));
+
+    const int64_t delta = static_cast<int64_t>(200.0 * kSamplesPerPixel);
+    CHECK(rig.edit.clip(a, ca)->timelineStart == delta);
+    // The clip on the other track moved by the same amount without being
+    // touched, and kept its offset from the one that was dragged.
+    CHECK(rig.edit.clip(b, cb)->timelineStart == 240000 + delta);
+
+    // One undo entry for the whole group, not one per member.
+    rig.undo.undo();
+    CHECK(rig.edit.clip(a, ca)->timelineStart == 0);
+    CHECK(rig.edit.clip(b, cb)->timelineStart == 240000);
+}
+
+TEST_CASE("an ungrouped clip still drags alone", "[timelinedrag][clipgroups]") {
+    // The guard for the case above: without it, "the group moved" would also
+    // pass if every clip on every track moved together.
+    TimelineRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string a = rig.edit.addTrack("A");
+    const std::string b = rig.edit.addTrack("B");
+    document::AudioClip clip;
+    clip.timelineStart = 0;
+    clip.length = 480000;
+    const std::string ca = rig.edit.addClip(a, clip);
+    clip.timelineStart = 240000;
+    const std::string cb = rig.edit.addClip(b, clip);
+
+    const float grabX = rig.xOfSample(48000);
+    const float rowCenterY =
+        rig.findRowY(grabX, gui::TimelineViewState::DragKind::AudioClip);
+    REQUIRE(rowCenterY > 0.0f);
+    rig.dragFrom(ImVec2(grabX, rowCenterY), ImVec2(grabX + 200.0f, rowCenterY));
+
+    CHECK(rig.edit.clip(a, ca)->timelineStart ==
+          static_cast<int64_t>(200.0 * kSamplesPerPixel));
+    CHECK(rig.edit.clip(b, cb)->timelineStart == 240000);
+}
+
+TEST_CASE("clicking a clip selects its range", "[timelinedrag][selection]") {
+    // Clicking a clip is how you say "this one", and every range edit — group,
+    // delete, loop — reads the selection. Leaving it untouched meant a clicked
+    // clip was selected for some purposes and not for others.
+    TimelineRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string t = rig.edit.addTrack("Audio");
+    document::AudioClip clip;
+    clip.timelineStart = 96000;
+    clip.length = 480000;
+    const std::string c = rig.edit.addClip(t, clip);
+
+    const float grabX = rig.xOfSample(240000);
+    const float rowCenterY =
+        rig.findRowY(grabX, gui::TimelineViewState::DragKind::AudioClip);
+    REQUIRE(rowCenterY > 0.0f);
+
+    rig.view.hasSelection = false;
+    rig.tick(grabX, rowCenterY, false);
+    rig.tick(grabX, rowCenterY, true);
+
+    CHECK(rig.view.selectedClipId == c);
+    CHECK(rig.view.hasSelection);
+    CHECK(rig.view.selectionStart == 96000);
+    CHECK(rig.view.selectionEnd == 576000);
+    // Scoped to the clip's own row, so a range edit cannot reach its
+    // neighbours' clips.
+    CHECK(rig.view.selectionRow >= 0);
+    // And the cursor goes to the head of it, the same as a dragged range —
+    // a selection made by clicking and one made by dragging should leave the
+    // playhead in the same place.
+    CHECK(rig.committedPosition() == 96000);
+
+    rig.tick(grabX, rowCenterY, false);
+}
+
+TEST_CASE("clicking a group clip selects the group's range",
+          "[timelinedrag][selection][clipgroups]") {
+    TimelineRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string t = rig.edit.addTrack("Audio");
+    document::AudioClip clip;
+    clip.timelineStart = 96000;
+    clip.length = 96000;
+    const std::string c = rig.edit.addClip(t, clip);
+    const std::string g = rig.edit.addClipGroup({{t, c, false}}, 48000, 288000,
+                                                {t});
+    REQUIRE_FALSE(g.empty());
+
+    const float grabX = rig.xOfSample(240000);
+    const float rowCenterY =
+        rig.findRowY(grabX, gui::TimelineViewState::DragKind::AudioClip);
+    REQUIRE(rowCenterY > 0.0f);
+
+    rig.view.hasSelection = false;
+    rig.tick(grabX, rowCenterY, false);
+    rig.tick(grabX, rowCenterY, true);
+
+    // The group's range, not the clip's — the group is what was clicked.
+    CHECK(rig.view.selectedClipId == g);
+    CHECK(rig.view.selectionStart == 48000);
+    CHECK(rig.view.selectionEnd == 336000);
+    CHECK(rig.committedPosition() == 48000);
+    rig.tick(grabX, rowCenterY, false);
+}
+
+TEST_CASE("holding Command selects a range instead of grabbing a clip",
+          "[timelinedrag][selection]") {
+    // Command is the selector tool: a press that lands on a clip marks a time
+    // range in that lane rather than picking the clip up. Without it you can
+    // only ever select a whole clip, never a span inside one. The MIDI lane
+    // was the regression — its click handler ignored the modifier.
+    TimelineRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string t = rig.edit.addTrack("Audio");
+    const std::string c = rig.edit.addMidiClip(t, midiClip(96000, 480000));
+
+    const float grabX = rig.xOfSample(240000);
+    const float rowCenterY =
+        rig.findRowY(grabX, gui::TimelineViewState::DragKind::MidiClip);
+    REQUIRE(rowCenterY > 0.0f);
+
+    const float toX = rig.xOfSample(360000);
+    // The GLFW backend reports the platform command key as ImGuiMod_Super on
+    // macOS (where ImGui then swaps it to Ctrl) and ImGuiMod_Ctrl elsewhere;
+    // feed whichever this build would see so selectorMode's KeyCtrl fires.
+#if defined(__APPLE__)
+    const ImGuiKey kCommand = ImGuiMod_Super;
+#else
+    const ImGuiKey kCommand = ImGuiMod_Ctrl;
+#endif
+    // Let ImGui settle after findRowY's probing presses: a couple of frames
+    // parked off the lane with the button up clear any lingering active item
+    // and drag state, so the Command gesture is judged on its own.
+    rig.tick(-100.0f, -100.0f, false);
+    rig.tick(-100.0f, -100.0f, false);
+    rig.view.dragKind = gui::TimelineViewState::DragKind::None;
+    rig.view.selectedClipId.clear();
+    rig.view.isSelecting = false;
+    rig.view.hasSelection = false;
+
+    ImGui::GetIO().AddKeyEvent(kCommand, true);
+    rig.dragFrom(ImVec2(grabX, rowCenterY), ImVec2(toX, rowCenterY));
+    ImGui::GetIO().AddKeyEvent(kCommand, false);
+
+    // The clip was left where it was, unselected and unmoved...
+    CHECK(rig.view.selectedClipId.empty());
+    CHECK_FALSE(
+        rig.view.isDragging(gui::TimelineViewState::DragKind::MidiClip));
+    CHECK(rig.edit.track(t)->midiClips.front().timelineStart == 96000);
+    // ...and a real time range was marked in that lane instead.
+    CHECK(rig.view.hasSelection);
+    CHECK(rig.view.selectionRow >= 0);
+    CHECK(rig.view.selectionStart != rig.view.selectionEnd);
+}
+
+TEST_CASE("a clip drags from one track onto another", "[timelinedrag]") {
+    // Cross-track drag: grab a clip on the first track and release it over the
+    // second, and it should belong to the second track afterwards.
+    TimelineRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string a = rig.edit.addTrack("A");
+    const std::string b = rig.edit.addTrack("B");
+    document::AudioClip clip;
+    clip.timelineStart = 0;
+    clip.length = 480000;
+    const std::string c = rig.edit.addClip(a, clip);
+    REQUIRE(rig.edit.track(a)->clips.size() == 1);
+    REQUIRE(rig.edit.track(b)->clips.empty());
+
+    const float grabX = rig.xOfSample(48000);
+    const float rowAY =
+        rig.findRowY(grabX, gui::TimelineViewState::DragKind::AudioClip);
+    REQUIRE(rowAY > 0.0f);
+
+    // Drop straight down onto the next row. One base row height (58) clears A
+    // and lands inside B.
+    rig.dragFrom(ImVec2(grabX, rowAY), ImVec2(grabX, rowAY + kTrackHeight));
+
+    CHECK(rig.edit.track(a)->clips.empty());
+    REQUIRE(rig.edit.track(b)->clips.size() == 1);
+    // The clip keeps its identity across the move.
+    CHECK(rig.edit.track(b)->clips.front().id == c);
+
+    rig.undo.undo();
+    CHECK(rig.edit.track(a)->clips.size() == 1);
+    CHECK(rig.edit.track(b)->clips.empty());
+}
+
+TEST_CASE("selecting while playing leaves the playhead alone",
+          "[timelinedrag][selection]") {
+    // Making a selection mid-playback marks the range without snapping the
+    // playhead back to its head — playback carries on from where it reached.
+    engine::Transport transport;
+    engine::TimeInfo time{};
+    transport.seek(500000);
+    transport.advanceAndFill(time, 0, 48000.0);  // apply the seek
+    REQUIRE(transport.position() == 500000);
+
+    gui::TimelineViewState view;
+
+    SECTION("stopped: it seeks to the selection head") {
+        gui::selectClipRange(view, transport, 0, 96000, 480000);
+        transport.advanceAndFill(time, 0, 48000.0);
+        CHECK(transport.position() == 96000);
+    }
+    SECTION("playing: no seek is requested") {
+        transport.play();
+        gui::selectClipRange(view, transport, 0, 96000, 480000);
+        transport.advanceAndFill(time, 0, 48000.0);
+        CHECK(transport.position() == 500000);
+    }
+    // Either way, the range is marked.
+    CHECK(view.hasSelection);
+    CHECK(view.selectionStart == 96000);
+    CHECK(view.selectionEnd == 576000);
+}
+
+TEST_CASE("the selection follows a clip as it moves",
+          "[timelinedrag][selection]") {
+    // Clicking a clip selects its range; moving the clip has to carry that
+    // range with it, or the selection is left behind over empty timeline.
+    TimelineRig rig;
+    rig.view.snapEnabled = false;  // assert exact samples, not a snapped grid
+    rig.edit.addMarkerTrack("Markers");
+    const std::string t = rig.edit.addTrack("Audio");
+    document::AudioClip clip;
+    clip.timelineStart = 96000;
+    clip.length = 480000;
+    rig.edit.addClip(t, clip);
+
+    const float grabX = rig.xOfSample(240000);  // mid-clip
+    const float rowY =
+        rig.findRowY(grabX, gui::TimelineViewState::DragKind::AudioClip);
+    REQUIRE(rowY > 0.0f);
+
+    // Grab at 240000, release at 480000 — a +240000-sample move.
+    rig.dragFrom(ImVec2(grabX, rowY), ImVec2(rig.xOfSample(480000), rowY));
+
+    const auto& moved = rig.edit.track(t)->clips.front();
+    REQUIRE(moved.timelineStart == 336000);  // 96000 + 240000
+    CHECK(rig.view.hasSelection);
+    CHECK(rig.view.selectionStart == moved.timelineStart);
+    CHECK(rig.view.selectionEnd == moved.timelineStart + moved.length);
+}
+
+TEST_CASE("the selection follows a clip onto another track",
+          "[timelinedrag][selection]") {
+    TimelineRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string a = rig.edit.addTrack("A");
+    const std::string b = rig.edit.addTrack("B");
+    document::AudioClip clip;
+    clip.timelineStart = 0;
+    clip.length = 480000;
+    rig.edit.addClip(a, clip);
+
+    const float grabX = rig.xOfSample(48000);
+    const float rowAY =
+        rig.findRowY(grabX, gui::TimelineViewState::DragKind::AudioClip);
+    REQUIRE(rowAY > 0.0f);
+
+    // Straight down onto B (one base row height clears A).
+    rig.dragFrom(ImVec2(grabX, rowAY), ImVec2(grabX, rowAY + kTrackHeight));
+
+    REQUIRE(rig.edit.track(b)->clips.size() == 1);
+    // B is the second audio track (index 1); the selection row rode along.
+    CHECK(rig.view.hasSelection);
+    CHECK(rig.view.selectionRow == 1);
+}
+
+TEST_CASE("a MIDI clip drags from one track onto another", "[timelinedrag]") {
+    TimelineRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string a = rig.edit.addMidiTrack("A");
+    const std::string b = rig.edit.addMidiTrack("B");
+    const std::string c = rig.edit.addMidiClip(a, midiClip(0, 480000));
+    REQUIRE(rig.edit.track(a)->midiClips.size() == 1);
+
+    const float grabX = rig.xOfSample(48000);
+    const float rowAY =
+        rig.findRowY(grabX, gui::TimelineViewState::DragKind::MidiClip);
+    REQUIRE(rowAY > 0.0f);
+
+    rig.dragFrom(ImVec2(grabX, rowAY), ImVec2(grabX, rowAY + kTrackHeight));
+
+    CHECK(rig.edit.track(a)->midiClips.empty());
+    REQUIRE(rig.edit.track(b)->midiClips.size() == 1);
+    CHECK(rig.edit.track(b)->midiClips.front().id == c);
+}
+
+TEST_CASE("a file drop resolves to the track and sample under it",
+          "[timelinedrag][drop]") {
+    TimelineRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string t = rig.edit.addTrack("Audio");
+    // A clip so findRowY can locate the row; the drop lands elsewhere on it.
+    document::AudioClip clip;
+    clip.timelineStart = 0;
+    clip.length = 48000;
+    rig.edit.addClip(t, clip);
+
+    // Grab mid-clip (not the edge, which would be a trim) to find the row.
+    const float rowY =
+        rig.findRowY(rig.xOfSample(24000),
+                     gui::TimelineViewState::DragKind::AudioClip);
+    REQUIRE(rowY > 0.0f);
+
+    // Drop a WAV at 96000 samples on that row.
+    const int64_t dropSample = 96000;
+    rig.view.pendingFileDrops.push_back(
+        {"/tmp/x.wav", rig.xOfSample(dropSample), rowY});
+    // One frame resolves it.
+    rig.tick(-100.0f, -100.0f, false);
+
+    REQUIRE(rig.view.pendingFileDrops.empty());
+    REQUIRE(rig.view.resolvedFileDrops.size() == 1);
+    const auto& r = rig.view.resolvedFileDrops.front();
+    CHECK(r.path == "/tmp/x.wav");
+    CHECK(r.trackId == t);
+    // Snap is off, so the sample is exactly under the cursor (± rounding).
+    CHECK(std::llabs(r.sample - dropSample) <= 1);
+}
+
+TEST_CASE("a file dropped off the lanes resolves to a new track",
+          "[timelinedrag][drop]") {
+    TimelineRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    rig.edit.addTrack("Audio");
+    rig.tick(-100.0f, -100.0f, false);
+
+    // Far below every row → no track; the app makes a new one.
+    rig.view.pendingFileDrops.push_back({"/tmp/y.wav", 600.0f, 5000.0f});
+    rig.tick(-100.0f, -100.0f, false);
+
+    REQUIRE(rig.view.resolvedFileDrops.size() == 1);
+    CHECK(rig.view.resolvedFileDrops.front().trackId.empty());
 }

@@ -2,6 +2,8 @@
 #include "audio/AudioImportPolicy.h"
 #include "engine/GraphBuilder.h"
 
+#include "document/ClipOverlap.h"
+
 #define DR_WAV_NO_IMPLEMENTATION
 #include <dr_wav.h>
 
@@ -157,6 +159,31 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit,
     };
     for (const auto& track : edit.tracks()) if (track.solo) activateSolo(track.id);
 
+    // Solo-safe keeps a track's OUTPUT path alive without pulling its inputs
+    // along. Walking upstream too would un-silence everything feeding it — a
+    // safe reverb return would make every track sending to it audible, which
+    // is the opposite of what soloing one guitar is for.
+    auto activateSoloSafe = [&](const std::string& id) {
+        std::unordered_set<std::string> seen;
+        std::function<void(const std::string&)> downstream =
+            [&](const std::string& current) {
+                if (!seen.insert(current).second) return;
+                soloActive.insert(current);
+                auto found = forward.find(current);
+                if (found == forward.end()) return;
+                for (const auto& next : found->second) {
+                    soloEdges.insert(edgeKey(current, next));
+                    if (next.starts_with("channel:")) downstream(next.substr(8));
+                }
+            };
+        downstream(id);
+    };
+    if (anySoloed) {
+        for (const auto& track : edit.tracks()) {
+            if (track.soloSafe) activateSoloSafe(track.id);
+        }
+    }
+
     // The meter tap is a node in the chain, so it reads exactly what reaches
     // that point — including inserts that changed the level. It passes audio
     // through untouched; see GainNode::setMeterTapOnly.
@@ -236,7 +263,9 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit,
 
     auto addGain = [&](const auto& channel, NodeId preFader) {
         auto gain = std::make_shared<GainNode>();
-        const bool active = !anySoloed || soloActive.count(channel.id) != 0;
+        const bool active = document::trackAudible(
+            false, soloActive.count(channel.id) != 0, anySoloed,
+            channel.soloSafe);
         gain->setGain(!channel.mute && active ? channel.gain : 0.0);
         gain->setPan(channel.pan);
         std::vector<GainNode::AutomationPoint> automation;
@@ -311,7 +340,16 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit,
                 node->setStart(clip.timelineStart);
                 node->setSourceOffset(clip.sourceOffset);
                 node->setLength(clip.length);
-                node->setFades(clip.fadeIn, clip.fadeOut);
+                node->setFades(clip.fadeIn, clip.fadeOut, clip.fadeInShape,
+                               clip.fadeOutShape);
+                node->setGain(static_cast<float>(clip.gain));
+                node->setMuted(clip.muted);
+                // Silence where a clip painted on top of this one overlaps it,
+                // so two clips on a track never sum — the top one wins.
+                const std::size_t clipIndex =
+                    static_cast<std::size_t>(&clip - track.clips.data());
+                node->setMuteIntervals(
+                    document::clipMuteIntervals(track.clips, clipIndex));
                 const NodeId clipId = graph->addNode(node);
                 clipNodes_[clip.id] = node;
                 graph->connect(clipId, 0, clips, clipPin++);

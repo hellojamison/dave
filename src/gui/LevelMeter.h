@@ -30,6 +30,11 @@ struct LevelMeterOptions {
     // it until the clip latch is cleared; zero lets it follow the bar. The
     // choices the menu offers are kMeterPeakHoldChoices below.
     float peakHoldSeconds = -1.0f;
+    // Where the channel strip puts its meter: in the signal chain at the fader
+    // position (false, the default), or as a dedicated bar directly below the
+    // fader control (true). A layout choice, not a metering one, but it rides
+    // here so the meter's own menu can offer it and it persists with the rest.
+    bool belowFader = false;
 };
 
 // The hold times the meter menu and Preferences offer. Infinite is last
@@ -97,9 +102,14 @@ float noiseFloorLossFraction(float overDb);
 // `floatHeadroom` says the session renders 32-bit float, which is the only
 // case where going above 0 dBFS is worth showing as headroom rather than as a
 // clip. Fixed-point sessions keep the old red.
+// `allowPlacementDrag` makes a vertical drag on the meter flip
+// options.belowFader — dragging down moves it below the fader, up returns it.
+// Only the channel strip passes true; the track-header and mixer meters keep a
+// plain click-for-menu. A clean click still opens the menu either way.
 bool drawLevelMeter(engine::GainNode* node, ImVec2 pos, float height,
                     LevelMeterOptions& options, int channels = 2,
                     const LevelMeterStyle& style = LevelMeterStyle{},
-                    bool floatHeadroom = false);
+                    bool floatHeadroom = false,
+                    bool allowPlacementDrag = false);
 
 } // namespace dave::gui

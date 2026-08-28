@@ -41,7 +41,8 @@ float noiseFloorLossFraction(float overDb) {
 
 bool drawLevelMeter(engine::GainNode* node, ImVec2 pos, float height,
                     LevelMeterOptions& options, int channels,
-                    const LevelMeterStyle& style, bool floatHeadroom) {
+                    const LevelMeterStyle& style, bool floatHeadroom,
+                    bool allowPlacementDrag) {
     if (channels <= 0 || height <= 1.0f) return false;
     bool changed = false;
 
@@ -54,7 +55,28 @@ bool drawLevelMeter(engine::GainNode* node, ImVec2 pos, float height,
     ImGui::PushID(node);
     ImGui::InvisibleButton("##levelMeter", ImVec2(width, height));
     const bool hovered = ImGui::IsItemHovered();
-    if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+    if (allowPlacementDrag) {
+        // Drag the meter to move it below the fader (down) or back into the
+        // chain (up). The threshold is small so a deliberate drag flips it but
+        // a click does not; a click that never crossed the drag threshold still
+        // opens the menu on release.
+        if (ImGui::IsItemActive()) {
+            const float dragY =
+                ImGui::GetMouseDragDelta(ImGuiMouseButton_Left, -1.0f).y;
+            if (dragY > 24.0f && !options.belowFader) {
+                options.belowFader = true;
+                changed = true;
+            } else if (dragY < -24.0f && options.belowFader) {
+                options.belowFader = false;
+                changed = true;
+            }
+        }
+        // Left is the drag; the menu moves to right-click so the two do not
+        // fight over the same press.
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+            ImGui::OpenPopup("##meterMenu");
+        }
+    } else if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
         ImGui::OpenPopup("##meterMenu");
     }
     if (ImGui::BeginPopup("##meterMenu")) {
@@ -87,6 +109,11 @@ bool drawLevelMeter(engine::GainNode* node, ImVec2 pos, float height,
                 }
             }
             ImGui::EndMenu();
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Meter below fader", nullptr, options.belowFader)) {
+            options.belowFader = !options.belowFader;
+            changed = true;
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Clear clip", nullptr, false, node != nullptr)) {
@@ -233,13 +260,16 @@ bool drawLevelMeter(engine::GainNode* node, ImVec2 pos, float height,
             ImGui::SetCursorScreenPos(restoreCursor);
             return changed;
         }
+        const char* hint = allowPlacementDrag
+            ? "Drag up/down to move it by the fader; right-click for options"
+            : "Click for options";
         if (channels >= 2) {
-            ImGui::SetTooltip("%s meter (%s)\nL %+.1f dB  R %+.1f dB\nClick for options",
+            ImGui::SetTooltip("%s meter (%s)\nL %+.1f dB  R %+.1f dB\n%s",
                               tap, body, db(snapshots[0].peak),
-                              db(snapshots[1].peak));
+                              db(snapshots[1].peak), hint);
         } else {
-            ImGui::SetTooltip("%s meter (%s)\n%+.1f dB\nClick for options", tap,
-                              body, db(snapshots[0].peak));
+            ImGui::SetTooltip("%s meter (%s)\n%+.1f dB\n%s", tap,
+                              body, db(snapshots[0].peak), hint);
         }
     }
 

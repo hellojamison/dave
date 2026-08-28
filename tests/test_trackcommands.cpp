@@ -373,3 +373,47 @@ TEST_CASE("Cmd+D duplicates whichever kind of clip is selected",
     CHECK(edit.track(t)->clips.size() == 2);
     CHECK(edit.track(t)->midiClips.size() == 2);
 }
+
+TEST_CASE("Cmd+M toggles the selected clip's mute", "[trackcommands]") {
+    document::Edit edit;
+    editing::UndoStack undo{edit};
+    gui::TimelineViewState view;
+    const std::string t = edit.addTrack("Audio");
+    const std::string c = edit.addClip(t, audioClip(0, 48000));
+    view.selectedTrackIndex = static_cast<int>(edit.tracks().size()) - 2;
+    view.selectedClipId = c;
+    REQUIRE(edit.track(t)->clips.front().id == c);
+
+    REQUIRE_FALSE(edit.track(t)->clips.front().muted);
+    REQUIRE(gui::toggleSelectedClipMute(edit, undo, view));
+    CHECK(edit.track(t)->clips.front().muted);
+    REQUIRE(gui::toggleSelectedClipMute(edit, undo, view));
+    CHECK_FALSE(edit.track(t)->clips.front().muted);
+
+    undo.undo();  // the second toggle
+    CHECK(edit.track(t)->clips.front().muted);
+
+    view.selectedClipId.clear();
+    CHECK_FALSE(gui::toggleSelectedClipMute(edit, undo, view));
+}
+
+TEST_CASE("copying a clip leaves the original and drops a copy",
+          "[trackcommands]") {
+    document::Edit edit;
+    editing::UndoStack undo{edit};
+    const std::string a = edit.addTrack("A");
+    const std::string b = edit.addTrack("B");
+    const std::string c = edit.addClip(a, audioClip(0, 48000));
+
+    undo.execute(std::make_unique<editing::CopyClipToCommand>(a, c, b, 96000));
+    // Original untouched on A...
+    CHECK(edit.track(a)->clips.size() == 1);
+    CHECK(edit.track(a)->clips.front().timelineStart == 0);
+    // ...and a copy landed on B at the drop position.
+    REQUIRE(edit.track(b)->clips.size() == 1);
+    CHECK(edit.track(b)->clips.front().timelineStart == 96000);
+
+    undo.undo();
+    CHECK(edit.track(b)->clips.empty());
+    CHECK(edit.track(a)->clips.size() == 1);
+}

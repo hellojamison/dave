@@ -432,3 +432,48 @@ TEST_CASE("delete does nothing without a selection or an open lane",
     CHECK_FALSE(dave::gui::deleteAutomationInSelection(edit, undo, view));
     CHECK(edit.volumeAutomation(t)->size() == 1);
 }
+
+// ─── Eraser tool ─────────────────────────────────────────────────────────────
+
+TEST_CASE("the eraser removes points inside its band and keeps the rest",
+          "[automation]") {
+    using dave::document::VolumeAutomationPoint;
+    // A five-point envelope; the swept band [90000, 210000] covers b, c and d
+    // and must leave a and e untouched, in order.
+    std::vector<VolumeAutomationPoint> points{
+        {"a", 0, 0.0},       {"b", 96000, -6.0},  {"c", 144000, -3.0},
+        {"d", 192000, -9.0}, {"e", 288000, -1.0},
+    };
+
+    const auto kept = dave::gui::automationErase(points, 90000, 210000);
+    REQUIRE(kept.size() == 2);
+    CHECK(kept[0].id == "a");
+    CHECK(kept[0].sample == 0);
+    CHECK(kept[1].id == "e");
+    CHECK(kept[1].sample == 288000);
+}
+
+TEST_CASE("the eraser band is inclusive at both edges", "[automation]") {
+    using dave::document::VolumeAutomationPoint;
+    std::vector<VolumeAutomationPoint> points{
+        {"lo", 1000, 0.0}, {"mid", 2000, 0.0}, {"hi", 3000, 0.0},
+    };
+    // Points exactly on the boundaries count as inside.
+    const auto kept = dave::gui::automationErase(points, 1000, 3000);
+    CHECK(kept.empty());
+
+    const auto keptOne = dave::gui::automationErase(points, 1001, 2999);
+    REQUIRE(keptOne.size() == 2);
+    CHECK(keptOne[0].id == "lo");
+    CHECK(keptOne[1].id == "hi");
+}
+
+TEST_CASE("an eraser band touching no points changes nothing", "[automation]") {
+    using dave::document::VolumeAutomationPoint;
+    std::vector<VolumeAutomationPoint> points{
+        {"a", 0, 0.0}, {"b", 48000, -6.0},
+    };
+    const auto kept = dave::gui::automationErase(points, 100000, 200000);
+    CHECK(kept.size() == 2);
+    CHECK(kept == points);
+}

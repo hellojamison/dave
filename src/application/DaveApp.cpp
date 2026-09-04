@@ -154,11 +154,9 @@ bool DaveApp::init(bool startAudio) {
             std::string suffix = extension == std::string::npos ? "" : path.substr(extension);
             std::transform(suffix.begin(), suffix.end(), suffix.begin(),
                            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-            if (suffix == ".mid" || suffix == ".midi") {
-                importMidiFile(path);
-                continue;
-            }
-            if (suffix != ".wav") {
+            // .mid rides the same drop resolution as .wav: over a track it
+            // lands on that track, elsewhere it imports as new tracks.
+            if (suffix != ".wav" && suffix != ".mid" && suffix != ".midi") {
                 std::fprintf(stderr,
                              "Dave: ignored dropped file (not .wav/.mid): %s\n",
                              path.c_str());
@@ -287,7 +285,29 @@ bool DaveApp::init(bool startAudio) {
         imgui_.newFrame();
         handleShortcuts();
         servicePostRoll();
-        if (auto metro = builder_.metronome()) metro->setEnabled(metronomeEnabled_);
+        // Re-applied every frame so the settings survive graph rebuilds
+        // (the node is recreated on every edit).
+        if (auto metro = builder_.metronome()) {
+            auto& tr = audio_.transport();
+            if (countInUntil_ >= 0 &&
+                (!tr.isPlaying() || tr.position() >= countInUntil_)) {
+                countInUntil_ = -1;
+            }
+            const bool gated = editorPreferences_.metronomeOnlyWhenRecording &&
+                               !recordingActive();
+            // A count-in overrides everything: it is the one time the click
+            // has to sound whether or not the button is lit.
+            metro->setEnabled(countInUntil_ >= 0 ||
+                              (metronomeEnabled_ && !gated));
+            metro->setGain(static_cast<float>(
+                std::pow(10.0, editorPreferences_.metronomeGainDb / 20.0)));
+            metro->setAccent(editorPreferences_.metronomeAccent);
+            metro->setAccentBoost(static_cast<float>(
+                std::pow(10.0, editorPreferences_.metronomeAccentDb / 20.0)));
+            metro->setSound(static_cast<engine::MetronomeNode::Sound>(
+                editorPreferences_.metronomeSound));
+            metro->setSubdivide(editorPreferences_.metronomeEighths);
+        }
         drawUI();
         // Last writer in the frame, so the backend's next NewFrame reads None
         // and takes its hide path instead of putting the arrow back. Without
@@ -463,15 +483,21 @@ void DaveApp::handleShortcuts() {
                               audio_.transport().position());
     } else if (!primaryModifier && ImGui::IsKeyPressed(ImGuiKey_L, false)) {
         // L = loop on/off, over whatever range is current.
-        const bool anyArmed = std::any_of(
-            edit_.tracks().begin(), edit_.tracks().end(),
-            [](const document::Track& track) { return track.recordArm; });
-        if (!loopEnabled_ && anyArmed) {
-            showStatus("Disarm recording tracks before enabling Loop", true);
-        } else {
-            loopEnabled_ = !loopEnabled_;
-            syncTransportLoop();
+        loopEnabled_ = !loopEnabled_;
+        syncTransportLoop();
+    } else if (!primaryModifier && !shift && alt &&
+               ImGui::IsKeyPressed(ImGuiKey_C, false)) {
+        // Option+C: clear every meter's latched clip indicator at once.
+        for (const auto& [id, node] : builder_.trackGains()) {
+            if (node) node->clearMeterClips();
         }
+        for (const auto& [id, node] : builder_.meterTaps()) {
+            if (node) node->clearMeterClips();
+        }
+    } else if (!primaryModifier && !shift && !alt &&
+               ImGui::IsKeyPressed(ImGuiKey_3, false)) {
+        // 3 = record (the number row, the Pro Tools convention).
+        toggleRecording();
     } else if (!primaryModifier && shift && ImGui::IsKeyPressed(ImGuiKey_M, false)) {
         // Shift+M / Shift+S toggle the selected track. The modifier keeps the
         // bare letters free and stops a stray keypress from silencing a track
@@ -1007,11 +1033,6 @@ void DaveApp::toggleTrackArm(const std::string& trackId) {
         showStatus("Save the project before arming a track", true);
         return;
     }
-    if (loopEnabled_) {
-        showStatus("Turn Loop off before arming; loop recording is not available yet",
-                   true);
-        return;
-    }
     if (!audio_.captureAvailable() || audio_.captureChannelCount() == 0) {
         showStatus("Select an available input device before arming", true);
         return;
@@ -1034,11 +1055,6 @@ bool DaveApp::beginCapture() {
     if (capturing()) return true;
     if (projectPath_.empty()) {
         showStatus("Save the project before recording", true);
-        return false;
-    }
-    if (loopEnabled_) {
-        showStatus("Turn Loop off before recording; loop recording is not available yet",
-                   true);
         return false;
     }
     const int captureChannels =
@@ -1159,22 +1175,36 @@ void DaveApp::beginCaptureIfArmed() {
 }
 
 void DaveApp::punchIn() {
+    int64_t at = audio_.transport().position();
     if (!capturing()) {
         // Record from a standing start still means "roll and keep it", so the
         // transport goes first and the capture anchors to it.
         if (!audio_.transport().isPlaying()) {
+            // Count-in: roll from N bars ahead of the punch with the click
+            // forced on, and keep the punch where Record was pressed so the
+            // count-in bars are heard but not kept.
+            const int64_t from = countOffStart(at);
+            if (from < at) {
+                audio_.transport().seek(from);
+                countInUntil_ = at;
+            }
             audio_.transport().play();
             transportWasRolling_ = true;
         }
         if (!beginCapture()) {
             audio_.transport().stop();
             transportWasRolling_ = false;
+            countInUntil_ = -1;
             return;
         }
+    } else {
+        // Punching in mid-roll: a count-in makes no sense, take the cursor.
+        at = audio_.transport().position();
     }
     audio_.transport().setRecording(true);
-    const int64_t at = audio_.transport().position();
-    recordingSession_->punches.push_back(application::PunchRange{at});
+    application::PunchRange punch{at};
+    punch.captureShift = recordingSession_->loopCaptureShift;
+    recordingSession_->punches.push_back(punch);
     view_.recordingActive = true;
     view_.recordingStartSample =
         std::max<int64_t>(0, at - recordingSession_->latencyOffsetSamples);
@@ -1332,8 +1362,35 @@ void DaveApp::togglePlayback() {
     }
     // The pre-roll is a lead-in, not a jump: rewind from wherever playback would
     // begin.
-    tr.seek(std::max<int64_t>(0, startAt - pre));
+    int64_t from = std::max<int64_t>(0, startAt - pre);
+    // Count-off: further back still, by whole bars, with the click forced on
+    // until the start point is reached.
+    const int64_t countOffFrom = countOffStart(startAt);
+    if (countOffFrom < from) {
+        from = countOffFrom;
+        countInUntil_ = startAt;
+    } else if (countOffFrom < startAt) {
+        countInUntil_ = startAt;
+    }
+    tr.seek(from);
     tr.toggle();  // play
+}
+
+// Where a count-off of the configured bars begins ahead of `at`, or `at`
+// itself when there is none. Bars follow the meter map, so a 3/4 bar counts
+// three beats.
+int64_t DaveApp::countOffStart(int64_t at) const {
+    const int bars = editorPreferences_.metronomeCountInBars;
+    if (bars <= 0) return at;
+    const double sr = static_cast<double>(edit_.sampleRate());
+    auto bb = document::barsBeatsAtSample(at, sr, edit_.tempoMap(),
+                                          edit_.meterMap());
+    bb.bar = std::max(1, bb.bar - bars);
+    bb.beat = 1;
+    bb.tick = 0;
+    const int64_t from = document::sampleAtBarsBeats(
+        bb, sr, edit_.tempoMap(), edit_.meterMap());
+    return std::min(from, at);
 }
 
 void DaveApp::servicePostRoll() {
@@ -1416,7 +1473,7 @@ void DaveApp::onEditChanged() {
         if (armRefused) {
             showStatus("Track arming cannot change during a recording", true);
         }
-    } else if (projectPath_.empty() || loopEnabled_) {
+    } else if (projectPath_.empty()) {
         for (auto& track : edit_.tracksMut()) {
             if (track.recordArm) {
                 track.recordArm = false;
@@ -1424,10 +1481,7 @@ void DaveApp::onEditChanged() {
             }
         }
         if (armRefused) {
-            showStatus(projectPath_.empty()
-                           ? "Save the project before arming a track"
-                           : "Turn Loop off before arming; loop recording is not available yet",
-                       true);
+            showStatus("Save the project before arming a track", true);
         }
     }
 
@@ -1661,6 +1715,31 @@ void DaveApp::drawUI() {
             endCapture();
         }
         transportWasRolling_ = rolling;
+    }
+
+    // Loop recording. The capture is one continuous file while the timeline
+    // wraps, so on each wrap an open punch closes at the loop's end and a new
+    // one opens at its start, a loop length further into the file. Every
+    // pass becomes its own take, stacked over the last — the newest on top is
+    // what plays, the same as a punch over an existing clip.
+    {
+        const int64_t position = transport.position();
+        int64_t loopStart = 0, loopEnd = 0;
+        if (capturing() && loopEnabled_ && transport.isPlaying() &&
+            loopRange(loopStart, loopEnd) && loopEnd > loopStart &&
+            position < lastTransportPosition_ &&
+            lastTransportPosition_ - position > (loopEnd - loopStart) / 2) {
+            const int64_t loopLength = loopEnd - loopStart;
+            recordingSession_->loopCaptureShift += loopLength;
+            auto& punches = recordingSession_->punches;
+            if (!punches.empty() && punches.back().open()) {
+                punches.back().out = std::max(punches.back().in, loopEnd);
+                application::PunchRange next{loopStart};
+                next.captureShift = recordingSession_->loopCaptureShift;
+                punches.push_back(next);
+            }
+        }
+        lastTransportPosition_ = position;
     }
 
     if (builder_.latencyChangePending() && !recordingActive()) {
@@ -2005,27 +2084,19 @@ void DaveApp::drawUI() {
         {
             int64_t loopLo = 0, loopHi = 0;
             const bool haveRange = loopRange(loopLo, loopHi);
+            // Loop covers recording too: with a track armed, every pass
+            // through the range lands a new take on top of the last.
             const char* loopTip = haveRange
-                ? "Loop playback over the selection (L)"
-                : "Loop playback (L) — select a range, or add a loop marker, "
+                ? "Loop over the selection (L) — record for a take per pass"
+                : "Loop (L) — select a range, or add a loop marker, "
                   "to give it something to loop";
             if (gui::theme::iconButton(
                     "##transportLoop", gui::theme::TransportIcon::Loop,
                     loopTip, ImVec2(controlH, controlH),
                     loopEnabled_ ? gui::theme::ButtonVariant::Primary
                                  : gui::theme::ButtonVariant::Normal)) {
-                const bool anyArmed = std::any_of(
-                    edit_.tracks().begin(), edit_.tracks().end(),
-                    [](const document::Track& track) {
-                        return track.recordArm;
-                    });
-                if (!loopEnabled_ && anyArmed) {
-                    showStatus("Disarm recording tracks before enabling Loop",
-                               true);
-                } else {
-                    loopEnabled_ = !loopEnabled_;
-                    syncTransportLoop();
-                }
+                loopEnabled_ = !loopEnabled_;
+                syncTransportLoop();
             }
         }
         ImGui::SameLine(0.0f, kGap);
@@ -2036,6 +2107,51 @@ void DaveApp::drawUI() {
                 metronomeEnabled_ ? gui::theme::ButtonVariant::Primary
                                   : gui::theme::ButtonVariant::Normal)) {
             metronomeEnabled_ = !metronomeEnabled_;
+        }
+        // Right-click: the click's settings. Left toggles, right configures,
+        // so the common gesture stays one click.
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+            ImGui::OpenPopup("##metronomeopts");
+        }
+        if (ImGui::BeginPopup("##metronomeopts")) {
+            ImGui::TextDisabled("Metronome");
+            ImGui::SetNextItemWidth(150.0f);
+            ImGui::SliderInt("##metrodb", &editorPreferences_.metronomeGainDb,
+                             -60, 6, "%d dB");
+            if (gui::theme::altClickedReset()) {
+                editorPreferences_.metronomeGainDb = -6;
+                saveEditorPreferences();
+            }
+            if (ImGui::IsItemDeactivatedAfterEdit()) saveEditorPreferences();
+            // Sound: three synthesised clicks, no sample files to manage.
+            const char* sounds[] = {"Beep", "Wood", "Click"};
+            ImGui::SetNextItemWidth(150.0f);
+            if (ImGui::Combo("##metrosound", &editorPreferences_.metronomeSound,
+                             sounds, 3)) {
+                saveEditorPreferences();
+            }
+            ImGui::Separator();
+            if (ImGui::Checkbox("Accent downbeat",
+                                &editorPreferences_.metronomeAccent)) {
+                saveEditorPreferences();
+            }
+            if (editorPreferences_.metronomeAccent) {
+                ImGui::SetNextItemWidth(150.0f);
+                ImGui::SliderInt("##metroaccent",
+                                 &editorPreferences_.metronomeAccentDb, 0, 12,
+                                 "accent +%d dB");
+                if (ImGui::IsItemDeactivatedAfterEdit()) saveEditorPreferences();
+            }
+            if (ImGui::Checkbox("Eighth-note subdivision",
+                                &editorPreferences_.metronomeEighths)) {
+                saveEditorPreferences();
+            }
+            ImGui::Separator();
+            if (ImGui::Checkbox("Only while recording",
+                                &editorPreferences_.metronomeOnlyWhenRecording)) {
+                saveEditorPreferences();
+            }
+            ImGui::EndPopup();
         }
         groupSeparator();
 
@@ -2302,7 +2418,8 @@ void DaveApp::drawUI() {
         // starts (see togglePlayback).
         {
             const bool anyRoll = editorPreferences_.preRollEnabled ||
-                                 editorPreferences_.postRollEnabled;
+                                 editorPreferences_.postRollEnabled ||
+                                 editorPreferences_.metronomeCountInBars > 0;
             if (anyRoll) ImGui::PushStyleColor(ImGuiCol_Text, pal.accent);
             if (ImGui::Button("Roll", ImVec2(0.0f, controlH))) {
                 ImGui::OpenPopup("##rollopts");
@@ -2312,25 +2429,75 @@ void DaveApp::drawUI() {
                 ImGui::SetTooltip("Pre-roll / post-roll");
             }
             if (ImGui::BeginPopup("##rollopts")) {
-                bool pre = editorPreferences_.preRollEnabled;
-                if (ImGui::Checkbox("Pre-roll", &pre)) {
-                    editorPreferences_.preRollEnabled = pre;
-                    saveEditorPreferences();
-                }
-                ImGui::SetNextItemWidth(130.0f);
-                ImGui::SliderInt("##prems", &editorPreferences_.preRollMs, 0,
-                                 10000, "%d ms");
-                if (ImGui::IsItemDeactivatedAfterEdit()) saveEditorPreferences();
+                // The lengths read and parse in the timeline's own time
+                // format (min:sec, bars|beats, samples…), the same way the
+                // counter and selection fields do. The setting itself stays
+                // in milliseconds, so switching formats re-renders the same
+                // duration rather than reinterpreting a number. A duration is
+                // formatted as a position from zero, which for bars|beats
+                // means "this many bars at the tempo at the top".
+                const double rollSr = static_cast<double>(edit_.sampleRate());
+                auto rollField = [&](const char* label, const char* id,
+                                     bool& enabled, int& ms, char* buf,
+                                     bool& editing) {
+                    if (ImGui::Checkbox(label, &enabled)) {
+                        saveEditorPreferences();
+                    }
+                    if (!editing) {
+                        const int64_t samples = static_cast<int64_t>(
+                            std::llround(ms * rollSr / 1000.0));
+                        const std::string t = gui::formatTimecode(
+                            samples, view_.tcMode, rollSr, 24.0,
+                            edit_.tempoBpm(), &edit_.meterMap(),
+                            &edit_.tempoMap());
+                        std::strncpy(buf, t.c_str(), 31);
+                        buf[31] = '\0';
+                    }
+                    ImGui::SetNextItemWidth(130.0f);
+                    ImGui::InputText(id, buf, 32,
+                                     ImGuiInputTextFlags_EnterReturnsTrue);
+                    if (ImGui::IsItemActivated()) editing = true;
+                    if (ImGui::IsItemDeactivated()) {
+                        editing = false;
+                        const int64_t parsed = gui::parseTimecodeToSamples(
+                            buf, view_.tcMode, rollSr, 24.0, &edit_.tempoMap(),
+                            &edit_.meterMap());
+                        if (parsed >= 0) {
+                            const int next = static_cast<int>(
+                                std::llround(parsed * 1000.0 / rollSr));
+                            if (next != ms) {
+                                ms = next;
+                                saveEditorPreferences();
+                            }
+                        }
+                    }
+                };
+                rollField("Pre-roll", "##prelen",
+                          editorPreferences_.preRollEnabled,
+                          editorPreferences_.preRollMs, preRollInput_,
+                          editingPreRoll_);
                 ImGui::Separator();
-                bool post = editorPreferences_.postRollEnabled;
-                if (ImGui::Checkbox("Post-roll", &post)) {
-                    editorPreferences_.postRollEnabled = post;
+                rollField("Post-roll", "##postlen",
+                          editorPreferences_.postRollEnabled,
+                          editorPreferences_.postRollMs, postRollInput_,
+                          editingPostRoll_);
+                ImGui::Separator();
+                // Count-off: bars of click ahead of the start point, with the
+                // metronome forced on for them. Play or Record from a
+                // standing start rolls in from there; a punch stays where
+                // Record was pressed, so the count-off is heard, not kept.
+                const char* countOffs[] = {"No count-off", "1 bar count-off",
+                                           "2 bar count-off",
+                                           "4 bar count-off"};
+                int countIdx = editorPreferences_.metronomeCountInBars >= 4 ? 3
+                             : editorPreferences_.metronomeCountInBars >= 2 ? 2
+                             : editorPreferences_.metronomeCountInBars;
+                ImGui::SetNextItemWidth(150.0f);
+                if (ImGui::Combo("##countoff", &countIdx, countOffs, 4)) {
+                    const int bars[] = {0, 1, 2, 4};
+                    editorPreferences_.metronomeCountInBars = bars[countIdx];
                     saveEditorPreferences();
                 }
-                ImGui::SetNextItemWidth(130.0f);
-                ImGui::SliderInt("##postms", &editorPreferences_.postRollMs, 0,
-                                 10000, "%d ms");
-                if (ImGui::IsItemDeactivatedAfterEdit()) saveEditorPreferences();
                 ImGui::EndPopup();
             }
             groupSeparator();
@@ -2484,9 +2651,34 @@ void DaveApp::drawUI() {
                        "Grid line increment \u2014 Auto follows the ruler format");
 
         ImGui::SameLine(0.0f, kGap);
-        ImGui::Checkbox("Snap", &view_.snapEnabled);
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Snap timeline edits to the increment beside this");
+        // Edit mode: Grid snaps clip boundaries and edits to the increment
+        // beside it; Slide moves freely, sample by sample. One state, two
+        // buttons, so the current mode reads at a glance.
+        {
+            const float modeH = ImGui::GetFrameHeight();
+            auto modeButton = [&](const char* label, bool active,
+                                  const char* tip) {
+                if (active) {
+                    ImGui::PushStyleColor(ImGuiCol_Button, pal.accentDeep);
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                                          pal.accentDeep);
+                    ImGui::PushStyleColor(ImGuiCol_Text, pal.primaryText);
+                }
+                const bool pressed = ImGui::Button(label, ImVec2(0.0f, modeH));
+                if (active) ImGui::PopStyleColor(3);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+                return pressed;
+            };
+            if (modeButton("Grid", view_.snapEnabled,
+                           "Grid mode: clip edges and edits snap to the "
+                           "increment beside this")) {
+                view_.snapEnabled = true;
+            }
+            ImGui::SameLine(0.0f, 1.0f);
+            if (modeButton("Slide", !view_.snapEnabled,
+                           "Slide mode: free, sample-accurate movement")) {
+                view_.snapEnabled = false;
+            }
         }
         ImGui::SameLine(0.0f, 4.0f);
         incrementCombo("##snapIncrement", "##snapCustom",
@@ -2757,8 +2949,19 @@ void DaveApp::drawUI() {
     // Place any audio-file drops the timeline resolved this frame.
     if (!view_.resolvedFileDrops.empty()) {
         for (const auto& drop : view_.resolvedFileDrops) {
+            const auto dot = drop.path.find_last_of('.');
+            std::string suffix =
+                dot == std::string::npos ? "" : drop.path.substr(dot);
+            std::transform(suffix.begin(), suffix.end(), suffix.begin(),
+                           [](unsigned char c) {
+                               return static_cast<char>(std::tolower(c));
+                           });
+            const bool midi = suffix == ".mid" || suffix == ".midi";
             if (drop.trackId.empty()) {
-                loadWavIntoNewTrack(drop.path);
+                if (midi) importMidiFile(drop.path);
+                else loadWavIntoNewTrack(drop.path);
+            } else if (midi) {
+                importMidiOntoTrack(drop.path, drop.trackId, drop.sample);
             } else {
                 placeWavOnTrack(drop.path, drop.trackId, drop.sample);
             }
@@ -2990,6 +3193,47 @@ void DaveApp::openMidiDialog() {
         NFD_FreePath(outPath);
         importMidiFile(p);
     }
+}
+
+// A .mid dropped on an existing track: its note tracks become clips on that
+// track at the drop point, audio and MIDI side by side. The track keeps
+// whatever it already holds; a clip per SMF track, so a multi-track file
+// arrives as several clips rather than one merged blob.
+bool DaveApp::importMidiOntoTrack(const std::string& path,
+                                  const std::string& trackId, int64_t at) {
+    const auto smf = engine::midi::readSmf(path, edit_.sampleRate());
+    if (!smf.ok) {
+        showStatus("MIDI import failed: " + smf.error, true);
+        return false;
+    }
+    if (edit_.track(trackId) == nullptr) return importMidiFile(path);
+    const size_t slash = path.find_last_of("/\\");
+    const std::string fileName =
+        slash == std::string::npos ? path : path.substr(slash + 1);
+    int index = 0;
+    int added = 0;
+    for (const auto& st : smf.tracks) {
+        ++index;
+        if (st.notes.empty()) continue;
+        document::MidiClip clip;
+        clip.name = !st.name.empty() ? st.name
+                                     : (fileName + " " + std::to_string(index));
+        clip.timelineStart = std::max<int64_t>(0, at);
+        clip.sourceOffset = 0;
+        clip.length = st.lengthSamples;
+        clip.notes = st.notes;
+        clip.sourcePath = path;
+        clip.sourcePpq = smf.ppq;
+        clip.sourceTempi = smf.tempi;
+        undo_.execute(std::make_unique<editing::AddMidiClipCommand>(
+            trackId, std::move(clip)));
+        ++added;
+    }
+    if (added == 0) {
+        showStatus(fileName + " has no notes to import", true);
+        return false;
+    }
+    return true;
 }
 
 bool DaveApp::importMidiFile(const std::string& path) {
@@ -3943,7 +4187,10 @@ void DaveApp::serviceViewRequests() {
         const bool topologyChange = request.kind == Kind::SetHardwareInput ||
             request.kind == Kind::SetMainOutput || request.kind == Kind::AddSend ||
             request.kind == Kind::UpdateSend || request.kind == Kind::RemoveSend ||
-            request.kind == Kind::AddBus || request.kind == Kind::RemoveBus;
+            request.kind == Kind::AddBus || request.kind == Kind::RemoveBus ||
+            request.kind == Kind::AddOutput || request.kind == Kind::RemoveOutput ||
+            request.kind == Kind::AddBusAndSend ||
+            request.kind == Kind::AddBusAndOutput;
         if (recordingActive() && topologyChange) {
             showStatus("Routing topology cannot change during recording", true);
             continue;
@@ -3973,6 +4220,34 @@ void DaveApp::serviceViewRequests() {
             case Kind::RemoveBus:
                 undo_.execute(std::make_unique<editing::RemoveTrackCommand>(
                     request.ownerId)); break;
+            case Kind::AddOutput:
+                undo_.execute(std::make_unique<editing::AddOutputCommand>(
+                    request.ownerId, request.route)); break;
+            case Kind::RemoveOutput:
+                undo_.execute(std::make_unique<editing::RemoveOutputCommand>(
+                    request.ownerId, request.route)); break;
+            case Kind::AddBusAndSend:
+            case Kind::AddBusAndOutput: {
+                // The bus first, so its minted id can be the target. Two
+                // undo steps, which is honest: Undo takes the route back
+                // and leaves the bus, Undo again removes the bus.
+                auto add = std::make_unique<editing::AddTrackCommand>(
+                    "Bus", editing::AddTrackCommand::Flavour::Bus);
+                auto* raw = add.get();
+                undo_.execute(std::move(add));
+                const std::string busId = raw->busId();
+                if (busId.empty()) break;
+                if (request.kind == Kind::AddBusAndSend) {
+                    document::AuxSend send = request.send;
+                    send.target = document::RouteTarget::bus(busId);
+                    undo_.execute(std::make_unique<editing::AddSendCommand>(
+                        request.ownerId, send));
+                } else {
+                    undo_.execute(std::make_unique<editing::AddOutputCommand>(
+                        request.ownerId, document::RouteTarget::bus(busId)));
+                }
+                break;
+            }
         }
     }
     if (!view_.requestRecordArmTrackId.empty()) {

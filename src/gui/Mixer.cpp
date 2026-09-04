@@ -310,7 +310,10 @@ void drawRouteChoices(const StripModel& model, const document::Edit& edit,
                                               playbackChannels, false);
     RoutingTargetOption::Group previous = RoutingTargetOption::Group::HardwareOutputs;
     bool first = true;
-    for (const auto& option : options) {
+    for (size_t i = 0; i < options.size(); ++i) {
+        const auto& option = options[i];
+        // Labels can repeat across groups; the index keeps ids distinct.
+        ImGui::PushID(static_cast<int>(i));
         if (first || option.group != previous) {
             if (!first) ImGui::Separator();
             const char* label = option.group == RoutingTargetOption::Group::MainAndBuses
@@ -331,6 +334,7 @@ void drawRouteChoices(const StripModel& model, const document::Edit& edit,
             ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
             ImGui::SetTooltip("%s", option.disabledReason.c_str());
         }
+        ImGui::PopID();
     }
 }
 

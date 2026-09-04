@@ -116,6 +116,9 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit,
     };
     auto rememberChannel = [&](const auto& channel) {
         rememberRoute(channel.id, channel.mainOutput);
+        for (const auto& extra : channel.extraOutputs) {
+            rememberRoute(channel.id, extra);
+        }
         for (const auto& send : channel.sends) {
             rememberRoute(channel.id, send.target);
         }
@@ -368,6 +371,14 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit,
             const NodeId instrumentId = graph->addNode(node);
             instrumentNodes_[track.id] = node;
             graph->connect(instrumentId, 0, input, 0);
+        } else if (!track.midiClips.empty()) {
+            // No instrument yet: a built-in sine plays the notes so a MIDI
+            // clip is audible the moment it lands.
+            auto node = std::make_shared<SineSynthNode>();
+            node->setSequence(bakeClips(track.midiClips));
+            const NodeId synthId = graph->addNode(node);
+            instrumentNodes_[track.id] = node;
+            graph->connect(synthId, 0, input, 0);
         }
 
         if (track.inputMonitor) {
@@ -424,6 +435,10 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit,
         const auto found = channels.find(channel.id);
         if (found == channels.end()) return;
         connectTarget(channel.id, found->second.postFader, channel.mainOutput);
+        // Additional outputs: the same post-fader signal, to more places.
+        for (const auto& extra : channel.extraOutputs) {
+            connectTarget(channel.id, found->second.postFader, extra);
+        }
         for (const auto& send : channel.sends) {
             // The chain says where this send taps. Pre/post-fader is no longer
             // a property of the send — it is whether the send sits before or

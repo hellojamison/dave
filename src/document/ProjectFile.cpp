@@ -239,6 +239,13 @@ static std::vector<PanAutomationPoint> panAutomationFromJson(
 template <typename Channel>
 static void writeChannelRouting(json& value, const Channel& channel) {
     value["mainOutput"] = routeToJson(channel.mainOutput);
+    if (!channel.extraOutputs.empty()) {
+        json extras = json::array();
+        for (const auto& extra : channel.extraOutputs) {
+            extras.push_back(routeToJson(extra));
+        }
+        value["extraOutputs"] = std::move(extras);
+    }
     json sends = json::array();
     for (const auto& send : channel.sends) sends.push_back(sendToJson(send));
     value["sends"] = std::move(sends);
@@ -251,6 +258,12 @@ template <typename Channel>
 static void readChannelRouting(const json& value, Channel& channel) {
     if (value.contains("mainOutput")) {
         channel.mainOutput = routeFromJson(value["mainOutput"], RouteTarget::bus());
+    }
+    if (value.contains("extraOutputs") && value["extraOutputs"].is_array()) {
+        for (const auto& extra : value["extraOutputs"]) {
+            channel.extraOutputs.push_back(
+                routeFromJson(extra, RouteTarget::none()));
+        }
     }
     if (value.contains("sends") && value["sends"].is_array()) {
         for (const auto& send : value["sends"]) {

@@ -243,6 +243,9 @@ struct TimelineViewState {
     int64_t selectionAnchor = 0;
     int64_t selectionFocus = 0;
     bool isSelecting = false;
+    // The range being dragged was anchored at the playhead by a Shift-click,
+    // so releasing it must not move the playhead to the range's head.
+    bool selectionFromPlayhead = false;
     // Which lane the selection belongs to, as a row index across both bands
     // (audio 0..n-1, then MIDI). -1 means every track: that is what a drag on
     // the ruler makes, and it is the only way to get one — a drag inside a

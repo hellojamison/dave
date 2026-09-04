@@ -369,6 +369,10 @@ struct Track {
     HardwareChannelSpan hardwareInput{0, 1};
     bool inputMonitor = false;
     RouteTarget mainOutput = RouteTarget::bus();
+    // Further destinations fed the same post-fader signal as mainOutput — a
+    // track that goes to Main and to a headphone pair at once. Validated by
+    // the same rules as the main route.
+    std::vector<RouteTarget> extraOutputs;
     std::vector<AuxSend> sends;
     std::vector<AudioClip> clips;
     // MIDI content. `instrument` is a dedicated field rather than "plugins[0]
@@ -398,6 +402,20 @@ struct Track {
     // Edit::normalizeChain_.
     std::vector<ChainSlot> chain;  // effect chain, processed in order
 };
+
+// Whether a send taps before the fader. The chain is the truth — a send is
+// pre-fader when it sits ahead of the Fader entry — with the send's own tap
+// flag standing in for a track whose chain has not been built yet.
+inline bool sendIsPreFader(const Track& track, const std::string& sendId) {
+    for (const auto& slot : track.chain) {
+        if (slot.kind == ChainSlot::Kind::Fader) return false;
+        if (slot.kind == ChainSlot::Kind::Send && slot.id == sendId) return true;
+    }
+    for (const auto& send : track.sends) {
+        if (send.id == sendId) return send.tap == SendTap::PreFader;
+    }
+    return false;
+}
 
 // Constrains a saved input span to a live capture device without coupling the
 // document layer to AudioEngine or miniaudio. A device-less state has no valid

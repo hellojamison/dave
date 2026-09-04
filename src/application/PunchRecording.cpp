@@ -15,11 +15,16 @@ PunchClipRange punchClipRange(int64_t captureStartSample,
     if (punch.open() || capturedFrames == 0) return result;
 
     const int64_t captureEnd = captureStartSample + capturedFrames;
-    // A punch outside the captured span produces nothing rather than a clip
-    // pointing at audio that was never written.
-    const int64_t in = std::clamp(punch.in, captureStartSample, captureEnd);
-    const int64_t out = std::clamp(punch.out, captureStartSample, captureEnd);
-    result.clampedToCapture = in != punch.in || out != punch.out;
+    // The punch in capture space: its timeline span pushed along by however
+    // many loop passes the capture ran through before it. A punch outside the
+    // captured span produces nothing rather than a clip pointing at audio that
+    // was never written.
+    const int64_t shift = std::max<int64_t>(0, punch.captureShift);
+    const int64_t in =
+        std::clamp(punch.in + shift, captureStartSample, captureEnd);
+    const int64_t out =
+        std::clamp(punch.out + shift, captureStartSample, captureEnd);
+    result.clampedToCapture = in != punch.in + shift || out != punch.out + shift;
     if (out <= in) return result;
 
     // Where in the file the punch begins, before any latency shift.
@@ -28,8 +33,9 @@ PunchClipRange punchClipRange(int64_t captureStartSample,
 
     // Move the region earlier by the offset. Below zero there is no timeline
     // left to move into, so the remainder is taken off the front of the audio
-    // instead — the region stays put and starts later in the file.
-    const int64_t wantStart = in - offset;
+    // instead — the region stays put and starts later in the file. The region
+    // lands at the punch's timeline position, not its place in the file.
+    const int64_t wantStart = (in - shift) - offset;
     if (wantStart >= 0) {
         result.timelineStart = wantStart;
         result.sourceOffset = sourceOffset;

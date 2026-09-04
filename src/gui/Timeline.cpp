@@ -2351,8 +2351,16 @@ void drawTimeline(const document::Edit& edit,
                 } else {
                     std::snprintf(level, sizeof(level), "%.1f dB", db);
                 }
-                const bool postFader = send.tap == document::SendTap::PostFader;
-                dl->AddText(ImVec2(textX, rowY), textCol, target.c_str());
+                const bool postFader = !document::sendIsPreFader(track, send.id);
+                // The tap reads by colour as well as by word: pre-fader in
+                // the MIDI accent, post-fader in the main accent.
+                const ImU32 tapCol = C(postFader ? pal.accentStrong
+                                                 : pal.clipMidiBorder);
+                dl->AddRectFilled(ImVec2(textX - 6.0f, rowY + 3.0f),
+                                  ImVec2(textX - 3.0f, rowY + rowH - 3.0f),
+                                  tapCol);
+                dl->AddText(ImVec2(textX, rowY), send.muted ? mutedCol : tapCol,
+                            target.c_str());
                 char meta[40];
                 std::snprintf(meta, sizeof(meta), "%s · %s", level,
                               postFader ? "post" : "pre");
@@ -3270,10 +3278,10 @@ void drawTimeline(const document::Edit& edit,
             // that appears to do nothing when replayed.
             const bool moved = view.dragPreviewStart != view.dragClipOriginalStart ||
                                !newTrackArg.empty();
-            // A clip in a group drags the whole group, by the same amount.
-            // The other members keep their tracks — a group can span lanes,
-            // and dragging one across would have to decide where a member with
-            // no lane to land in goes.
+            // A clip in a group drags the whole group, by the same amount —
+            // along the timeline and across tracks, every member shifting the
+            // same number of rows so the group keeps its shape. The document
+            // refuses a row shift that would push a member off the list.
             // The dragged id is a group's when a group clip was grabbed —
             // there is nothing else on the timeline it could be.
             const auto* group = edit.clipGroup(view.selectedClipId);
@@ -3282,9 +3290,19 @@ void drawTimeline(const document::Edit& edit,
             // a whole group is a niche the drag machinery doesn't cover yet).
             const bool altCopy = ImGui::GetIO().KeyAlt && group == nullptr;
             if (moved && group != nullptr) {
+                int rowDelta = 0;
+                if (targetTrackIndex >= 0) {
+                    for (size_t oi = 0; oi < tracks.size(); ++oi) {
+                        if (tracks[oi].id == view.dragOriginalTrackId) {
+                            rowDelta = targetTrackIndex - static_cast<int>(oi);
+                            break;
+                        }
+                    }
+                }
                 undo.execute(std::make_unique<editing::MoveClipGroupCommand>(
                     group->id,
-                    view.dragPreviewStart - view.dragClipOriginalStart));
+                    view.dragPreviewStart - view.dragClipOriginalStart,
+                    rowDelta));
             } else if (moved && altCopy) {
                 if (draggingMidiClip) {
                     undo.execute(std::make_unique<editing::CopyMidiClipToCommand>(
@@ -3446,16 +3464,23 @@ void drawTimeline(const document::Edit& edit,
         // so dragging out a selection never interrupts playback. A plain click
         // (no drag) still relocates on release, via the click path below. The
         // selector (command) never seeks — it is for marking, not locating.
-        if (!transport.isPlaying() && !selectorMode) seekToMouseX();
+        // Shift: the range runs from the playhead to the click, the way a
+        // shift-click extends a selection from the cursor in any editor.
+        const bool fromPlayhead = ImGui::GetIO().KeyShift;
+        if (!transport.isPlaying() && !selectorMode && !fromPlayhead) {
+            seekToMouseX();
+        }
         view.selectionPressSample = selectionSampleAtMouseX();
         const int64_t s = selectionSampleAtMouseX();
-        view.selectionStart = s;
+        const int64_t anchor = fromPlayhead ? transport.position() : s;
+        view.selectionStart = anchor;
         view.selectionEnd = s;
-        view.selectionAnchor = s;
+        view.selectionAnchor = anchor;
         view.selectionFocus = s;
         view.selectionRow = -1;          // -1 = all tracks
         view.isSelecting = true;
         view.hasSelection = true;
+        view.selectionFromPlayhead = fromPlayhead;
     }
 
     // Track area: click empty space seeks (but not on clips — those drag).
@@ -3490,12 +3515,16 @@ void drawTimeline(const document::Edit& edit,
             const int row = rowAtY(mouse.y);
             view.selectionPressSample = selectionSampleAtMouseX();
             const int64_t s = selectionSampleAtMouseX();
-            view.selectionStart = s;
+            // Shift anchors the range at the playhead instead of the click.
+            const bool fromPlayhead = ImGui::GetIO().KeyShift;
+            const int64_t anchor = fromPlayhead ? transport.position() : s;
+            view.selectionStart = anchor;
             view.selectionEnd = s;
-            view.selectionAnchor = s;
+            view.selectionAnchor = anchor;
             view.selectionFocus = s;
             view.selectionRow = row;
             view.isSelecting = true;
+            view.selectionFromPlayhead = fromPlayhead;
             // Below the last track there is no lane to select in, so the press
             // is a plain seek and nothing highlights.
             view.hasSelection = row >= 0;
@@ -3516,12 +3545,18 @@ void drawTimeline(const document::Edit& edit,
         // If the selection is tiny (just a click, not a drag), treat as seek +
         // clear selection — unless the selector (command) is held, whose whole
         // point is to select without disturbing the playhead.
+        const bool fromPlayhead = view.selectionFromPlayhead;
+        view.selectionFromPlayhead = false;
         if (std::abs(view.selectionEnd - view.selectionStart) <
             static_cast<int64_t>(4 * view.samplesPerPixel)) {
             // Not a drag after all: the cursor uses the same snap mode as the
             // press, so Snap never changes meaning between click and drag.
-            if (!selectorMode) transport.seek(view.selectionPressSample);
+            if (!selectorMode && !fromPlayhead) {
+                transport.seek(view.selectionPressSample);
+            }
             view.hasSelection = false;
+        } else if (fromPlayhead) {
+            // Anchored at the playhead on purpose: leave it there.
         } else if (view.hasSelection) {
             // A finished selection puts the cursor at its head, so play
             // starts from the top of the range — and, with loop on, so does

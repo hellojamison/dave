@@ -104,6 +104,10 @@ public:
                                          const RouteTarget& target) const;
 
     bool setMainOutput(const std::string& ownerId, RouteTarget target);
+    // Additional post-fader destinations beside the main output. Refused when
+    // the route would be invalid or is already one of the track's outputs.
+    bool addOutput(const std::string& ownerId, RouteTarget target);
+    bool removeOutput(const std::string& ownerId, const RouteTarget& target);
     bool setTrackHardwareInput(const std::string& trackId,
                                HardwareChannelSpan span);
     bool setInputMonitor(const std::string& trackId, bool enabled);
@@ -205,6 +209,11 @@ public:
     }
     // Slide a whole group, range and members together.
     bool moveClipGroup(const std::string& groupId, int64_t deltaSamples);
+    // Move a whole group down (positive) or up (negative) by that many track
+    // rows, members and nested groups together. Refused — nothing moves — if
+    // any member would land off the end of the track list, so a group never
+    // ends up half on and half off.
+    bool moveClipGroupTracks(const std::string& groupId, int rowDelta);
     // Replay helper: re-inserts an already-identified group so redo cannot
     // mint a different id.
     bool restoreClipGroup_(ClipGroup group, size_t index);
@@ -218,6 +227,9 @@ public:
     // longer exists.
     void pruneClipGroups_();
     void shiftClipGroup_(const std::string& groupId, int64_t delta);
+    bool clipGroupTracksFit_(const std::string& groupId, int rowDelta) const;
+    void shiftClipGroupTracks_(const std::string& groupId, int rowDelta);
+    int trackIndexOf_(const std::string& trackId) const;
     int64_t earliestInClipGroup_(const std::string& groupId) const;
     void loadClipGroup_(ClipGroup group) {
         clipGroups_.push_back(std::move(group));

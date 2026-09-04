@@ -76,11 +76,12 @@ TEST_CASE("a MIDI track gets a gain node and a master pin", "[midigraph]") {
     REQUIRE(compiled != nullptr);
 }
 
-TEST_CASE("a MIDI track with no instrument still compiles and is silent",
+TEST_CASE("a MIDI track with no instrument still compiles and plays a sine",
           "[midigraph]") {
     // Importing a .mid and only then picking a synth is the normal order of
-    // operations. The track must exist, compile, and produce silence — not
-    // vanish from the graph or take the derive down with it.
+    // operations. The track must exist, compile, and be audible through the
+    // built-in sine — not vanish from the graph, stay silent, or take the
+    // derive down with it.
     document::Edit edit;
     const std::string midi = edit.addMidiTrack("Keys");
     edit.addMidiClip(midi, chordClip(0, 48000));
@@ -88,25 +89,29 @@ TEST_CASE("a MIDI track with no instrument still compiles and is silent",
     engine::GraphBuilder builder;
     auto graph = builder.build(edit, kSampleRate);
     REQUIRE(graph != nullptr);
-    CHECK(builder.instrumentNodes().empty());   // nothing to instantiate
+    REQUIRE(builder.instrumentNodes().count(midi) == 1);
+    CHECK(std::dynamic_pointer_cast<engine::SineSynthNode>(
+              builder.instrumentNodes().at(midi)) != nullptr);
     CHECK(builder.trackGains().count(midi) == 1);
 
     auto [compiled, err] = engine::compile(*graph, kSampleRate, kBlock);
     INFO("compile: " << (err ? err->message : std::string{}));
     REQUIRE(compiled != nullptr);
 
-    std::vector<float> left(kBlock, 1.0f), right(kBlock, 1.0f);
+    std::vector<float> left(kBlock, 0.0f), right(kBlock, 0.0f);
     float* channels[2] = {left.data(), right.data()};
     engine::AudioBus out{channels, 2, kBlock};
     engine::TimeInfo time;
     time.sampleRate = kSampleRate;
     time.isPlaying = true;
-    compiled->process(out, time);
-
-    for (int i = 0; i < kBlock; ++i) {
-        REQUIRE(left[i] == 0.0f);
-        REQUIRE(right[i] == 0.0f);
+    // A couple of blocks in, past the attack.
+    for (int b = 0; b < 4; ++b) {
+        time.samplePos = static_cast<int64_t>(b) * kBlock;
+        compiled->process(out, time);
     }
+    double energy = 0.0;
+    for (int i = 0; i < kBlock; ++i) energy += std::fabs(left[i]);
+    CHECK(energy > 0.0);
 }
 
 TEST_CASE("audio and MIDI tracks route independently into Main", "[midigraph]") {
@@ -185,7 +190,11 @@ TEST_CASE("a bad instrument path leaves the track silent rather than failing",
     engine::GraphBuilder builder;
     auto graph = builder.build(edit, kSampleRate);
     REQUIRE(graph != nullptr);
-    CHECK(countNodes(*graph, "instrument") == 0);
+    // The plugin never loads, so the built-in sine stands in for it — the
+    // track sounds rather than sitting there broken and mute.
+    REQUIRE(builder.instrumentNodes().count(midi) == 1);
+    CHECK(std::dynamic_pointer_cast<engine::SineSynthNode>(
+              builder.instrumentNodes().at(midi)) != nullptr);
     CHECK(builder.trackGains().count(midi) == 1);
 
     auto [compiled, err] = engine::compile(*graph, kSampleRate, kBlock);

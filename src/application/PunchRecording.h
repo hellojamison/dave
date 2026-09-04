@@ -20,6 +20,11 @@ struct PunchRange {
     static constexpr int64_t kOpen = -1;
     int64_t in = 0;
     int64_t out = kOpen;
+    // Loop recording: the capture keeps running through every pass while the
+    // timeline wraps, so a punch on pass N sits this many frames further into
+    // the take file than its timeline position alone would say (N-1 loop
+    // lengths). Zero for a linear pass.
+    int64_t captureShift = 0;
 
     bool open() const { return out == kOpen; }
     bool empty() const { return !open() && out <= in; }

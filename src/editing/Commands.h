@@ -1282,6 +1282,40 @@ private:
     document::RouteTarget previous_ = document::RouteTarget::none();
 };
 
+class AddOutputCommand : public Command {
+public:
+    AddOutputCommand(std::string ownerId, document::RouteTarget target)
+        : ownerId_(std::move(ownerId)), target_(std::move(target)) {}
+    void perform(document::Edit& edit) override {
+        applied_ = edit.addOutput(ownerId_, target_);
+    }
+    void undo(document::Edit& edit) override {
+        if (applied_) edit.removeOutput(ownerId_, target_);
+    }
+    std::string name() const override { return "Add Output"; }
+private:
+    std::string ownerId_;
+    document::RouteTarget target_;
+    bool applied_ = false;
+};
+
+class RemoveOutputCommand : public Command {
+public:
+    RemoveOutputCommand(std::string ownerId, document::RouteTarget target)
+        : ownerId_(std::move(ownerId)), target_(std::move(target)) {}
+    void perform(document::Edit& edit) override {
+        applied_ = edit.removeOutput(ownerId_, target_);
+    }
+    void undo(document::Edit& edit) override {
+        if (applied_) edit.addOutput(ownerId_, target_);
+    }
+    std::string name() const override { return "Remove Output"; }
+private:
+    std::string ownerId_;
+    document::RouteTarget target_;
+    bool applied_ = false;
+};
+
 class SetInputMonitorCommand : public Command {
 public:
     SetInputMonitorCommand(std::string trackId, bool enabled)
@@ -1536,8 +1570,13 @@ private:
 // sliding in time has no such question.
 class MoveClipGroupCommand : public Command {
 public:
-    MoveClipGroupCommand(std::string groupId, int64_t deltaSamples)
-        : groupId_(std::move(groupId)), delta_(deltaSamples) {}
+    // rowDelta moves the group across tracks (positive = down) as well as
+    // along the timeline; a row move the document refuses is dropped and the
+    // time move still happens.
+    MoveClipGroupCommand(std::string groupId, int64_t deltaSamples,
+                         int rowDelta = 0)
+        : groupId_(std::move(groupId)), delta_(deltaSamples),
+          rowDelta_(rowDelta) {}
 
     void perform(document::Edit& e) override {
         const auto* before = e.clipGroup(groupId_);
@@ -1549,9 +1588,12 @@ public:
             const auto* after = e.clipGroup(groupId_);
             if (after != nullptr) delta_ = after->timelineStart - start;
         }
+        rowsApplied_ = rowDelta_ != 0 &&
+                       e.moveClipGroupTracks(groupId_, rowDelta_);
     }
 
     void undo(document::Edit& e) override {
+        if (rowsApplied_) e.moveClipGroupTracks(groupId_, -rowDelta_);
         if (applied_) e.moveClipGroup(groupId_, -delta_);
     }
 
@@ -1560,7 +1602,9 @@ public:
 private:
     std::string groupId_;
     int64_t delta_ = 0;
+    int rowDelta_ = 0;
     bool applied_ = false;
+    bool rowsApplied_ = false;
 };
 
 // Set or replace the time signature at a bar. Undoable because it moves every

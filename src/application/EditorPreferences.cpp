@@ -129,6 +129,31 @@ EditorPreferences EditorPreferencesStore::load() const noexcept {
         const auto xfMs = root.find("defaultCrossfadeMs");
         if (xfMs != root.end() && xfMs->is_number_integer())
             preferences.defaultCrossfadeMs = std::max(0, xfMs->get<int>());
+        const auto metroDb = root.find("metronomeGainDb");
+        if (metroDb != root.end() && metroDb->is_number_integer())
+            preferences.metronomeGainDb =
+                std::clamp(metroDb->get<int>(), -60, 6);
+        const auto metroAccent = root.find("metronomeAccent");
+        if (metroAccent != root.end() && metroAccent->is_boolean())
+            preferences.metronomeAccent = metroAccent->get<bool>();
+        const auto metroRec = root.find("metronomeOnlyWhenRecording");
+        if (metroRec != root.end() && metroRec->is_boolean())
+            preferences.metronomeOnlyWhenRecording = metroRec->get<bool>();
+        const auto metroAccentDb = root.find("metronomeAccentDb");
+        if (metroAccentDb != root.end() && metroAccentDb->is_number_integer())
+            preferences.metronomeAccentDb =
+                std::clamp(metroAccentDb->get<int>(), 0, 12);
+        const auto metroSound = root.find("metronomeSound");
+        if (metroSound != root.end() && metroSound->is_number_integer())
+            preferences.metronomeSound =
+                std::clamp(metroSound->get<int>(), 0, 2);
+        const auto metroEighths = root.find("metronomeEighths");
+        if (metroEighths != root.end() && metroEighths->is_boolean())
+            preferences.metronomeEighths = metroEighths->get<bool>();
+        const auto metroCountIn = root.find("metronomeCountInBars");
+        if (metroCountIn != root.end() && metroCountIn->is_number_integer())
+            preferences.metronomeCountInBars =
+                std::clamp(metroCountIn->get<int>(), 0, 8);
         return preferences;
     } catch (...) {
         return defaults;
@@ -162,6 +187,17 @@ bool EditorPreferencesStore::save(
             {"defaultCrossfadeShape",
              static_cast<int>(preferences.defaultCrossfadeShape)},
             {"defaultCrossfadeMs", preferences.defaultCrossfadeMs},
+            {"metronomeGainDb",
+             std::clamp(preferences.metronomeGainDb, -60, 6)},
+            {"metronomeAccent", preferences.metronomeAccent},
+            {"metronomeOnlyWhenRecording",
+             preferences.metronomeOnlyWhenRecording},
+            {"metronomeAccentDb",
+             std::clamp(preferences.metronomeAccentDb, 0, 12)},
+            {"metronomeSound", std::clamp(preferences.metronomeSound, 0, 2)},
+            {"metronomeEighths", preferences.metronomeEighths},
+            {"metronomeCountInBars",
+             std::clamp(preferences.metronomeCountInBars, 0, 8)},
         };
         std::error_code error;
         const auto parent = path_.parent_path();

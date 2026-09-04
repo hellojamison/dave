@@ -42,6 +42,19 @@ struct EditorPreferences {
     int preRollMs = 2000;
     bool postRollEnabled = false;
     int postRollMs = 2000;
+    // Metronome: click level in dB, whether the downbeat is accented, and
+    // whether it clicks only while recording (silent on plain playback).
+    int metronomeGainDb = -6;
+    bool metronomeAccent = true;
+    bool metronomeOnlyWhenRecording = false;
+    // How much louder the accented downbeat is, in dB.
+    int metronomeAccentDb = 6;
+    // 0 = Beep (sine ping), 1 = Wood (short block), 2 = Click (tick).
+    int metronomeSound = 0;
+    // A softer tick on the off-eighths between beats.
+    bool metronomeEighths = false;
+    // Bars of click before a punch from a standing start; 0 = none.
+    int metronomeCountInBars = 0;
 
     bool operator==(const EditorPreferences&) const = default;
 };

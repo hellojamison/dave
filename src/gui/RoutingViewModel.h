@@ -29,6 +29,13 @@ struct RoutingRequest {
         RemoveSend,
         AddBus,
         RemoveBus,
+        // Additional outputs beside the main route; `route` names which.
+        AddOutput,
+        RemoveOutput,
+        // Make a fresh internal bus and point a new send / extra output at
+        // it in one go — the "+ New bus…" entry in the target pickers.
+        AddBusAndSend,
+        AddBusAndOutput,
     };
     Kind kind = Kind::SetMainOutput;
     std::string ownerId;

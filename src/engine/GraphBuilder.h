@@ -8,6 +8,7 @@
 #include "engine/nodes/GainNode.h"
 #include "engine/nodes/InstrumentNode.h"
 #include "engine/nodes/MetronomeNode.h"
+#include "engine/nodes/SineSynthNode.h"
 #include "engine/nodes/RoutingNodes.h"
 #include "engine/nodes/SummingNode.h"
 #include "engine/plugins/PluginInstance.h"

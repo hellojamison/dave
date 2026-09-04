@@ -20,6 +20,17 @@ using dave::application::punchClipRange;
 TEST_CASE("a punch takes the slice of the capture under it", "[punch]") {
     // Capture ran from sample 1000 for 10,000 frames; Record was pressed at
     // 3000 and again at 5000.
+    // A loop-record pass: the capture ran through one 4000-frame loop
+    // before this punch, so the same timeline span sits 4000 frames further
+    // into the file — the region lands where the punch was, at 3000.
+    PunchRange looped{3000, 5000};
+    looped.captureShift = 4000;
+    const auto pass2 = punchClipRange(1000, 10000, looped, 0);
+    CHECK(pass2.timelineStart == 3000);
+    CHECK(pass2.sourceOffset == 6000);
+    CHECK(pass2.length == 2000);
+    CHECK_FALSE(pass2.clampedToCapture);
+
     const auto range = punchClipRange(1000, 10000, PunchRange{3000, 5000}, 0);
     CHECK(range.timelineStart == 3000);
     // 2000 frames into the file, which is where 3000 falls in a capture that

@@ -44,6 +44,13 @@ TEST_CASE("editor preferences default safely and round trip globally",
     preferences.preRollMs = 1500;
     preferences.postRollEnabled = true;
     preferences.postRollMs = 3000;
+    preferences.metronomeGainDb = -12;
+    preferences.metronomeAccent = false;
+    preferences.metronomeOnlyWhenRecording = true;
+    preferences.metronomeAccentDb = 9;
+    preferences.metronomeSound = 2;
+    preferences.metronomeEighths = true;
+    preferences.metronomeCountInBars = 2;
     REQUIRE(store.save(preferences));
     REQUIRE(store.load() == preferences);
 }

@@ -154,6 +154,44 @@ TEST_CASE("moving a group moves every member by the same amount",
     CHECK(f.startOf(f.trackB, f.b2) == 96000);
 }
 
+TEST_CASE("dragging a group onto another track moves every member a row",
+          "[clipgroups]") {
+    // A group spanning A and B dropped one row down lands on B and C: each
+    // member shifts the same number of rows, keeping the group's shape, and
+    // the clips keep their ids so undo and the selection still find them.
+    Fixture f;
+    const std::string trackC = f.edit.addTrack("C");
+    const std::string id = f.edit.addClipGroup(
+        {{f.trackA, f.a1, false}, {f.trackB, f.b2, false}}, 0, 200000,
+        {f.trackA, f.trackB});
+    REQUIRE_FALSE(id.empty());
+
+    f.undo.execute(
+        std::make_unique<editing::MoveClipGroupCommand>(id, 24000, 1));
+    CHECK(f.edit.clip(f.trackA, f.a1) == nullptr);
+    CHECK(f.startOf(f.trackB, f.a1) == 24000);
+    CHECK(f.startOf(trackC, f.b2) == 120000);
+    const auto* group = f.edit.clipGroup(id);
+    REQUIRE(group != nullptr);
+    CHECK(group->coversTrack(f.trackB));
+    CHECK(group->coversTrack(trackC));
+    CHECK_FALSE(group->coversTrack(f.trackA));
+    // The row a member vacated keeps its other clip.
+    CHECK(f.startOf(f.trackA, f.a2) == 96000);
+
+    f.undo.undo();
+    CHECK(f.startOf(f.trackA, f.a1) == 0);
+    CHECK(f.startOf(f.trackB, f.b2) == 96000);
+    CHECK(f.edit.clip(trackC, f.b2) == nullptr);
+
+    // Off the end of the list is refused outright: the time move still
+    // happens, but no member moves rows, so nothing is left half-way.
+    f.undo.execute(
+        std::make_unique<editing::MoveClipGroupCommand>(id, 1000, 5));
+    CHECK(f.startOf(f.trackA, f.a1) == 1000);
+    CHECK(f.startOf(f.trackB, f.b2) == 97000);
+}
+
 TEST_CASE("a group clamps as one thing, keeping its spacing", "[clipgroups]") {
     // Clamping each clip separately would squash the members against zero and
     // lose their spacing, which is the one thing a group exists to keep.

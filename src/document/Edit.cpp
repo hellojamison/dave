@@ -600,6 +600,10 @@ bool Edit::routeReferences(RouteTarget::Kind kind, const std::string& id) const 
     };
     const auto channelReferences = [&](const auto& channel) {
         if (references(channel.mainOutput)) return true;
+        if (std::any_of(channel.extraOutputs.begin(), channel.extraOutputs.end(),
+                        references)) {
+            return true;
+        }
         return std::any_of(channel.sends.begin(), channel.sends.end(),
                            [&](const AuxSend& send) { return references(send.target); });
     };
@@ -667,6 +671,13 @@ Edit::RoutingValidation Edit::validateRouting() const {
         const bool isMain = channel.id == kMainBusId;
         auto result = checkTarget(channel.id, channel.mainOutput, isMain);
         if (!result.ok) return result;
+        for (const auto& extra : channel.extraOutputs) {
+            if (extra.kind == RouteTarget::Kind::None) {
+                return {false, "an additional output must go somewhere"};
+            }
+            result = checkTarget(channel.id, extra, isMain);
+            if (!result.ok) return result;
+        }
         std::unordered_set<std::string> sendIds;
         for (const auto& send : channel.sends) {
             if (send.id.empty() || !sendIds.insert(send.id).second) {
@@ -719,6 +730,34 @@ Edit::RoutingValidation Edit::validateSendTarget(
     send.target = target;
     list->push_back(std::move(send));
     return candidate.validateRouting();
+}
+
+bool Edit::addOutput(const std::string& ownerId, RouteTarget target) {
+    Track* owner = track(ownerId);
+    if (owner == nullptr) return false;
+    // The same destination twice would just double the signal into it.
+    if (owner->mainOutput == target) return false;
+    for (const auto& extra : owner->extraOutputs) {
+        if (extra == target) return false;
+    }
+    owner->extraOutputs.push_back(std::move(target));
+    if (!validateRouting().ok) {
+        owner->extraOutputs.pop_back();
+        return false;
+    }
+    notifyChanged();
+    return true;
+}
+
+bool Edit::removeOutput(const std::string& ownerId, const RouteTarget& target) {
+    Track* owner = track(ownerId);
+    if (owner == nullptr) return false;
+    auto& extras = owner->extraOutputs;
+    const auto it = std::find(extras.begin(), extras.end(), target);
+    if (it == extras.end()) return false;
+    extras.erase(it);
+    notifyChanged();
+    return true;
 }
 
 bool Edit::setMainOutput(const std::string& ownerId, RouteTarget target) {
@@ -1046,6 +1085,86 @@ void Edit::shiftClipGroup_(const std::string& groupId, int64_t delta) {
         }
     }
     for (const auto& childId : children) shiftClipGroup_(childId, delta);
+}
+
+int Edit::trackIndexOf_(const std::string& trackId) const {
+    for (size_t i = 0; i < tracks_.size(); ++i) {
+        if (tracks_[i].id == trackId) return static_cast<int>(i);
+    }
+    return -1;
+}
+
+bool Edit::moveClipGroupTracks(const std::string& groupId, int rowDelta) {
+    if (rowDelta == 0 || clipGroup(groupId) == nullptr) return false;
+    if (!clipGroupTracksFit_(groupId, rowDelta)) return false;
+    shiftClipGroupTracks_(groupId, rowDelta);
+    notifyChanged();
+    return true;
+}
+
+// Every track the group touches — its own rows, its members' and its nested
+// groups' — has to have a row to land on. Checked before anything moves so a
+// refusal leaves the document untouched.
+bool Edit::clipGroupTracksFit_(const std::string& groupId,
+                               int rowDelta) const {
+    const auto* group = clipGroup(groupId);
+    if (group == nullptr) return false;
+    const int count = static_cast<int>(tracks_.size());
+    auto fits = [&](const std::string& trackId) {
+        const int at = trackIndexOf_(trackId);
+        if (at < 0) return false;
+        const int to = at + rowDelta;
+        return to >= 0 && to < count;
+    };
+    for (const auto& trackId : group->trackIds) {
+        if (!fits(trackId)) return false;
+    }
+    for (const auto& member : group->members) {
+        if (!fits(member.trackId)) return false;
+    }
+    for (const auto& childId : group->childGroupIds) {
+        if (!clipGroupTracksFit_(childId, rowDelta)) return false;
+    }
+    return true;
+}
+
+void Edit::shiftClipGroupTracks_(const std::string& groupId, int rowDelta) {
+    const auto it = std::find_if(clipGroups_.begin(), clipGroups_.end(),
+                                 [&](const ClipGroup& g) {
+                                     return g.id == groupId;
+                                 });
+    if (it == clipGroups_.end()) return;
+    auto shifted = [&](const std::string& trackId) -> std::string {
+        const int at = trackIndexOf_(trackId);
+        return tracks_[static_cast<size_t>(at + rowDelta)].id;
+    };
+    for (auto& trackId : it->trackIds) trackId = shifted(trackId);
+    for (auto& member : it->members) {
+        const std::string to = shifted(member.trackId);
+        auto* from = track(member.trackId);
+        auto* dest = track(to);
+        if (from == nullptr || dest == nullptr) continue;
+        // Lift the clip out of one track's vector and append it to the
+        // other's, id and all — a move, not a re-add, so nothing re-mints.
+        if (member.midi) {
+            auto& v = from->midiClips;
+            const auto c = std::find_if(v.begin(), v.end(),
+                [&](const MidiClip& m) { return m.id == member.clipId; });
+            if (c == v.end()) continue;
+            dest->midiClips.push_back(std::move(*c));
+            v.erase(c);
+        } else {
+            auto& v = from->clips;
+            const auto c = std::find_if(v.begin(), v.end(),
+                [&](const AudioClip& a) { return a.id == member.clipId; });
+            if (c == v.end()) continue;
+            dest->clips.push_back(std::move(*c));
+            v.erase(c);
+        }
+        member.trackId = to;
+    }
+    const auto children = it->childGroupIds;
+    for (const auto& childId : children) shiftClipGroupTracks_(childId, rowDelta);
 }
 
 bool Edit::restoreClipGroup_(ClipGroup group, size_t index) {

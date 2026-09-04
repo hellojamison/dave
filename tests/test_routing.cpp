@@ -189,6 +189,39 @@ TEST_CASE("bus and send commands preserve stable ids across undo redo",
     CHECK(edit.track(track)->sends[0].id == sendId);
 }
 
+TEST_CASE("a track can feed more than one output", "[routing][document]") {
+    // An extra output is a second post-fader destination: it rides the same
+    // validation as the main route (no self-routes, no cycles, no dangling
+    // targets), survives a save/load, and pins a track it points at.
+    document::Edit edit;
+    const std::string a = edit.addTrack("A");
+    const std::string cue = edit.addTrack("Cue");
+
+    editing::UndoStack undo{edit};
+    undo.execute(std::make_unique<editing::AddOutputCommand>(
+        a, document::RouteTarget::bus(cue)));
+    REQUIRE(edit.track(a)->extraOutputs.size() == 1);
+    // The same destination twice is refused, as is the main route itself.
+    CHECK_FALSE(edit.addOutput(a, document::RouteTarget::bus(cue)));
+    CHECK_FALSE(edit.addOutput(a, edit.track(a)->mainOutput));
+    // A self-route is refused and leaves nothing behind.
+    CHECK_FALSE(edit.addOutput(a, document::RouteTarget::bus(a)));
+    CHECK(edit.track(a)->extraOutputs.size() == 1);
+    // The cue track is now referenced, so it cannot be removed.
+    CHECK_FALSE(edit.removeTrack(cue));
+
+    const std::string text = document::serializeEdit(edit);
+    document::Edit loaded;
+    REQUIRE(document::deserializeEdit(text, loaded).ok);
+    REQUIRE(loaded.track(a) != nullptr);
+    CHECK(loaded.track(a)->extraOutputs ==
+          std::vector<document::RouteTarget>{document::RouteTarget::bus(cue)});
+
+    undo.undo();
+    CHECK(edit.track(a)->extraOutputs.empty());
+    CHECK(edit.removeTrack(cue));
+}
+
 TEST_CASE("Main refuses software routes and sends", "[routing][document]") {
     document::Edit edit;
     const auto track = edit.addTrack("A");

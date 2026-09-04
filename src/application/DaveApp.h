@@ -85,6 +85,9 @@ private:
     // Parse a .mid and push one ImportMidiFileCommand for the whole file.
     // Returns false (and logs) if the file isn't readable as an SMF.
     bool importMidiFile(const std::string& path);
+    int64_t countOffStart(int64_t at) const;
+    bool importMidiOntoTrack(const std::string& path,
+                             const std::string& trackId, int64_t at);
     void importMarkersDialog();
     void exportMarkersDialog();
     void openVideoDialog();
@@ -120,9 +123,22 @@ private:
     // selection). -1 means no stop point is armed.
     void servicePostRoll();
     int64_t playStopAt_ = -1;
+    // Count-in: the click is forced on until the transport reaches this
+    // sample (the position Record was pressed at), then reverts to the
+    // toggle. -1 = no count-in in progress.
+    int64_t countInUntil_ = -1;
+    // Last frame's transport position, for spotting a loop wrap while
+    // recording (the position jumps back to the loop start).
+    int64_t lastTransportPosition_ = 0;
     // Metronome on/off (session state); applied to the graph's node each frame
     // so it survives rebuilds without a rebuild of its own.
     bool metronomeEnabled_ = false;
+    // Pre/post-roll fields in the Roll popup: typed in the timeline's time
+    // format, seeded from the ms setting unless being edited.
+    char preRollInput_[32] = {};
+    char postRollInput_[32] = {};
+    bool editingPreRoll_ = false;
+    bool editingPostRoll_ = false;
     // A capture is running — the engine is writing to disk, so routing
     // topology is frozen even when nothing is being kept.
     bool capturing() const { return recordingSession_ != nullptr; }
@@ -168,6 +184,10 @@ private:
         // transport rolled over armed tracks without anyone pressing Record,
         // which writes a file and commits nothing.
         std::vector<application::PunchRange> punches;
+        // Loop recording: how far the capture has run past the timeline, one
+        // loop length per completed pass. New punches carry it as their
+        // captureShift.
+        int64_t loopCaptureShift = 0;
     };
     std::unique_ptr<RecordingSession> recordingSession_;
     // Capture follows the transport, so the frame loop watches for the edge

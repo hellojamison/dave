@@ -383,12 +383,17 @@ void drawChannelStrip(document::Edit& edit,
     if (ImGui::BeginPopup("##sendTargetPicker")) {
         const auto options =
             routingTargetOptions(edit, ownerId, playbackChannels, true);
-        for (const auto& option : options) {
+        // Two destinations can share a name (a track and a bus both called
+        // "Track 1"), so each row gets an id of its own.
+        for (size_t i = 0; i < options.size(); ++i) {
+            const auto& option = options[i];
+            ImGui::PushID(static_cast<int>(i));
             if (!option.enabled) {
                 ImGui::TextDisabled("%s", option.label.c_str());
                 if (ImGui::IsItemHovered()) {
                     ImGui::SetTooltip("%s", option.disabledReason.c_str());
                 }
+                ImGui::PopID();
                 continue;
             }
             if (ImGui::Selectable(option.label.c_str())) {
@@ -401,6 +406,20 @@ void drawChannelStrip(document::Edit& edit,
                 view.routing.request(std::move(request));
                 ImGui::CloseCurrentPopup();
             }
+            ImGui::PopID();
+        }
+        // A send to somewhere that does not exist yet: make the bus here
+        // rather than sending the user off to create it first.
+        ImGui::Separator();
+        if (ImGui::Selectable("+ New bus\xe2\x80\xa6")) {
+            RoutingRequest request;
+            request.kind = RoutingRequest::Kind::AddBusAndSend;
+            request.ownerId = ownerId;
+            view.routing.request(std::move(request));
+            ImGui::CloseCurrentPopup();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Create an internal bus and send to it");
         }
         ImGui::EndPopup();
     }
@@ -501,23 +520,36 @@ void drawChannelStrip(document::Edit& edit,
                 // Target picker stays compact — the level fader is the wide
                 // element on the row, not the destination label.
                 const float labelWidth = 84.0f;
+                // Pre-fader sends read in the MIDI accent, post-fader in the
+                // main accent, so the tap is visible without reading the
+                // chain order.
+                const bool preFader = document::sendIsPreFader(track, send.id);
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                                      preFader ? pal.clipMidiBorder
+                                               : pal.accentStrong);
                 if (ImGui::Button(rowLabel.c_str(),
                                   ImVec2(labelWidth, kRowHeight))) {
                     if (!strip.draggingChain()) ImGui::OpenPopup("##sendRetarget");
                 }
+                ImGui::PopStyleColor();
                 if (ImGui::IsItemActive() &&
                     ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
                     strip.draggingChainRow = static_cast<int>(row);
                 }
                 if (ImGui::IsItemHovered()) {
                     ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-                    ImGui::SetTooltip("Send — click to retarget, drag to move "
-                                      "it through the chain");
+                    ImGui::SetTooltip(preFader
+                        ? "Pre-fader send — click to retarget, drag to move "
+                          "it through the chain"
+                        : "Post-fader send — click to retarget, drag to move "
+                          "it through the chain");
                 }
                 if (ImGui::BeginPopup("##sendRetarget")) {
                     const auto options = routingTargetOptions(
                         edit, ownerId, playbackChannels, true);
-                    for (const auto& option : options) {
+                    for (size_t i = 0; i < options.size(); ++i) {
+                        const auto& option = options[i];
+                        ImGui::PushID(static_cast<int>(i));
                         if (ImGui::Selectable(option.label.c_str(),
                                               send.target == option.target,
                                               option.enabled
@@ -527,6 +559,7 @@ void drawChannelStrip(document::Edit& edit,
                             updatedSend = send;
                             sendChanged = true;
                         }
+                        ImGui::PopID();
                     }
                     ImGui::EndPopup();
                 }
@@ -548,8 +581,10 @@ void drawChannelStrip(document::Edit& edit,
                     sendChanged = true;
                 }
                 ImGui::PopStyleVar();
+                // Option-click puts the send at unity, the same reset every
+                // other fader has.
                 if (theme::altClickedReset()) {
-                    send.gain = dbToGain(-60.0);
+                    send.gain = dbToGain(0.0);
                     updatedSend = send;
                     sendChanged = true;
                 }
@@ -778,7 +813,10 @@ void drawChannelStrip(document::Edit& edit,
         constexpr float bottomPad = 10.0f;
         const float outputHeight =
             ImGui::GetTextLineHeightWithSpacing() +   // the OUTPUT label
-            ImGui::GetFrameHeightWithSpacing();       // the combo
+            ImGui::GetFrameHeightWithSpacing() +      // the combo
+            // one row per extra output, plus the "+ Output" row
+            ImGui::GetFrameHeightWithSpacing() *
+                static_cast<float>(track.extraOutputs.size() + 1);
         // Leave a little air beneath the combo instead of pressing it against
         // the panel's bottom edge.
         const float spare =
@@ -792,7 +830,9 @@ void drawChannelStrip(document::Edit& edit,
     if (ImGui::BeginCombo("##mainOutput", route.c_str())) {
         const auto options =
             routingTargetOptions(edit, ownerId, playbackChannels, false);
-        for (const auto& option : options) {
+        for (size_t i = 0; i < options.size(); ++i) {
+            const auto& option = options[i];
+            ImGui::PushID(static_cast<int>(i));
             if (ImGui::Selectable(option.label.c_str(),
                                   track.mainOutput == option.target,
                                   option.enabled ? ImGuiSelectableFlags_None
@@ -807,8 +847,81 @@ void drawChannelStrip(document::Edit& edit,
                 ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
                 ImGui::SetTooltip("%s", option.disabledReason.c_str());
             }
+            ImGui::PopID();
         }
         ImGui::EndCombo();
+    }
+    // Additional outputs: the same post-fader signal to more places. Each
+    // has a remove button; "+ Output" picks a destination the way "+ Send"
+    // does, so a track can feed Main and a cue mix at once.
+    if (!track.isMain) {
+        for (size_t i = 0; i < track.extraOutputs.size(); ++i) {
+            const auto& extra = track.extraOutputs[i];
+            ImGui::PushID(static_cast<int>(i) + 1000);
+            const std::string label =
+                "+ " + routeTargetLabel(edit, extra, playbackChannels);
+            ImGui::PushStyleColor(ImGuiCol_Text, pal.textMuted);
+            ImGui::Button(label.c_str(),
+                          ImVec2(fullWidth - kRemoveWidth - kGutter, kRowHeight));
+            ImGui::PopStyleColor();
+            ImGui::SameLine(0.0f, kGutter);
+            if (ImGui::Button("\xc3\x97", ImVec2(kRemoveWidth, kRowHeight))) {
+                RoutingRequest request;
+                request.kind = RoutingRequest::Kind::RemoveOutput;
+                request.ownerId = ownerId;
+                request.route = extra;
+                view.routing.request(std::move(request));
+            }
+            ImGui::PopID();
+        }
+        ImGui::PushStyleColor(ImGuiCol_Text, pal.textSubtle);
+        if (ImGui::Button("+ Output", ImVec2(fullWidth, kRowHeight))) {
+            ImGui::OpenPopup("##extraOutputPicker");
+        }
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Send this track's output somewhere else as well");
+        }
+        if (ImGui::BeginPopup("##extraOutputPicker")) {
+            const auto options =
+                routingTargetOptions(edit, ownerId, playbackChannels, false);
+            for (size_t i = 0; i < options.size(); ++i) {
+                const auto& option = options[i];
+                ImGui::PushID(static_cast<int>(i));
+                const bool already = option.target == track.mainOutput ||
+                    std::find(track.extraOutputs.begin(),
+                              track.extraOutputs.end(),
+                              option.target) != track.extraOutputs.end();
+                if (!option.enabled || already) {
+                    ImGui::TextDisabled("%s", option.label.c_str());
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("%s", already
+                            ? "Already one of this track's outputs"
+                            : option.disabledReason.c_str());
+                    }
+                } else if (ImGui::Selectable(option.label.c_str())) {
+                    RoutingRequest request;
+                    request.kind = RoutingRequest::Kind::AddOutput;
+                    request.ownerId = ownerId;
+                    request.route = option.target;
+                    view.routing.request(std::move(request));
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::PopID();
+            }
+            ImGui::Separator();
+            if (ImGui::Selectable("+ New bus\xe2\x80\xa6")) {
+                RoutingRequest request;
+                request.kind = RoutingRequest::Kind::AddBusAndOutput;
+                request.ownerId = ownerId;
+                view.routing.request(std::move(request));
+                ImGui::CloseCurrentPopup();
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Create an internal bus and route to it");
+            }
+            ImGui::EndPopup();
+        }
     }
 
     ImGui::EndDisabled();

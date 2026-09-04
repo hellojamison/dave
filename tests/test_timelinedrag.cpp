@@ -565,6 +565,46 @@ TEST_CASE("holding Command selects a range instead of grabbing a clip",
     CHECK(rig.view.selectionStart != rig.view.selectionEnd);
 }
 
+TEST_CASE("shift-clicking the lane selects from the playhead to the click",
+          "[timelinedrag][selection]") {
+    // The playhead is the anchor: a Shift-click marks everything between it
+    // and the click and leaves the playhead where it was, the way a
+    // shift-click extends from the cursor in any editor.
+    TimelineRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string t = rig.edit.addTrack("Audio");
+    rig.edit.addClip(t, [] {
+        document::AudioClip c;
+        c.timelineStart = 0;
+        c.length = 48000;
+        return c;
+    }());
+    const float probeX = rig.xOfSample(24000);
+    const float rowY =
+        rig.findRowY(probeX, gui::TimelineViewState::DragKind::AudioClip);
+    REQUIRE(rowY > 0.0f);
+    rig.tick(-100.0f, -100.0f, false);
+    rig.tick(-100.0f, -100.0f, false);
+    rig.view.dragKind = gui::TimelineViewState::DragKind::None;
+    rig.view.hasSelection = false;
+
+    rig.transport.seek(96000);
+    REQUIRE(rig.committedPosition() == 96000);
+    // Empty lane, well past the clip.
+    const float clickX = rig.xOfSample(200000);
+    ImGui::GetIO().AddKeyEvent(ImGuiMod_Shift, true);
+    rig.tick(clickX, rowY, false);
+    rig.tick(clickX, rowY, true);
+    rig.tick(clickX, rowY, false);
+    ImGui::GetIO().AddKeyEvent(ImGuiMod_Shift, false);
+
+    CHECK(rig.view.hasSelection);
+    CHECK(std::min(rig.view.selectionStart, rig.view.selectionEnd) == 96000);
+    CHECK(std::max(rig.view.selectionStart, rig.view.selectionEnd) == 200000);
+    // The playhead stayed put.
+    CHECK(rig.committedPosition() == 96000);
+}
+
 TEST_CASE("a clip drags from one track onto another", "[timelinedrag]") {
     // Cross-track drag: grab a clip on the first track and release it over the
     // second, and it should belong to the second track afterwards.

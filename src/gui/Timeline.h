@@ -68,10 +68,10 @@ enum class TimecodeMode {
 
 enum class AutomationParameter { Volume, Pan };
 enum class AutomationTool { Pencil, Line, Curve, Eraser };
-// What the expanded lane beneath a track shows. Automation defers to
-// automationParameters for which envelope (Volume/Pan); Sends and Inserts list
-// the track's chain entries instead.
-enum class LaneMode { Automation, Sends, Inserts };
+// What the expanded lane beneath a track shows. Only automation: the lane is
+// for envelopes (Volume/Pan, per automationParameters); sends and inserts are
+// assigned in the track head instead, which grows to reveal them.
+enum class LaneMode { Automation };
 
 std::string formatAutomationDrawValue(AutomationParameter parameter,
                                       double value);
@@ -263,10 +263,6 @@ struct TimelineViewState {
     // channel reveals one parameter-selectable automation lane below its row.
     std::unordered_set<std::string> expandedTracks;
     std::unordered_map<std::string, AutomationParameter> automationParameters;
-    // The lanes an expanded track shows, top to bottom. Absent or empty means
-    // one Automation lane. At most one Automation lane per track (its edit
-    // state is keyed by track); Sends and Inserts lanes can be added freely.
-    std::unordered_map<std::string, std::vector<LaneMode>> trackLanes;
     // Automation editing tools are global like the pointer tools in a DAW,
     // even though their compact toggle is repeated inside each open lane.
     AutomationTool automationTool = AutomationTool::Pencil;

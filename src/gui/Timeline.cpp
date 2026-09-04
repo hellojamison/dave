@@ -942,23 +942,13 @@ void drawTimeline(const document::Edit& edit,
     // selection, drag and command in the timeline indexes tracks by their
     // position in the document; compacting the table here would silently
     // renumber all of them the moment a track was hidden.
-    // The lanes an open track shows, top to bottom. An open track with no
-    // explicit list shows one Automation lane, the way it always has.
+    // The lanes an open track shows, top to bottom: one automation lane.
     auto lanesOf = [&](const std::string& id) -> std::vector<LaneMode> {
         if (!view.expandedTracks.contains(id)) return {};
-        const auto it = view.trackLanes.find(id);
-        if (it == view.trackLanes.end() || it->second.empty()) {
-            return {LaneMode::Automation};
-        }
-        return it->second;
+        return {LaneMode::Automation};
     };
-    // Sends and Inserts lanes grow with their lists: a header row, one row
-    // per entry (at least one, for the empty message) and an add row.
-    auto laneHeightFor = [&](const document::Track& t, LaneMode mode) -> float {
-        if (mode == LaneMode::Automation) return automationLaneHeight;
-        const size_t n = mode == LaneMode::Sends ? t.sends.size()
-                                                 : t.plugins.size();
-        return 30.0f + 24.0f * static_cast<float>(std::max<size_t>(1, n)) + 28.0f;
+    auto laneHeightFor = [&](const document::Track&, LaneMode) -> float {
+        return automationLaneHeight;
     };
     auto lanesHeightOf = [&](const document::Track& t) -> float {
         float h = 0.0f;
@@ -1437,74 +1427,28 @@ void drawTimeline(const document::Edit& edit,
     // parameter (Volume/Pan) and the higher-level lane mode (Sends/Inserts),
     // because they are mutually exclusive views of the same lane and a second
     // control would not fit beside the automation tools.
-    // `laneIndex` is which of the track's lanes this header belongs to; -1
-    // means "the Automation lane, wherever it sits" (the automation renderer
-    // does not know its own index). Below the combo: "+" adds a lane, "×"
-    // removes this one when there is more than one.
-    auto drawLaneModeCombo = [&](const std::string& ownerId, float top,
-                                 int laneIndex = -1) {
-        std::vector<LaneMode> lanes = lanesOf(ownerId);
-        if (lanes.empty()) lanes = {LaneMode::Automation};
-        if (laneIndex < 0) {
-            laneIndex = 0;
-            for (size_t i = 0; i < lanes.size(); ++i) {
-                if (lanes[i] == LaneMode::Automation) {
-                    laneIndex = static_cast<int>(i);
-                    break;
-                }
-            }
-        }
-        if (laneIndex >= static_cast<int>(lanes.size())) return;
-        const LaneMode mode = lanes[static_cast<size_t>(laneIndex)];
-        bool otherAutomation = false;
-        for (size_t i = 0; i < lanes.size(); ++i) {
-            if (static_cast<int>(i) != laneIndex &&
-                lanes[i] == LaneMode::Automation) {
-                otherAutomation = true;
-            }
-        }
+    // The automation lane's parameter picker: which envelope the lane shows.
+    auto drawLaneModeCombo = [&](const std::string& ownerId, float top) {
         const AutomationParameter parameter =
             view.automationParameters.count(ownerId)
                 ? view.automationParameters[ownerId]
                 : AutomationParameter::Volume;
         const char* label =
-            mode == LaneMode::Sends      ? "Sends"
-            : mode == LaneMode::Inserts  ? "Inserts"
-            : parameter == AutomationParameter::Pan ? "Pan"
-                                                    : "Volume";
+            parameter == AutomationParameter::Pan ? "Pan" : "Volume";
         const ImVec2 savedCursor = ImGui::GetCursorScreenPos();
         ImGui::SetCursorScreenPos(
             ImVec2(origin.x + kGutterContentX - 4.0f, top + 5.0f));
         ImGui::PushID(ownerId.c_str());
-        ImGui::PushID(laneIndex);
         ImGui::SetNextItemWidth(90.0f);
         if (ImGui::BeginCombo("##laneMode", label,
                               ImGuiComboFlags_HeightSmall)) {
-            struct Entry { const char* name; LaneMode mode;
-                           AutomationParameter param; };
-            const Entry entries[] = {
-                {"Volume", LaneMode::Automation, AutomationParameter::Volume},
-                {"Pan", LaneMode::Automation, AutomationParameter::Pan},
-                {"Sends", LaneMode::Sends, AutomationParameter::Volume},
-                {"Inserts", LaneMode::Inserts, AutomationParameter::Volume},
-            };
-            for (const auto& entry : entries) {
-                const bool selected =
-                    entry.mode == mode &&
-                    (entry.mode != LaneMode::Automation ||
-                     entry.param == parameter);
-                // One automation lane per track: its drag/edit state is
-                // keyed by the track, so a second would fight the first.
-                const bool blocked =
-                    entry.mode == LaneMode::Automation && otherAutomation;
-                if (ImGui::Selectable(entry.name, selected,
-                                      blocked ? ImGuiSelectableFlags_Disabled
-                                              : ImGuiSelectableFlags_None)) {
-                    lanes[static_cast<size_t>(laneIndex)] = entry.mode;
-                    view.trackLanes[ownerId] = lanes;
-                    if (entry.mode == LaneMode::Automation) {
-                        view.automationParameters[ownerId] = entry.param;
-                    }
+            for (const auto choice : {AutomationParameter::Volume,
+                                      AutomationParameter::Pan}) {
+                const bool selected = choice == parameter;
+                if (ImGui::Selectable(
+                        choice == AutomationParameter::Volume ? "Volume" : "Pan",
+                        selected)) {
+                    view.automationParameters[ownerId] = choice;
                     cancelAutomationGesture(ownerId);
                     automationConsumedClick = true;
                 }
@@ -1512,42 +1456,9 @@ void drawTimeline(const document::Edit& edit,
             }
             ImGui::EndCombo();
         }
-        bool hovered = ImGui::IsItemHovered();
-        if (hovered) ImGui::SetTooltip("Lane content");
-
-        // Add / remove lane, tucked under the combo in the gutter.
-        const ImVec2 small(20.0f, 18.0f);
-        ImGui::SetCursorScreenPos(
-            ImVec2(origin.x + kGutterContentX - 4.0f, top + 31.0f));
-        if (ImGui::Button("+", small)) {
-            // The first kind this track does not show yet, Sends first.
-            LaneMode next = LaneMode::Sends;
-            auto has = [&](LaneMode m) {
-                return std::find(lanes.begin(), lanes.end(), m) != lanes.end();
-            };
-            if (has(LaneMode::Sends)) next = LaneMode::Inserts;
-            if (has(LaneMode::Sends) && has(LaneMode::Inserts)) {
-                next = LaneMode::Sends;
-            }
-            lanes.insert(lanes.begin() + laneIndex + 1, next);
-            view.trackLanes[ownerId] = lanes;
-            automationConsumedClick = true;
-        }
-        hovered = hovered || ImGui::IsItemHovered();
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Add a lane below");
-        if (lanes.size() > 1) {
-            ImGui::SameLine(0.0f, 2.0f);
-            if (ImGui::Button("\xc3\x97", small)) {
-                if (mode == LaneMode::Automation) cancelAutomationGesture(ownerId);
-                lanes.erase(lanes.begin() + laneIndex);
-                view.trackLanes[ownerId] = lanes;
-                automationConsumedClick = true;
-            }
-            hovered = hovered || ImGui::IsItemHovered();
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Remove this lane");
-        }
+        const bool hovered = ImGui::IsItemHovered();
+        if (hovered) ImGui::SetTooltip("Automation parameter");
         automationMouseOver = automationMouseOver || hovered;
-        ImGui::PopID();
         ImGui::PopID();
         ImGui::SetCursorScreenPos(savedCursor);
     };
@@ -2385,157 +2296,166 @@ void drawTimeline(const document::Edit& edit,
         drawAutomationLane(ownerId, normalized, top, parameter);
     };
 
-    // Sends / Inserts lane: the track's chain entries as live controls, with
-    // the lane-mode combo (and add/remove lane) in the gutter. A send row is
-    // target · level · mute · remove; an insert row is name · bypass ·
-    // remove; each lane ends in an add button. The same requests and
-    // commands the channel strip issues, so the two never disagree.
-    auto drawChainLane = [&](const document::Track& track, float top,
-                             LaneMode mode, int laneIndex) {
-        const float bottom = top + laneHeightFor(track, mode);
-        const float laneLeft = origin.x + gutterWidth;
-        const float laneRight = origin.x + totalWidth;
-        dl->AddRectFilled(ImVec2(origin.x, top),
-                          ImVec2(laneLeft, bottom), C(pal.surfaceBase));
-        dl->AddRectFilled(ImVec2(laneLeft, top),
-                          ImVec2(laneRight, bottom), C(pal.trackLaneAlt));
-        dl->AddLine(ImVec2(origin.x, top), ImVec2(laneRight, top),
-                    C(pal.border));
-        dl->AddLine(ImVec2(origin.x, bottom), ImVec2(laneRight, bottom),
-                    C(pal.border));
-        drawLaneModeCombo(track.id, top, laneIndex);
-
-        // The whole lane body is a control surface: a press here must never
-        // start a range selection or seek underneath the widgets.
-        if (mouse.x >= laneLeft && mouse.x <= laneRight && mouse.y >= top &&
-            mouse.y <= bottom) {
-            automationMouseOver = true;
-        }
+    // Sends and inserts in the track head. Rows are compact — target · level
+    // · mute · × for a send, name · bypass · × for an insert — and only as
+    // many as fit between the pan row and the row's bottom, then an add row.
+    // A track at its default height shows none; making it taller reveals
+    // them, so the head grows into a small channel strip on demand. The same
+    // requests and commands the strip issues, so the two never disagree.
+    auto drawHeadChain = [&](const document::Track& track, float top,
+                             float bottom) {
+        constexpr float rowH = 22.0f;
+        constexpr float ctrlH = 18.0f;
+        constexpr int kAssumedPlaybackChannels = 2;
+        const float x0 = origin.x + kGutterContentX;
+        const float wide = gutterWidth - kGutterContentX - 12.0f;
+        float rowY = top + 2.0f;
+        auto fits = [&] { return rowY + ctrlH <= bottom; };
+        if (!fits()) return;
 
         const ImVec2 savedCursor = ImGui::GetCursorScreenPos();
-        const float x0 = laneLeft + 10.0f;
-        float rowY = top + 6.0f;
-        constexpr float rowH = 24.0f;
-        constexpr float ctrlH = 20.0f;
-        const ImU32 mutedCol = C(pal.textMuted);
-        // Only the hardware "(unavailable)" suffix depends on the playback
-        // channel count, which the timeline does not know; two is the common
-        // case and the labels are otherwise identical.
-        constexpr int kAssumedPlaybackChannels = 2;
-        std::string idScope = track.id + "#lane" + std::to_string(laneIndex);
-        ImGui::PushID(idScope.c_str());
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.0f, 2.0f));
+        ImGui::PushID((track.id + "#head").c_str());
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(5.0f, 1.0f));
 
-        if (mode == LaneMode::Sends) {
-            if (track.sends.empty()) {
-                dl->AddText(ImVec2(x0, rowY + 3.0f), mutedCol, "No sends");
-                rowY += rowH;
-            }
-            for (size_t si = 0; si < track.sends.size(); ++si) {
-                const auto& send = track.sends[si];
-                ImGui::PushID(static_cast<int>(si));
-                const bool preFader = document::sendIsPreFader(track, send.id);
-                const ImVec4 tapCol = preFader ? pal.clipMidiBorder
-                                               : pal.accentStrong;
-                dl->AddRectFilled(ImVec2(x0 - 6.0f, rowY + 3.0f),
-                                  ImVec2(x0 - 3.0f, rowY + ctrlH - 3.0f),
-                                  C(tapCol));
-                // Target: click to retarget.
-                const std::string label = "\xe2\x86\x92 " +
-                    routeTargetLabel(edit, send.target,
-                                     kAssumedPlaybackChannels);
-                ImGui::SetCursorScreenPos(ImVec2(x0, rowY));
-                ImGui::PushStyleColor(ImGuiCol_Text,
-                                      send.muted ? pal.textMuted : tapCol);
-                if (ImGui::Button(label.c_str(), ImVec2(140.0f, ctrlH))) {
-                    ImGui::OpenPopup("##laneRetarget");
-                }
-                ImGui::PopStyleColor();
-                if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip(preFader ? "Pre-fader send — click to "
-                                                 "retarget"
-                                               : "Post-fader send — click to "
-                                                 "retarget");
-                }
-                if (ImGui::BeginPopup("##laneRetarget")) {
-                    const auto options = routingTargetOptions(
-                        edit, track.id, kAssumedPlaybackChannels, true);
-                    for (size_t oi = 0; oi < options.size(); ++oi) {
-                        const auto& option = options[oi];
-                        ImGui::PushID(static_cast<int>(oi));
-                        if (ImGui::Selectable(
-                                option.label.c_str(),
-                                send.target == option.target,
-                                option.enabled
-                                    ? ImGuiSelectableFlags_None
-                                    : ImGuiSelectableFlags_Disabled)) {
-                            RoutingRequest request;
-                            request.kind = RoutingRequest::Kind::UpdateSend;
-                            request.ownerId = track.id;
-                            request.send = send;
-                            request.send.target = option.target;
-                            view.routing.request(std::move(request));
-                        }
-                        ImGui::PopID();
-                    }
-                    ImGui::EndPopup();
-                }
-                // Level: a plain horizontal fader; Option-click puts it at
-                // unity.
-                ImGui::SameLine(0.0f, 6.0f);
-                float db = send.gain <= 0.0001
-                    ? -60.0f
-                    : 20.0f * std::log10(static_cast<float>(send.gain));
-                ImGui::SetNextItemWidth(150.0f);
-                ImGui::PushStyleVar(ImGuiStyleVar_GrabMinSize, 12.0f);
-                const bool dragged =
-                    ImGui::SliderFloat("##lvl", &db, -60.0f, 6.0f, "%.1f dB");
-                ImGui::PopStyleVar();
-                const bool reset = theme::altClickedReset();
-                if (dragged || reset) {
-                    RoutingRequest request;
-                    request.kind = RoutingRequest::Kind::UpdateSend;
-                    request.ownerId = track.id;
-                    request.send = send;
-                    request.send.gain =
-                        reset ? 1.0 : std::pow(10.0, db / 20.0);
-                    view.routing.request(std::move(request));
-                }
-                // Mute and remove.
-                ImGui::SameLine(0.0f, 6.0f);
-                if (send.muted) {
-                    ImGui::PushStyleColor(ImGuiCol_Button, pal.trackMuteActive);
-                    ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(32, 30, 28, 255));
-                }
-                if (ImGui::Button("M", ImVec2(ctrlH, ctrlH))) {
-                    RoutingRequest request;
-                    request.kind = RoutingRequest::Kind::UpdateSend;
-                    request.ownerId = track.id;
-                    request.send = send;
-                    request.send.muted = !send.muted;
-                    view.routing.request(std::move(request));
-                }
-                if (send.muted) ImGui::PopStyleColor(2);
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Mute send");
-                ImGui::SameLine(0.0f, 4.0f);
-                if (ImGui::Button("\xc3\x97", ImVec2(ctrlH, ctrlH))) {
-                    RoutingRequest request;
-                    request.kind = RoutingRequest::Kind::RemoveSend;
-                    request.ownerId = track.id;
-                    request.send.id = send.id;
-                    view.routing.request(std::move(request));
-                }
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Remove send");
-                ImGui::PopID();
-                rowY += rowH;
-            }
-            // Add: pick the destination first, the way the strip does; a bus
-            // that does not exist yet can be made on the spot.
+        // Sends.
+        for (size_t si = 0; si < track.sends.size() && fits(); ++si) {
+            const auto& send = track.sends[si];
+            ImGui::PushID(static_cast<int>(si));
+            const bool preFader = document::sendIsPreFader(track, send.id);
+            const ImVec4 tapCol = preFader ? pal.clipMidiBorder
+                                           : pal.accentStrong;
+            const std::string label = "\xe2\x86\x92 " +
+                routeTargetLabel(edit, send.target, kAssumedPlaybackChannels);
             ImGui::SetCursorScreenPos(ImVec2(x0, rowY));
-            if (ImGui::Button("+ Send", ImVec2(90.0f, ctrlH))) {
-                ImGui::OpenPopup("##laneAddSend");
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                                  send.muted ? pal.textMuted : tapCol);
+            if (ImGui::Button(label.c_str(), ImVec2(78.0f, ctrlH))) {
+                ImGui::OpenPopup("##headRetarget");
             }
-            if (ImGui::BeginPopup("##laneAddSend")) {
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(preFader ? "Pre-fader send — click to retarget"
+                                           : "Post-fader send — click to retarget");
+            }
+            if (ImGui::BeginPopup("##headRetarget")) {
+                const auto options = routingTargetOptions(
+                    edit, track.id, kAssumedPlaybackChannels, true);
+                for (size_t oi = 0; oi < options.size(); ++oi) {
+                    const auto& option = options[oi];
+                    ImGui::PushID(static_cast<int>(oi));
+                    if (ImGui::Selectable(option.label.c_str(),
+                                          send.target == option.target,
+                                          option.enabled
+                                              ? ImGuiSelectableFlags_None
+                                              : ImGuiSelectableFlags_Disabled)) {
+                        RoutingRequest request;
+                        request.kind = RoutingRequest::Kind::UpdateSend;
+                        request.ownerId = track.id;
+                        request.send = send;
+                        request.send.target = option.target;
+                        view.routing.request(std::move(request));
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::EndPopup();
+            }
+            ImGui::SameLine(0.0f, 4.0f);
+            float db = send.gain <= 0.0001
+                ? -60.0f
+                : 20.0f * std::log10(static_cast<float>(send.gain));
+            ImGui::SetNextItemWidth(wide - 78.0f - ctrlH * 2.0f - 12.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_GrabMinSize, 10.0f);
+            const bool dragged =
+                ImGui::SliderFloat("##lvl", &db, -60.0f, 6.0f, "%.0f");
+            ImGui::PopStyleVar();
+            const bool reset = theme::altClickedReset();
+            if (dragged || reset) {
+                RoutingRequest request;
+                request.kind = RoutingRequest::Kind::UpdateSend;
+                request.ownerId = track.id;
+                request.send = send;
+                request.send.gain = reset ? 1.0 : std::pow(10.0, db / 20.0);
+                view.routing.request(std::move(request));
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Send level (dB) — Option-click for unity");
+            }
+            ImGui::SameLine(0.0f, 4.0f);
+            if (send.muted) {
+                ImGui::PushStyleColor(ImGuiCol_Button, pal.trackMuteActive);
+                ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(32, 30, 28, 255));
+            }
+            if (ImGui::Button("M", ImVec2(ctrlH, ctrlH))) {
+                RoutingRequest request;
+                request.kind = RoutingRequest::Kind::UpdateSend;
+                request.ownerId = track.id;
+                request.send = send;
+                request.send.muted = !send.muted;
+                view.routing.request(std::move(request));
+            }
+            if (send.muted) ImGui::PopStyleColor(2);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Mute send");
+            ImGui::SameLine(0.0f, 4.0f);
+            if (ImGui::Button("\xc3\x97", ImVec2(ctrlH, ctrlH))) {
+                RoutingRequest request;
+                request.kind = RoutingRequest::Kind::RemoveSend;
+                request.ownerId = track.id;
+                request.send.id = send.id;
+                view.routing.request(std::move(request));
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Remove send");
+            ImGui::PopID();
+            rowY += rowH;
+        }
+
+        // Inserts. Mutations wait until the list has been walked.
+        std::string removeSlotId;
+        std::string bypassSlotId;
+        bool bypassTo = false;
+        for (size_t pi = 0; pi < track.plugins.size() && fits(); ++pi) {
+            const auto& slot = track.plugins[pi];
+            ImGui::PushID(1000 + static_cast<int>(pi));
+            const std::string name =
+                slot.name.empty() ? std::string("(unnamed)") : slot.name;
+            ImGui::SetCursorScreenPos(ImVec2(x0, rowY));
+            if (slot.bypass) ImGui::PushStyleColor(ImGuiCol_Text, pal.textMuted);
+            if (ImGui::Button(name.c_str(),
+                              ImVec2(wide - 36.0f - ctrlH - 8.0f, ctrlH))) {
+                view.requestPluginEditorSlotId = slot.id;
+            }
+            if (slot.bypass) ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Insert — click to open its editor");
+            }
+            ImGui::SameLine(0.0f, 4.0f);
+            if (slot.bypass) {
+                ImGui::PushStyleColor(ImGuiCol_Button, pal.trackMuteActive);
+                ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(32, 30, 28, 255));
+            }
+            if (ImGui::Button("Byp", ImVec2(36.0f, ctrlH))) {
+                bypassSlotId = slot.id;
+                bypassTo = !slot.bypass;
+            }
+            if (slot.bypass) ImGui::PopStyleColor(2);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Bypass");
+            ImGui::SameLine(0.0f, 4.0f);
+            if (ImGui::Button("\xc3\x97", ImVec2(ctrlH, ctrlH))) {
+                removeSlotId = slot.id;
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Remove insert");
+            ImGui::PopID();
+            rowY += rowH;
+        }
+
+        // Add row: a send (pick its destination, or make a bus) and an insert.
+        if (fits()) {
+            ImGui::SetCursorScreenPos(ImVec2(x0, rowY));
+            ImGui::PushStyleColor(ImGuiCol_Text, pal.textSubtle);
+            const bool addSend =
+                ImGui::Button("+ Send", ImVec2(wide * 0.5f - 2.0f, ctrlH));
+            ImGui::PopStyleColor();
+            if (addSend) ImGui::OpenPopup("##headAddSend");
+            if (ImGui::BeginPopup("##headAddSend")) {
                 const auto options = routingTargetOptions(
                     edit, track.id, kAssumedPlaybackChannels, true);
                 for (size_t oi = 0; oi < options.size(); ++oi) {
@@ -2563,67 +2483,25 @@ void drawTimeline(const document::Edit& edit,
                 }
                 ImGui::EndPopup();
             }
-        } else {  // Inserts
-            // Mutations wait until the list has been walked: removing a
-            // plugin mid-loop would pull the vector out from under it.
-            std::string removeSlotId;
-            std::string bypassSlotId;
-            bool bypassTo = false;
-            if (track.plugins.empty()) {
-                dl->AddText(ImVec2(x0, rowY + 3.0f), mutedCol, "No inserts");
-                rowY += rowH;
-            }
-            for (size_t pi = 0; pi < track.plugins.size(); ++pi) {
-                const auto& slot = track.plugins[pi];
-                ImGui::PushID(static_cast<int>(pi));
-                const std::string name =
-                    slot.name.empty() ? std::string("(unnamed)") : slot.name;
-                ImGui::SetCursorScreenPos(ImVec2(x0, rowY));
-                if (slot.bypass) {
-                    ImGui::PushStyleColor(ImGuiCol_Text, pal.textMuted);
-                }
-                if (ImGui::Button(name.c_str(), ImVec2(180.0f, ctrlH))) {
-                    view.requestPluginEditorSlotId = slot.id;
-                }
-                if (slot.bypass) ImGui::PopStyleColor();
-                if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("Open the plugin's editor");
-                }
-                ImGui::SameLine(0.0f, 6.0f);
-                if (slot.bypass) {
-                    ImGui::PushStyleColor(ImGuiCol_Button, pal.trackMuteActive);
-                    ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(32, 30, 28, 255));
-                }
-                if (ImGui::Button("Byp", ImVec2(38.0f, ctrlH))) {
-                    bypassSlotId = slot.id;
-                    bypassTo = !slot.bypass;
-                }
-                if (slot.bypass) ImGui::PopStyleColor(2);
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Bypass");
-                ImGui::SameLine(0.0f, 4.0f);
-                if (ImGui::Button("\xc3\x97", ImVec2(ctrlH, ctrlH))) {
-                    removeSlotId = slot.id;
-                }
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Remove insert");
-                ImGui::PopID();
-                rowY += rowH;
-            }
-            ImGui::SetCursorScreenPos(ImVec2(x0, rowY));
-            if (ImGui::Button("+ Insert", ImVec2(90.0f, ctrlH))) {
+            ImGui::SameLine(0.0f, 4.0f);
+            ImGui::PushStyleColor(ImGuiCol_Text, pal.textSubtle);
+            if (ImGui::Button("+ Insert", ImVec2(wide * 0.5f - 2.0f, ctrlH))) {
                 view.requestPicker = TimelineViewState::PluginPicker::AudioFx;
                 view.requestPickerTrackId = track.id;
             }
+            ImGui::PopStyleColor();
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Add an insert to the end of the chain");
             }
-            if (!removeSlotId.empty()) {
-                undo.execute(std::make_unique<editing::RemovePluginCommand>(
-                    track.id, removeSlotId));
-            }
-            if (!bypassSlotId.empty()) {
-                undo.execute(std::make_unique<editing::SetPluginBypassCommand>(
-                    bypassSlotId, bypassTo));
-            }
+        }
+
+        if (!removeSlotId.empty()) {
+            undo.execute(std::make_unique<editing::RemovePluginCommand>(
+                track.id, removeSlotId));
+        }
+        if (!bypassSlotId.empty()) {
+            undo.execute(std::make_unique<editing::SetPluginBypassCommand>(
+                bypassSlotId, bypassTo));
         }
         ImGui::PopStyleVar();
         ImGui::PopID();
@@ -2638,30 +2516,62 @@ void drawTimeline(const document::Edit& edit,
         // Zero-height, so there is nothing to draw and nothing to hit.
         if (track.hidden) continue;
         float y = tracksTop + audioOffsets[ti];
+        // The row's own height: the default for its kind times its resize
+        // scale. Everything in the row lays out against this, so pulling the
+        // edge down really makes the row bigger rather than adding a gap.
+        const float rowH = baseHeightOf(track);
         if (y > origin.y + totalHeight) break;
 
-        // A 6px grip on the row's bottom edge (in the gutter) resizes the row.
+        // The row's bottom edge is a resize handle across the whole width,
+        // gutter and lane alike. Hit-tested by hand rather than with an
+        // ImGui item: the gutter's own widgets are created after this point
+        // and would win the hover, which is why the old 6px gutter-only grip
+        // was so hard to catch. Double-click puts the row back to its
+        // default height.
         {
             const float rowTotalH = audioOffsets[ti + 1] - audioOffsets[ti];
-            char resizeId[40];
-            std::snprintf(resizeId, sizeof(resizeId), "##rowresize_%zu", ti);
-            ImGui::SetCursorScreenPos(ImVec2(origin.x, y + rowTotalH - 3.0f));
-            ImGui::SetNextItemAllowOverlap();
-            ImGui::InvisibleButton(resizeId, ImVec2(gutterWidth, 6.0f));
-            if (ImGui::IsItemHovered() || view.resizingTrackId == track.id) {
-                ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+            const float edgeY = y + rowTotalH;
+            constexpr float grab = 4.0f;
+            const bool inBand = (areaHovered || gutterHovered) &&
+                mouse.x >= origin.x && mouse.x <= origin.x + totalWidth &&
+                mouse.y >= edgeY - grab && mouse.y <= edgeY + grab;
+            const bool resizingThis = view.resizingTrackId == track.id;
+            const bool idle = view.resizingTrackId.empty() &&
+                              !view.isDragging() && !view.isSelecting &&
+                              !view.draggingAutomation;
+            if (inBand && idle && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                    view.trackHeightScales.erase(track.id);
+                } else {
+                    view.resizingTrackId = track.id;
+                }
+                // Neither a seek nor the start of a range.
+                automationConsumedClick = true;
             }
-            if (ImGui::IsItemActive()) {
-                view.resizingTrackId = track.id;
-                const float base = track.instrument.uidString.empty()
-                    ? trackHeight : midiTrackHeight;
-                const float laneExtra = lanesHeightOf(track);
-                const float desired =
-                    std::max(minTrackHeight, (mouse.y - y) - laneExtra);
-                view.trackHeightScales[track.id] =
-                    std::clamp(desired / base, 0.5f, 4.0f);
-            } else if (view.resizingTrackId == track.id) {
-                view.resizingTrackId.clear();
+            if (resizingThis) {
+                if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                    const float base = track.instrument.uidString.empty()
+                        ? trackHeight : midiTrackHeight;
+                    const float laneExtra = lanesHeightOf(track);
+                    const float desired =
+                        std::max(minTrackHeight, (mouse.y - y) - laneExtra);
+                    view.trackHeightScales[track.id] =
+                        std::clamp(desired / base, 0.5f, 6.0f);
+                    automationConsumedClick = true;
+                } else {
+                    view.resizingTrackId.clear();
+                }
+            }
+            if ((inBand && idle) || resizingThis) {
+                ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+                // A visible line so the handle can be found, not just felt.
+                // On the foreground list: the row's own background is
+                // painted after this block and would cover it otherwise.
+                ImGui::GetForegroundDrawList()->AddLine(
+                    ImVec2(origin.x, edgeY - 0.5f),
+                    ImVec2(origin.x + totalWidth, edgeY - 0.5f),
+                    C(resizingThis ? pal.accent : pal.accentStrong),
+                    resizingThis ? 2.0f : 1.5f);
             }
         }
 
@@ -2677,43 +2587,48 @@ void drawTimeline(const document::Edit& edit,
         const ImVec4 laneBg = ti % 2 == 0 ? pal.trackLaneSurface : pal.trackLaneAlt;
         dl->AddRectFilled(
             ImVec2(origin.x, y),
-            ImVec2(origin.x + gutterWidth, y + trackHeight), C(headerBg));
+            ImVec2(origin.x + gutterWidth, y + rowH), C(headerBg));
         dl->AddRectFilled(
             ImVec2(origin.x + gutterWidth, y),
-            ImVec2(origin.x + totalWidth, y + trackHeight), C(laneBg));
+            ImVec2(origin.x + totalWidth, y + rowH), C(laneBg));
         // Selection reads on the lane too, or selecting a track would only
         // highlight the narrow header and be easy to miss at a glance.
         if (selected) {
             dl->AddRectFilled(
                 ImVec2(origin.x + gutterWidth, y),
-                ImVec2(origin.x + totalWidth, y + trackHeight),
+                ImVec2(origin.x + totalWidth, y + rowH),
                 IM_COL32(static_cast<int>(pal.accent.x * 255),
                          static_cast<int>(pal.accent.y * 255),
                          static_cast<int>(pal.accent.z * 255), 18));
         }
-        drawLaneGrid(y, trackHeight);
+        drawLaneGrid(y, rowH);
         // Track separator.
-        dl->AddLine(ImVec2(origin.x, y + trackHeight),
-                    ImVec2(origin.x + totalWidth, y + trackHeight),
+        dl->AddLine(ImVec2(origin.x, y + rowH),
+                    ImVec2(origin.x + totalWidth, y + rowH),
                     C(pal.border));
         const ImVec4 trackColor = defaultTrackColor(static_cast<int>(ti));
-        drawTrackMeter(y, trackHeight, track.id);
-        drawTrackBand(y, trackHeight, trackColor, track.color, track.id,
+        drawTrackMeter(y, rowH, track.id);
+        drawTrackBand(y, rowH, trackColor, track.color, track.id,
                       static_cast<int>(ti));
 
         {
             auto& mutableTrack = const_cast<document::Track&>(track);
-            drawTrackGutter(gutter, view, const_cast<document::Edit&>(edit), y,
-                            static_cast<int>(ti),
-                            TrackGutterFields{&mutableTrack.id,
-                                              &mutableTrack.name,
-                                              &mutableTrack.gain,
-                                              &mutableTrack.pan,
-                                              &mutableTrack.mute,
-                                              &mutableTrack.solo,
-                                              &mutableTrack.soloSafe,
-                                              &mutableTrack.recordArm},
-                            selected);
+            const float headFree = drawTrackGutter(
+                gutter, view, const_cast<document::Edit&>(edit), y,
+                static_cast<int>(ti),
+                TrackGutterFields{&mutableTrack.id,
+                                  &mutableTrack.name,
+                                  &mutableTrack.gain,
+                                  &mutableTrack.pan,
+                                  &mutableTrack.mute,
+                                  &mutableTrack.solo,
+                                  &mutableTrack.soloSafe,
+                                  &mutableTrack.recordArm},
+                selected);
+            // Sends and inserts live in the head too, below gain and pan,
+            // in whatever height the row has spare — pull the row taller to
+            // see and assign them.
+            drawHeadChain(track, headFree, y + baseHeightOf(track) - 4.0f);
         }
         // MIDI content on the same row. A track can hold both — audio clips
         // drawn above, note blobs here — because nothing about the row says
@@ -2932,17 +2847,12 @@ void drawTimeline(const document::Edit& edit,
         }
 
         {
-            float laneTop = y + trackHeight;
+            float laneTop = y + rowH;
             const auto lanes = lanesOf(track.id);
             for (size_t li = 0; li < lanes.size(); ++li) {
                 const LaneMode laneMode = lanes[li];
-                if (laneMode == LaneMode::Automation) {
-                    drawChannelAutomationLane(track.id, track.volumeAutomation,
-                                              track.panAutomation, laneTop);
-                } else {
-                    drawChainLane(track, laneTop, laneMode,
-                                  static_cast<int>(li));
-                }
+                drawChannelAutomationLane(track.id, track.volumeAutomation,
+                                          track.panAutomation, laneTop);
                 laneTop += laneHeightFor(track, laneMode);
             }
         }
@@ -2953,7 +2863,7 @@ void drawTimeline(const document::Edit& edit,
         if (!track.mute && !track.solo && anySoloed) {
             dl->AddRectFilled(
                 ImVec2(origin.x, y),
-                ImVec2(origin.x + gutterWidth, y + trackHeight),
+                ImVec2(origin.x + gutterWidth, y + rowH),
                 IM_COL32(20, 19, 18, 110));
         }
 
@@ -2974,7 +2884,7 @@ void drawTimeline(const document::Edit& edit,
                 const ImVec2 previewMin(std::max(x1, laneLeft), y + 6.0f);
                 const ImVec2 previewMax(
                     std::min(std::max(x2, x1 + 2.0f), laneRight),
-                    y + trackHeight - 6.0f);
+                    y + rowH - 6.0f);
                 dl->AddRectFilled(previewMin, previewMax,
                                   IM_COL32(196, 48, 54, 70), 2.0f);
                 dl->AddRect(previewMin, previewMax,
@@ -2984,7 +2894,7 @@ void drawTimeline(const document::Edit& edit,
 
         // Click the gutter to select this track.
         if (gutterHovered &&
-            mouse.y >= y && mouse.y <= y + trackHeight &&
+            mouse.y >= y && mouse.y <= y + rowH &&
             ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
             view.selectedTrackIndex = static_cast<int>(ti);
         }
@@ -3028,7 +2938,7 @@ void drawTimeline(const document::Edit& edit,
             struct Rect { ImVec2 min, max; bool contains(const ImVec2& p) const {
                 return p.x >= min.x && p.x <= max.x && p.y >= min.y && p.y <= max.y; } };
             Rect clipRect{ImVec2(clipX, y + 6),
-                          ImVec2(clipX + clipW, y + trackHeight - 6)};
+                          ImVec2(clipX + clipW, y + rowH - 6)};
             // A grouped clip does not draw itself: the group's own clip
             // stands in for it, over the range the group was made from. The
             // audio is still there and still plays — this is what you can see
@@ -3040,7 +2950,7 @@ void drawTimeline(const document::Edit& edit,
             // start sits under the gutter must not paint over the track header
             // and its controls.
             dl->PushClipRect(ImVec2(origin.x + gutterWidth, y),
-                             ImVec2(origin.x + totalWidth, y + trackHeight), true);
+                             ImVec2(origin.x + totalWidth, y + rowH), true);
             bool isSel = view.selectedClipId == clip.id ||
                         view.selectedClipIds.count(clip.id) > 0;
             // A distinct header gives a clip its identity without competing
@@ -3261,7 +3171,7 @@ void drawTimeline(const document::Edit& edit,
                 static_cast<int>(pal.accent.z * 255.0f), 190);
             for (const auto& tick : culled) {
                 dl->AddLine(ImVec2(tick.x, y + 5.0f),
-                            ImVec2(tick.x, y + trackHeight - 5.0f),
+                            ImVec2(tick.x, y + rowH - 5.0f),
                             tickColor, 1.0f);
             }
         }

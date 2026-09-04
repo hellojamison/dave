@@ -550,6 +550,19 @@ bool iconButton(const char* id, TransportIcon icon, const char* tooltip,
                               glyph, 1.0f);
             break;
         }
+        case TransportIcon::Metronome: {
+            // The classic wedge with a swinging pendulum — reads as a metronome
+            // at 16 px without any text.
+            const ImVec2 apex(center.x, center.y - 7.0f);
+            const ImVec2 baseL(center.x - 6.0f, center.y + 7.0f);
+            const ImVec2 baseR(center.x + 6.0f, center.y + 7.0f);
+            drawList->AddTriangle(apex, baseL, baseR, glyph, 1.5f);
+            // Pendulum arm, tipped to one side.
+            drawList->AddLine(ImVec2(center.x, center.y + 6.0f),
+                              ImVec2(center.x + 3.5f, center.y - 4.0f), glyph,
+                              1.5f);
+            break;
+        }
     }
 
     if (tooltip != nullptr && tooltip[0] != '\0') {

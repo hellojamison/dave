@@ -68,6 +68,10 @@ enum class TimecodeMode {
 
 enum class AutomationParameter { Volume, Pan };
 enum class AutomationTool { Pencil, Line, Curve, Eraser };
+// What the expanded lane beneath a track shows. Automation defers to
+// automationParameters for which envelope (Volume/Pan); Sends and Inserts list
+// the track's chain entries instead.
+enum class LaneMode { Automation, Sends, Inserts };
 
 std::string formatAutomationDrawValue(AutomationParameter parameter,
                                       double value);
@@ -106,6 +110,10 @@ struct TimelineViewState {
     std::unordered_set<std::string> selectedTrackIds;
     int trackSelectAnchor = -1;
     std::string selectedClipId;
+    // Multi-clip selection: Shift-click adds the run between the anchor and the
+    // click (with the gaps), Cmd-click toggles clips one at a time. Always
+    // contains the primary `selectedClipId` too.
+    std::unordered_set<std::string> selectedClipIds;
     // UI-only recording preview. The document does not receive a clip until
     // the WAV is closed and hashed; armed lanes still show the growing take.
     bool recordingActive = false;
@@ -249,6 +257,8 @@ struct TimelineViewState {
     // channel reveals one parameter-selectable automation lane below its row.
     std::unordered_set<std::string> expandedTracks;
     std::unordered_map<std::string, AutomationParameter> automationParameters;
+    // Which content the expanded lane shows per track. Absent = Automation.
+    std::unordered_map<std::string, LaneMode> trackLaneModes;
     // Automation editing tools are global like the pointer tools in a DAW,
     // even though their compact toggle is repeated inside each open lane.
     AutomationTool automationTool = AutomationTool::Pencil;
@@ -541,6 +551,14 @@ bool duplicateSelectedClip(const document::Edit& edit,
 bool toggleSelectedClipMute(const document::Edit& edit,
                             editing::UndoStack& undo, TimelineViewState& view);
 
+// Update the multi-clip selection for a click on `clipId` on track `trackIndex`.
+// shift extends a run from the anchor (current primary) to the click, gaps and
+// all; cmd toggles the single clip; neither selects it alone. Here, not in the
+// handler, so the range/toggle arithmetic is testable.
+void applyClipSelection(TimelineViewState& view, const document::Edit& edit,
+                        int trackIndex, const std::string& clipId, bool shift,
+                        bool cmd);
+
 // Scale the selected track's row height by `factor` (Ctrl+Up/Down), clamped.
 // Per-track and view-only, so it neither rebuilds the graph nor needs undo.
 bool adjustSelectedTrackHeight(const document::Edit& edit,
@@ -580,6 +598,17 @@ bool createFadeFromSelection(const document::Edit& edit,
                              document::FadeShape inShape,
                              document::FadeShape outShape,
                              int64_t defaultFadeSamples);
+
+// F on a selected clip that overlaps a same-track neighbour crossfades the two
+// over their overlap (both take `crossShape`) and fades the selected clip's free
+// edge with `freeFadeSamples`/`freeShape`. Returns false when the selected clip
+// has no clean edge overlap, so the caller falls back to the normal fade.
+bool createCrossfadeForSelectedClip(const document::Edit& edit,
+                                    editing::UndoStack& undo,
+                                    TimelineViewState& view,
+                                    document::FadeShape crossShape,
+                                    int64_t freeFadeSamples,
+                                    document::FadeShape freeShape);
 
 // Draw the marker lane (a strip above the track rows showing markers as flags
 // and regions). Returns the height it consumed (caller reserves that much

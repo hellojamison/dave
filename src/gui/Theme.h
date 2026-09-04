@@ -156,6 +156,7 @@ enum class TransportIcon {
     Record,
     Loop,
     Transient,
+    Metronome,
 };
 
 void drawVerticalGradient(ImDrawList* drawList, const Rect& rect,

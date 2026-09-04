@@ -116,6 +116,13 @@ private:
     void toggleRecording();
     // Start/stop playback, rolling in from the pre-roll lead when enabled.
     void togglePlayback();
+    // Stop playback once it passes a post-roll stop point (auditioning a
+    // selection). -1 means no stop point is armed.
+    void servicePostRoll();
+    int64_t playStopAt_ = -1;
+    // Metronome on/off (session state); applied to the graph's node each frame
+    // so it survives rebuilds without a rebuild of its own.
+    bool metronomeEnabled_ = false;
     // A capture is running — the engine is writing to disk, so routing
     // topology is frozen even when nothing is being kept.
     bool capturing() const { return recordingSession_ != nullptr; }

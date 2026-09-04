@@ -1376,6 +1376,84 @@ void drawTimeline(const document::Edit& edit,
     }
     const bool automationEditorOpenAtFrameStart =
         view.editingAutomationValue;
+    // Cancel any in-flight automation gesture on this owner. Called when the
+    // lane's content changes out from under an active drag/edit/draw.
+    auto cancelAutomationGesture = [&](const std::string& ownerId) {
+        if (view.automationOwnerId == ownerId) {
+            view.draggingAutomation = false;
+            view.automationOwnerId.clear();
+            view.automationPointId.clear();
+        }
+        if (view.automationEditOwnerId == ownerId) {
+            view.editingAutomationValue = false;
+            view.automationEditOwnerId.clear();
+            view.automationEditPointId.clear();
+        }
+        if (view.drawingAutomationOwnerId == ownerId) {
+            view.drawingAutomation = false;
+            view.drawingAutomationOwnerId.clear();
+            view.automationDrawOriginal.clear();
+            view.automationDrawStroke.clear();
+            view.automationDrawFlipped = false;
+            view.automationSteepnessLatched = false;
+        }
+    };
+    // The lane's content selector, drawn at the top-left of every expanded
+    // lane regardless of what it shows. One combo carries both the automation
+    // parameter (Volume/Pan) and the higher-level lane mode (Sends/Inserts),
+    // because they are mutually exclusive views of the same lane and a second
+    // control would not fit beside the automation tools.
+    auto drawLaneModeCombo = [&](const std::string& ownerId, float top) {
+        const LaneMode mode = view.trackLaneModes.count(ownerId)
+                                  ? view.trackLaneModes[ownerId]
+                                  : LaneMode::Automation;
+        const AutomationParameter parameter =
+            view.automationParameters.count(ownerId)
+                ? view.automationParameters[ownerId]
+                : AutomationParameter::Volume;
+        const char* label =
+            mode == LaneMode::Sends      ? "Sends"
+            : mode == LaneMode::Inserts  ? "Inserts"
+            : parameter == AutomationParameter::Pan ? "Pan"
+                                                    : "Volume";
+        const ImVec2 savedCursor = ImGui::GetCursorScreenPos();
+        ImGui::SetCursorScreenPos(
+            ImVec2(origin.x + kGutterContentX - 4.0f, top + 5.0f));
+        ImGui::PushID(ownerId.c_str());
+        ImGui::SetNextItemWidth(90.0f);
+        if (ImGui::BeginCombo("##laneMode", label,
+                              ImGuiComboFlags_HeightSmall)) {
+            struct Entry { const char* name; LaneMode mode;
+                           AutomationParameter param; };
+            const Entry entries[] = {
+                {"Volume", LaneMode::Automation, AutomationParameter::Volume},
+                {"Pan", LaneMode::Automation, AutomationParameter::Pan},
+                {"Sends", LaneMode::Sends, AutomationParameter::Volume},
+                {"Inserts", LaneMode::Inserts, AutomationParameter::Volume},
+            };
+            for (const auto& entry : entries) {
+                const bool selected =
+                    entry.mode == mode &&
+                    (entry.mode != LaneMode::Automation ||
+                     entry.param == parameter);
+                if (ImGui::Selectable(entry.name, selected)) {
+                    view.trackLaneModes[ownerId] = entry.mode;
+                    if (entry.mode == LaneMode::Automation) {
+                        view.automationParameters[ownerId] = entry.param;
+                    }
+                    cancelAutomationGesture(ownerId);
+                    automationConsumedClick = true;
+                }
+                if (selected) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        const bool comboHovered = ImGui::IsItemHovered();
+        automationMouseOver = automationMouseOver || comboHovered;
+        if (comboHovered) ImGui::SetTooltip("Lane content");
+        ImGui::PopID();
+        ImGui::SetCursorScreenPos(savedCursor);
+    };
     auto drawAutomationLane = [&](
         const std::string& ownerId,
         const std::vector<document::VolumeAutomationPoint>& storedPoints,
@@ -1400,53 +1478,7 @@ void drawTimeline(const document::Edit& edit,
                     C(pal.border));
         dl->AddLine(ImVec2(origin.x, bottom), ImVec2(laneRight, bottom),
                     C(pal.border));
-        const ImVec2 savedParameterCursor = ImGui::GetCursorScreenPos();
-        ImGui::SetCursorScreenPos(
-            ImVec2(origin.x + kGutterContentX - 4.0f, top + 5.0f));
-        ImGui::PushID(ownerId.c_str());
-        // 90, not the combo's natural width: it shares the gutter with
-        // four tool buttons now, and at 112 the fourth (eraser) spilled
-        // past the gutter edge and was clipped by the lane.
-        ImGui::SetNextItemWidth(90.0f);
-        const char* parameterName = isPan ? "Pan" : "Volume";
-        if (ImGui::BeginCombo("##automationParameter", parameterName,
-                              ImGuiComboFlags_HeightSmall)) {
-            for (const auto choice : {AutomationParameter::Volume,
-                                      AutomationParameter::Pan}) {
-                const bool selected = choice == parameter;
-                if (ImGui::Selectable(
-                        choice == AutomationParameter::Volume ? "Volume" : "Pan",
-                        selected)) {
-                    view.automationParameters[ownerId] = choice;
-                    if (view.automationOwnerId == ownerId) {
-                        view.draggingAutomation = false;
-                        view.automationOwnerId.clear();
-                        view.automationPointId.clear();
-                    }
-                    if (view.automationEditOwnerId == ownerId) {
-                        view.editingAutomationValue = false;
-                        view.automationEditOwnerId.clear();
-                        view.automationEditPointId.clear();
-                    }
-                    if (view.drawingAutomationOwnerId == ownerId) {
-                        view.drawingAutomation = false;
-                        view.drawingAutomationOwnerId.clear();
-                        view.automationDrawOriginal.clear();
-                        view.automationDrawStroke.clear();
-                        view.automationDrawFlipped = false;
-                view.automationSteepnessLatched = false;
-                    }
-                    automationConsumedClick = true;
-                }
-                if (selected) ImGui::SetItemDefaultFocus();
-            }
-            ImGui::EndCombo();
-        }
-        const bool parameterHovered = ImGui::IsItemHovered();
-        automationMouseOver = automationMouseOver || parameterHovered;
-        if (parameterHovered) {
-            ImGui::SetTooltip("Automation parameter");
-        }
+        drawLaneModeCombo(ownerId, top);
 
         const ImVec2 toolSize(24.0f, 22.0f);
         constexpr float toolGap = 4.0f;
@@ -1558,8 +1590,6 @@ void drawTimeline(const document::Edit& edit,
                        toolsLeft + 3.0f * (toolSize.x + toolGap),
                        "Eraser: drag across the lane to remove points");
         ImGui::PopID();
-        ImGui::PopID();
-        ImGui::SetCursorScreenPos(savedParameterCursor);
 
         const double playheadValue = document::volumeAutomationDbAt(
             storedPoints, transport.position());
@@ -2258,6 +2288,100 @@ void drawTimeline(const document::Edit& edit,
         drawAutomationLane(ownerId, normalized, top, parameter);
     };
 
+    // Sends / Inserts lane. A compact read-only list of the track's chain
+    // entries, with the same lane-mode combo at the top-left so the user can
+    // switch back to automation. Editing lives in the channel strip; this lane
+    // is a timeline-side glance at what the track routes to and hosts.
+    auto drawChainLane = [&](const document::Track& track, float top,
+                             LaneMode mode) {
+        const float bottom = top + automationLaneHeight;
+        const float laneLeft = origin.x + gutterWidth;
+        const float laneRight = origin.x + totalWidth;
+        dl->AddRectFilled(ImVec2(origin.x, top),
+                          ImVec2(laneLeft, bottom), C(pal.surfaceBase));
+        dl->AddRectFilled(ImVec2(laneLeft, top),
+                          ImVec2(laneRight, bottom), C(pal.trackLaneAlt));
+        dl->AddLine(ImVec2(origin.x, top), ImVec2(laneRight, top),
+                    C(pal.border));
+        dl->AddLine(ImVec2(origin.x, bottom), ImVec2(laneRight, bottom),
+                    C(pal.border));
+        drawLaneModeCombo(track.id, top);
+
+        // The list itself starts in the lane body (right of the gutter) so it
+        // does not collide with the mode combo sitting in the gutter.
+        const float textX = laneLeft + 10.0f;
+        float rowY = top + 8.0f;
+        constexpr float rowH = 18.0f;
+        const ImU32 textCol = C(pal.text);
+        const ImU32 mutedCol = C(pal.textMuted);
+        auto rowFits = [&] { return rowY + rowH <= bottom - 4.0f; };
+
+        if (mode == LaneMode::Sends) {
+            if (track.sends.empty()) {
+                dl->AddText(ImVec2(textX, rowY), mutedCol, "No sends");
+            }
+            for (const auto& send : track.sends) {
+                if (!rowFits()) break;
+                std::string target;
+                switch (send.target.kind) {
+                    case document::RouteTarget::Kind::None:
+                        target = "—";
+                        break;
+                    case document::RouteTarget::Kind::AudioTrack:
+                    case document::RouteTarget::Kind::Bus: {
+                        const auto* t = edit.track(send.target.targetId);
+                        target = t ? t->name : "Missing";
+                        break;
+                    }
+                    case document::RouteTarget::Kind::HardwareOutput: {
+                        const int first = send.target.hardware.firstChannel;
+                        target = "Output " + std::to_string(first + 1);
+                        if (send.target.hardware.channelCount == 2) {
+                            target += "-" + std::to_string(first + 2);
+                        }
+                        break;
+                    }
+                }
+                const float db = send.gain <= 0.0001
+                    ? -60.0f
+                    : 20.0f * std::log10(static_cast<float>(send.gain));
+                char level[24];
+                if (send.muted || send.gain <= 0.0001) {
+                    std::snprintf(level, sizeof(level), "muted");
+                } else {
+                    std::snprintf(level, sizeof(level), "%.1f dB", db);
+                }
+                const bool postFader = send.tap == document::SendTap::PostFader;
+                dl->AddText(ImVec2(textX, rowY), textCol, target.c_str());
+                char meta[40];
+                std::snprintf(meta, sizeof(meta), "%s · %s", level,
+                              postFader ? "post" : "pre");
+                const float metaW = ImGui::CalcTextSize(meta).x;
+                dl->AddText(ImVec2(laneRight - metaW - 12.0f, rowY),
+                            send.muted ? mutedCol : textCol, meta);
+                rowY += rowH;
+            }
+        } else {  // Inserts
+            if (track.plugins.empty()) {
+                dl->AddText(ImVec2(textX, rowY), mutedCol, "No inserts");
+            }
+            for (const auto& slot : track.plugins) {
+                if (!rowFits()) break;
+                const std::string name =
+                    slot.name.empty() ? std::string("(unnamed)") : slot.name;
+                dl->AddText(ImVec2(textX, rowY),
+                            slot.bypass ? mutedCol : textCol, name.c_str());
+                if (slot.bypass) {
+                    const char* tag = "bypassed";
+                    const float tagW = ImGui::CalcTextSize(tag).x;
+                    dl->AddText(ImVec2(laneRight - tagW - 12.0f, rowY),
+                                mutedCol, tag);
+                }
+                rowY += rowH;
+            }
+        }
+    };
+
     // Tracks + clips.
     ImGui::PushStyleVar(
         ImGuiStyleVar_FramePadding, ImVec2(style.FramePadding.x, 1.0f));
@@ -2380,7 +2504,8 @@ void drawTimeline(const document::Edit& edit,
             const ImVec2 clipMin(static_cast<float>(clipX), y + 6.0f);
             const ImVec2 clipMax(static_cast<float>(clipX + clipW),
                                  y + midiTrackHeight - 6.0f);
-            const bool isSel = view.selectedClipId == clip.id;
+            const bool isSel = view.selectedClipId == clip.id ||
+                               view.selectedClipIds.count(clip.id) > 0;
             dl->PushClipRect(ImVec2(origin.x + gutterWidth, y),
                              ImVec2(origin.x + totalWidth, y + midiTrackHeight),
                              true);
@@ -2458,25 +2583,32 @@ void drawTimeline(const document::Edit& edit,
                 midiGesture != TimelineViewState::DragKind::None) {
                 ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
             }
-            if (!selectorMode && areaHovered &&
+            if (areaHovered &&
                 ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
                 clipHovered) {
-                view.selectedClipId = clip.id;
-                view.selectedTrackIndex = static_cast<int>(ti);
-                selectClipRange(view, transport, static_cast<int>(ti),
-                                clip.timelineStart, clip.length);
-                view.dragClipOriginalStart = clip.timelineStart;
-                view.dragPreviewStart = clip.timelineStart;
-                view.dragClipOriginalOffset = clip.sourceOffset;
-                view.dragPreviewOffset = clip.sourceOffset;
-                view.dragClipOriginalLength = clip.length;
-                view.dragPreviewLength = clip.length;
-                view.dragOriginalTrackId = track.id;
-                view.dragClipIsMidi = true;
-                view.dragKind =
-                    midiGesture == TimelineViewState::DragKind::None
-                        ? TimelineViewState::DragKind::MidiClip
-                        : midiGesture;
+                const bool shift = ImGui::GetIO().KeyShift;
+                // Command is the selector: it stands down here so the range
+                // machinery below marks a span in this lane instead.
+                if (!selectorMode) {
+                    applyClipSelection(view, edit, static_cast<int>(ti),
+                                       clip.id, shift, false);
+                    if (!shift) {
+                        selectClipRange(view, transport, static_cast<int>(ti),
+                                        clip.timelineStart, clip.length);
+                        view.dragClipOriginalStart = clip.timelineStart;
+                        view.dragPreviewStart = clip.timelineStart;
+                        view.dragClipOriginalOffset = clip.sourceOffset;
+                        view.dragPreviewOffset = clip.sourceOffset;
+                        view.dragClipOriginalLength = clip.length;
+                        view.dragPreviewLength = clip.length;
+                        view.dragOriginalTrackId = track.id;
+                        view.dragClipIsMidi = true;
+                        view.dragKind =
+                            midiGesture == TimelineViewState::DragKind::None
+                                ? TimelineViewState::DragKind::MidiClip
+                                : midiGesture;
+                    }
+                }
             }
             if (areaHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right) &&
                 clipHovered) {
@@ -2554,8 +2686,15 @@ void drawTimeline(const document::Edit& edit,
         }
 
         if (view.expandedTracks.contains(track.id)) {
-            drawChannelAutomationLane(track.id, track.volumeAutomation,
-                                      track.panAutomation, y + trackHeight);
+            const LaneMode laneMode = view.trackLaneModes.count(track.id)
+                                          ? view.trackLaneModes[track.id]
+                                          : LaneMode::Automation;
+            if (laneMode == LaneMode::Automation) {
+                drawChannelAutomationLane(track.id, track.volumeAutomation,
+                                          track.panAutomation, y + trackHeight);
+            } else {
+                drawChainLane(track, y + trackHeight, laneMode);
+            }
         }
 
         // A soloed track elsewhere silences this one. Without a cue in the
@@ -2652,7 +2791,8 @@ void drawTimeline(const document::Edit& edit,
             // and its controls.
             dl->PushClipRect(ImVec2(origin.x + gutterWidth, y),
                              ImVec2(origin.x + totalWidth, y + trackHeight), true);
-            bool isSel = view.selectedClipId == clip.id;
+            bool isSel = view.selectedClipId == clip.id ||
+                        view.selectedClipIds.count(clip.id) > 0;
             // A distinct header gives a clip its identity without competing
             // with the waveform, which carries the edit-critical detail.
             ImVec4 body = pal.clipAudio;
@@ -2789,24 +2929,33 @@ void drawTimeline(const document::Edit& edit,
                 audioGesture != TimelineViewState::DragKind::None) {
                 ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
             }
-            if (!selectorMode && areaHovered &&
+            if (areaHovered &&
                 ImGui::IsMouseClicked(ImGuiMouseButton_Left) && clipHovered) {
-                view.selectedClipId = clip.id;
-                view.selectedTrackIndex = static_cast<int>(ti);
-                selectClipRange(view, transport, static_cast<int>(ti),
-                                clip.timelineStart, clip.length);
-                view.dragClipOriginalStart = clip.timelineStart;
-                // Seed the preview so a click without movement draws in place.
-                view.dragPreviewStart = clip.timelineStart;
-                view.dragClipOriginalOffset = clip.sourceOffset;
-                view.dragPreviewOffset = clip.sourceOffset;
-                view.dragClipOriginalLength = clip.length;
-                view.dragPreviewLength = clip.length;
-                view.dragOriginalTrackId = track.id;
-                view.dragClipIsMidi = false;
-                view.dragKind = audioGesture == TimelineViewState::DragKind::None
-                    ? TimelineViewState::DragKind::AudioClip
-                    : audioGesture;
+                const bool shift = ImGui::GetIO().KeyShift;
+                // Command is the selector: it stands down here so the range
+                // machinery marks a span in this lane instead of grabbing the
+                // clip. Shift builds a multi-clip selection; a plain click
+                // selects the one clip and arms move/trim.
+                if (!selectorMode) {
+                    applyClipSelection(view, edit, static_cast<int>(ti),
+                                       clip.id, shift, false);
+                    if (!shift) {
+                        selectClipRange(view, transport, static_cast<int>(ti),
+                                        clip.timelineStart, clip.length);
+                        view.dragClipOriginalStart = clip.timelineStart;
+                        view.dragPreviewStart = clip.timelineStart;
+                        view.dragClipOriginalOffset = clip.sourceOffset;
+                        view.dragPreviewOffset = clip.sourceOffset;
+                        view.dragClipOriginalLength = clip.length;
+                        view.dragPreviewLength = clip.length;
+                        view.dragOriginalTrackId = track.id;
+                        view.dragClipIsMidi = false;
+                        view.dragKind =
+                            audioGesture == TimelineViewState::DragKind::None
+                                ? TimelineViewState::DragKind::AudioClip
+                                : audioGesture;
+                    }
+                }
             }
             // Right-click: context menu (split, delete).
             if (areaHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right) && clipHovered) {
@@ -3330,9 +3479,14 @@ void drawTimeline(const document::Edit& edit,
             if (hitClip) break;
         }
         if (!hitClip || selectorMode) {
-            // Start a selection drag (instead of just seeking). The row under
-            // the press owns it: a range dragged in one lane stays in that
-            // lane no matter how far the pointer wanders vertically.
+            // Empty lane, or the Command selector held over a clip: start a
+            // range selection. Command is the selector tool, so a press on a
+            // clip with Command marks a time range within the clip's lane
+            // rather than grabbing the clip (the clip handler stands down for
+            // selectorMode). A plain press on a clip still goes to the clip
+            // handler and drags. Dragging a fresh range drops any multi-clip
+            // selection.
+            view.selectedClipIds.clear();
             const int row = rowAtY(mouse.y);
             view.selectionPressSample = selectionSampleAtMouseX();
             const int64_t s = selectionSampleAtMouseX();
@@ -4126,6 +4280,52 @@ int64_t parseTimecodeToSamples(
     return -1;
 }
 
+void applyClipSelection(TimelineViewState& view, const document::Edit& edit,
+                        int trackIndex, const std::string& clipId, bool shift,
+                        bool cmd) {
+    const auto& tracks = edit.tracks();
+    if (trackIndex < 0 || trackIndex >= static_cast<int>(tracks.size())) return;
+    const auto& track = tracks[static_cast<size_t>(trackIndex)];
+    auto extentOf = [&](const std::string& id, int64_t& s, int64_t& e) {
+        for (const auto& c : track.clips)
+            if (c.id == id) { s = c.timelineStart; e = s + c.length; return true; }
+        for (const auto& c : track.midiClips)
+            if (c.id == id) { s = c.timelineStart; e = s + c.length; return true; }
+        return false;
+    };
+    int64_t clickStart = 0, clickEnd = 0;
+    if (!extentOf(clipId, clickStart, clickEnd)) return;
+
+    if (shift) {
+        // Range from the anchor (the current primary) to the clicked clip,
+        // gaps included; every clip touching that span joins the selection.
+        int64_t aStart = clickStart, aEnd = clickEnd;
+        extentOf(view.selectedClipId, aStart, aEnd);
+        const int64_t rs = std::min(aStart, clickStart);
+        const int64_t re = std::max(aEnd, clickEnd);
+        view.selectedClipIds.clear();
+        for (const auto& c : track.clips)
+            if (c.timelineStart < re && c.timelineStart + c.length > rs)
+                view.selectedClipIds.insert(c.id);
+        for (const auto& c : track.midiClips)
+            if (c.timelineStart < re && c.timelineStart + c.length > rs)
+                view.selectedClipIds.insert(c.id);
+        view.selectionStart = rs;
+        view.selectionEnd = re;
+        view.selectionRow = trackIndex;
+        view.hasSelection = true;
+    } else if (cmd) {
+        // Toggle this clip alone — no range, so no gaps are highlighted.
+        if (view.selectedClipIds.count(clipId)) view.selectedClipIds.erase(clipId);
+        else view.selectedClipIds.insert(clipId);
+    } else {
+        view.selectedClipIds.clear();
+        view.selectedClipIds.insert(clipId);
+    }
+    view.selectedClipId = clipId;
+    view.selectedTrackIndex = trackIndex;
+}
+
 bool adjustSelectedTrackHeight(const document::Edit& edit,
                                TimelineViewState& view, float factor) {
     if (view.selectedTrackIndex < 0) return false;
@@ -4135,6 +4335,81 @@ bool adjustSelectedTrackHeight(const document::Edit& edit,
     const auto it = view.trackHeightScales.find(id);
     const float current = it != view.trackHeightScales.end() ? it->second : 1.0f;
     view.trackHeightScales[id] = std::clamp(current * factor, 0.5f, 4.0f);
+    return true;
+}
+
+bool createCrossfadeForSelectedClip(const document::Edit& edit,
+                                    editing::UndoStack& undo,
+                                    TimelineViewState& view,
+                                    document::FadeShape crossShape,
+                                    int64_t freeFadeSamples,
+                                    document::FadeShape freeShape) {
+    std::string trackId;
+    const document::AudioClip* s = selectedAudioClip(edit, view, trackId);
+    if (s == nullptr) return false;
+    const int64_t sStart = s->timelineStart;
+    const int64_t sEnd = sStart + s->length;
+
+    // The first same-track clip whose extent overlaps the selected one.
+    const document::AudioClip* n = nullptr;
+    for (const auto& tr : edit.tracks()) {
+        if (tr.id != trackId) continue;
+        for (const auto& c : tr.clips) {
+            if (c.id == s->id) continue;
+            const int64_t cs = c.timelineStart;
+            const int64_t ce = cs + c.length;
+            if (cs < sEnd && ce > sStart) { n = &c; break; }
+        }
+        break;
+    }
+    if (n == nullptr) return false;  // no overlap — caller does the normal fade
+
+    const int64_t nStart = n->timelineStart;
+    const int64_t nEnd = nStart + n->length;
+    const int64_t os = std::max(sStart, nStart);
+    const int64_t oe = std::min(sEnd, nEnd);
+    const int64_t overlap = oe - os;
+    if (overlap <= 0) return false;
+
+    // Outgoing ends first, incoming starts later. If they are the same clip the
+    // overlap is interior (one clip inside the other) — no clean edge crossfade.
+    const document::AudioClip* outgoing = sEnd <= nEnd ? s : n;
+    const document::AudioClip* incoming = sStart >= nStart ? s : n;
+    if (outgoing == incoming) return false;
+
+    // Crossfade over the whole overlap: the fades are anchored to the outgoing
+    // clip's end and the incoming clip's start, which for an edge overlap are
+    // exactly the overlap bounds — so equal length makes them line up.
+    int64_t outIn = outgoing->fadeIn, outOut = overlap;
+    int64_t inIn = overlap, inOut = incoming->fadeOut;
+    document::FadeShape outInS = outgoing->fadeInShape, outOutS = crossShape;
+    document::FadeShape inInS = crossShape, inOutS = incoming->fadeOutShape;
+
+    // The selected clip's free (non-overlapping) edge gets a normal fade.
+    const int64_t freeLen = std::max<int64_t>(0, freeFadeSamples);
+    if (s == outgoing) {
+        outIn = std::min(freeLen, s->length - outOut);
+        outInS = freeShape;
+    } else {  // s == incoming
+        inOut = std::min(freeLen, s->length - inIn);
+        inOutS = freeShape;
+    }
+    // A clip's two fades can't overlap.
+    auto clampPair = [](int64_t& in, int64_t& out, int64_t len) {
+        in = std::clamp<int64_t>(in, 0, len);
+        out = std::clamp<int64_t>(out, 0, len);
+        if (in + out > len) out = len - in;
+    };
+    clampPair(outIn, outOut, outgoing->length);
+    clampPair(inIn, inOut, incoming->length);
+
+    std::vector<std::unique_ptr<editing::Command>> cmds;
+    cmds.push_back(std::make_unique<editing::SetClipFadeCommand>(
+        trackId, outgoing->id, outIn, outInS, outOut, outOutS));
+    cmds.push_back(std::make_unique<editing::SetClipFadeCommand>(
+        trackId, incoming->id, inIn, inInS, inOut, inOutS));
+    undo.execute(std::make_unique<editing::CompoundCommand>(std::move(cmds),
+                                                            "Crossfade"));
     return true;
 }
 

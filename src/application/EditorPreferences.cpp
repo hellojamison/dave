@@ -123,6 +123,12 @@ EditorPreferences EditorPreferencesStore::load() const noexcept {
         const auto postMs = root.find("postRollMs");
         if (postMs != root.end() && postMs->is_number_integer())
             preferences.postRollMs = std::max(0, postMs->get<int>());
+        const auto xfShape = root.find("defaultCrossfadeShape");
+        if (xfShape != root.end() && xfShape->is_number_integer())
+            preferences.defaultCrossfadeShape = clampShape(xfShape->get<int>());
+        const auto xfMs = root.find("defaultCrossfadeMs");
+        if (xfMs != root.end() && xfMs->is_number_integer())
+            preferences.defaultCrossfadeMs = std::max(0, xfMs->get<int>());
         return preferences;
     } catch (...) {
         return defaults;
@@ -153,6 +159,9 @@ bool EditorPreferencesStore::save(
             {"preRollMs", preferences.preRollMs},
             {"postRollEnabled", preferences.postRollEnabled},
             {"postRollMs", preferences.postRollMs},
+            {"defaultCrossfadeShape",
+             static_cast<int>(preferences.defaultCrossfadeShape)},
+            {"defaultCrossfadeMs", preferences.defaultCrossfadeMs},
         };
         std::error_code error;
         const auto parent = path_.parent_path();

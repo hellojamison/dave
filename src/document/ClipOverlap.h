@@ -24,14 +24,23 @@ inline std::vector<std::pair<std::int64_t, std::int64_t>> clipMuteIntervals(
     if (index >= clips.size()) return out;
     const std::int64_t start = clips[index].timelineStart;
     const std::int64_t end = start + clips[index].length;
+    // This clip's own fade regions, used to spot a crossfade with the clip on
+    // top of it.
+    const std::int64_t fadeOutStart = end - clips[index].fadeOut;
     for (std::size_t j = index + 1; j < clips.size(); ++j) {
         const std::int64_t js = clips[j].timelineStart;
         const std::int64_t je = js + clips[j].length;
         const std::int64_t overlapStart = std::max(start, js);
         const std::int64_t overlapEnd = std::min(end, je);
-        if (overlapEnd > overlapStart) {
-            out.emplace_back(overlapStart, overlapEnd);
-        }
+        if (overlapEnd <= overlapStart) continue;
+        // A crossfade: this clip fades OUT into the overlap while the one on
+        // top fades IN across it. Then both are meant to play (summed with
+        // complementary curves), so the mute stands down here.
+        const std::int64_t topFadeInEnd = js + clips[j].fadeIn;
+        const bool crossfade = clips[index].fadeOut > 0 && clips[j].fadeIn > 0 &&
+                               fadeOutStart < overlapEnd &&
+                               topFadeInEnd > overlapStart;
+        if (!crossfade) out.emplace_back(overlapStart, overlapEnd);
     }
     return out;
 }

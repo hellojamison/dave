@@ -43,6 +43,7 @@ add_executable(dave_tests
     test_fade.cpp
     test_clipfades.cpp
     test_clipoverlap.cpp
+    test_metronome.cpp
     test_transientdetector.cpp
     test_transientcache.cpp
     test_transientnavigation.cpp

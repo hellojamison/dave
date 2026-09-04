@@ -417,3 +417,33 @@ TEST_CASE("copying a clip leaves the original and drops a copy",
     CHECK(edit.track(b)->clips.empty());
     CHECK(edit.track(a)->clips.size() == 1);
 }
+
+TEST_CASE("shift and cmd click build a multi-clip selection",
+          "[trackcommands]") {
+    document::Edit edit;
+    gui::TimelineViewState view;
+    const std::string t = edit.addTrack("Audio");
+    const std::string a = edit.addClip(t, audioClip(0, 1000));     // [0, 1000)
+    const std::string b = edit.addClip(t, audioClip(2000, 1000));  // [2000, 3000)
+    const std::string c = edit.addClip(t, audioClip(4000, 1000));  // [4000, 5000)
+    const int row = static_cast<int>(edit.tracks().size()) - 2;
+
+    // Plain click on A selects A alone.
+    gui::applyClipSelection(view, edit, row, a, false, false);
+    CHECK(view.selectedClipId == a);
+    CHECK(view.selectedClipIds.size() == 1);
+
+    // Shift-click C takes the whole run A..C, gaps included.
+    gui::applyClipSelection(view, edit, row, c, true, false);
+    CHECK(view.selectedClipIds.size() == 3);
+    CHECK(view.selectedClipIds.count(b) == 1);
+    CHECK(view.selectionStart == 0);
+    CHECK(view.selectionEnd == 5000);
+    CHECK(view.hasSelection);
+
+    // Cmd-click B toggles just B out — the others stay, no range change.
+    gui::applyClipSelection(view, edit, row, b, false, true);
+    CHECK(view.selectedClipIds.count(b) == 0);
+    CHECK(view.selectedClipIds.count(a) == 1);
+    CHECK(view.selectedClipIds.count(c) == 1);
+}

@@ -286,6 +286,8 @@ bool DaveApp::init(bool startAudio) {
         imgui_.setViewportsEnabled(videoPoppedOut_);
         imgui_.newFrame();
         handleShortcuts();
+        servicePostRoll();
+        if (auto metro = builder_.metronome()) metro->setEnabled(metronomeEnabled_);
         drawUI();
         // Last writer in the frame, so the backend's next NewFrame reads None
         // and takes its hide path instead of putting the arrow back. Without
@@ -409,13 +411,21 @@ void DaveApp::handleShortcuts() {
         // gets default fades on both ends. Shapes and the default length come
         // from the Fades preferences. Dispatch lives in Timeline.cpp for the
         // test.
-        const int64_t defaultFade = static_cast<int64_t>(
-            editorPreferences_.defaultFadeMs *
-            static_cast<double>(edit_.sampleRate()) / 1000.0);
-        if (!gui::createFadeFromSelection(
-                edit_, undo_, view_, editorPreferences_.defaultFadeInShape,
-                editorPreferences_.defaultFadeOutShape, defaultFade)) {
-            showStatus("Select part of an audio clip to fade", true);
+        const double sr = static_cast<double>(edit_.sampleRate());
+        const int64_t defaultFade =
+            static_cast<int64_t>(editorPreferences_.defaultFadeMs * sr / 1000.0);
+        const int64_t crossFree = static_cast<int64_t>(
+            editorPreferences_.defaultCrossfadeMs * sr / 1000.0);
+        // A selected clip overlapping a neighbour crossfades; otherwise F fades
+        // the selection.
+        if (!gui::createCrossfadeForSelectedClip(
+                edit_, undo_, view_, editorPreferences_.defaultCrossfadeShape,
+                crossFree, editorPreferences_.defaultCrossfadeShape)) {
+            if (!gui::createFadeFromSelection(
+                    edit_, undo_, view_, editorPreferences_.defaultFadeInShape,
+                    editorPreferences_.defaultFadeOutShape, defaultFade)) {
+                showStatus("Select part of an audio clip to fade", true);
+            }
         }
     } else if (!primaryModifier && !shift && !alt &&
                ImGui::IsKeyPressed(ImGuiKey_A, false)) {
@@ -881,6 +891,27 @@ void DaveApp::drawPreferencesWindow() {
                 "Used when F fades a whole clip, and to soften the edges of "
                 "imported clips.");
 
+            ImGui::Separator();
+            ImGui::TextUnformatted("Crossfade (F on an overlapping clip)");
+            int xfShape =
+                static_cast<int>(editorPreferences_.defaultCrossfadeShape);
+            ImGui::SetNextItemWidth(160.0f);
+            if (ImGui::Combo("##xfShape", &xfShape, kShapeNames,
+                             IM_ARRAYSIZE(kShapeNames))) {
+                editorPreferences_.defaultCrossfadeShape =
+                    static_cast<document::FadeShape>(xfShape);
+                saveEditorPreferences();
+            }
+            ImGui::SameLine();
+            previewCurve(editorPreferences_.defaultCrossfadeShape, false);
+            ImGui::SetNextItemWidth(200.0f);
+            ImGui::SliderInt("##xfMs", &editorPreferences_.defaultCrossfadeMs, 0,
+                             500, "%d ms");
+            if (ImGui::IsItemDeactivatedAfterEdit()) saveEditorPreferences();
+            ImGui::TextDisabled(
+                "Curve across the overlap (equal power holds constant loudness);"
+                " length is the auto-fade on the clip's free edge.");
+
             ImGui::EndTabItem();
         }
 
@@ -1276,15 +1307,46 @@ void DaveApp::endCapture() {
 
 void DaveApp::togglePlayback() {
     auto& tr = audio_.transport();
-    // Rewind by the pre-roll before starting, so playback rolls in ahead of the
-    // cursor. Stopping is unchanged — the pre-roll is a lead-in, not a jump.
-    if (!tr.isPlaying() && editorPreferences_.preRollEnabled) {
-        const int64_t pre = static_cast<int64_t>(
-            editorPreferences_.preRollMs *
-            static_cast<double>(edit_.sampleRate()) / 1000.0);
-        tr.seek(std::max<int64_t>(0, tr.position() - pre));
+    if (tr.isPlaying()) {
+        tr.toggle();
+        playStopAt_ = -1;
+        return;
     }
-    tr.toggle();
+    const double sr = static_cast<double>(edit_.sampleRate());
+    const int64_t pre = editorPreferences_.preRollEnabled
+        ? static_cast<int64_t>(editorPreferences_.preRollMs * sr / 1000.0) : 0;
+    const int64_t post = editorPreferences_.postRollEnabled
+        ? static_cast<int64_t>(editorPreferences_.postRollMs * sr / 1000.0) : 0;
+    const bool rolling =
+        editorPreferences_.preRollEnabled || editorPreferences_.postRollEnabled;
+    playStopAt_ = -1;
+    int64_t startAt = tr.position();
+    if (rolling && view_.hasSelection &&
+        view_.selectionEnd != view_.selectionStart) {
+        // Audition the selection: roll in ahead of its start and, with
+        // post-roll on, stop a tail past its end.
+        const int64_t selStart = std::min(view_.selectionStart, view_.selectionEnd);
+        const int64_t selEnd = std::max(view_.selectionStart, view_.selectionEnd);
+        startAt = selStart;
+        if (editorPreferences_.postRollEnabled) playStopAt_ = selEnd + post;
+    }
+    // The pre-roll is a lead-in, not a jump: rewind from wherever playback would
+    // begin.
+    tr.seek(std::max<int64_t>(0, startAt - pre));
+    tr.toggle();  // play
+}
+
+void DaveApp::servicePostRoll() {
+    if (playStopAt_ < 0) return;
+    auto& tr = audio_.transport();
+    if (!tr.isPlaying()) {
+        playStopAt_ = -1;
+        return;
+    }
+    if (tr.position() >= playStopAt_) {
+        tr.toggle();  // stop
+        playStopAt_ = -1;
+    }
 }
 
 void DaveApp::toggleRecording() {
@@ -1965,6 +2027,15 @@ void DaveApp::drawUI() {
                     syncTransportLoop();
                 }
             }
+        }
+        ImGui::SameLine(0.0f, kGap);
+        if (gui::theme::iconButton(
+                "##metronome", gui::theme::TransportIcon::Metronome,
+                "Metronome — a click on every beat while playing",
+                ImVec2(controlH, controlH),
+                metronomeEnabled_ ? gui::theme::ButtonVariant::Primary
+                                  : gui::theme::ButtonVariant::Normal)) {
+            metronomeEnabled_ = !metronomeEnabled_;
         }
         groupSeparator();
 

@@ -7,6 +7,7 @@
 #include "engine/nodes/AudioClipNode.h"
 #include "engine/nodes/GainNode.h"
 #include "engine/nodes/InstrumentNode.h"
+#include "engine/nodes/MetronomeNode.h"
 #include "engine/nodes/RoutingNodes.h"
 #include "engine/nodes/SummingNode.h"
 #include "engine/plugins/PluginInstance.h"
@@ -47,6 +48,7 @@ public:
                                  int playbackChannels = 2);
 
     std::shared_ptr<GainNode> master() const { return master_; }
+    std::shared_ptr<MetronomeNode> metronome() const { return metronome_; }
     const std::unordered_map<std::string, std::shared_ptr<GainNode>>& trackGains() const {
         return trackGains_;
     }
@@ -105,6 +107,7 @@ private:
     std::unordered_map<std::string, uint32_t> pluginLatencies_;
 
     std::shared_ptr<GainNode> master_;
+    std::shared_ptr<MetronomeNode> metronome_;
     std::unordered_map<std::string, std::shared_ptr<GainNode>> trackGains_;
     std::unordered_map<std::string, std::shared_ptr<GainNode>> meterTaps_;
     std::unordered_map<std::string, std::shared_ptr<AudioClipNode>> clipNodes_;

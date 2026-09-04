@@ -261,3 +261,50 @@ TEST_CASE("D and G fade the selected clip to the playhead", "[clipedit]") {
     CHECK_FALSE(gui::fadeSelectedClipToPlayhead(edit, undo, view, 500, true,
                                                 document::FadeShape::Linear));
 }
+
+TEST_CASE("F crossfades a clip that overlaps a neighbour",
+          "[clipedit][crossfade]") {
+    document::Edit edit;
+    editing::UndoStack undo{edit};
+    gui::TimelineViewState view;
+    const std::string t = edit.addTrack("Audio");
+    document::AudioClip a;
+    a.timelineStart = 0;
+    a.length = 10000;                    // A [0, 10000)
+    const std::string aId = edit.addClip(t, a);
+    document::AudioClip b;
+    b.timelineStart = 8000;              // laps A's tail; overlap [8000, 10000)
+    b.length = 10000;
+    const std::string bId = edit.addClip(t, b);
+    view.selectedTrackIndex = static_cast<int>(edit.tracks().size()) - 2;
+    view.selectedClipId = aId;           // A is outgoing
+
+    REQUIRE(gui::createCrossfadeForSelectedClip(
+        edit, undo, view, FadeShape::EqualPower, 500, FadeShape::Linear));
+    const auto* A = edit.clip(t, aId);
+    const auto* B = edit.clip(t, bId);
+    // Crossfade over the 2000-sample overlap: A fades out, B fades in, both
+    // equal-power.
+    CHECK(A->fadeOut == 2000);
+    CHECK(A->fadeOutShape == FadeShape::EqualPower);
+    CHECK(B->fadeIn == 2000);
+    CHECK(B->fadeInShape == FadeShape::EqualPower);
+    // A's free edge (its head) takes the auto-fade.
+    CHECK(A->fadeIn == 500);
+
+    // One undo clears both clips' fades.
+    undo.undo();
+    CHECK(edit.clip(t, aId)->fadeOut == 0);
+    CHECK(edit.clip(t, bId)->fadeIn == 0);
+
+    // A clip with no overlapping neighbour crossfades nothing.
+    document::Edit lone;
+    editing::UndoStack lu{lone};
+    gui::TimelineViewState lv;
+    const std::string lt = lone.addTrack("Audio");
+    const std::string lc = lone.addClip(lt, a);
+    lv.selectedTrackIndex = static_cast<int>(lone.tracks().size()) - 2;
+    lv.selectedClipId = lc;
+    CHECK_FALSE(gui::createCrossfadeForSelectedClip(
+        lone, lu, lv, FadeShape::EqualPower, 500, FadeShape::Linear));
+}

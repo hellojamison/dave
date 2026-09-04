@@ -107,3 +107,20 @@ TEST_CASE("per-clip gain and mute reach the output", "[clipoverlap][clipgain]") 
     CHECK(levelAt50(0.5f, false) == 0.5f);   // half gain scales the sample
     CHECK(levelAt50(1.0f, true) == 0.0f);    // muted is silent regardless
 }
+
+TEST_CASE("a crossfade lifts the overlap mute", "[clipoverlap][crossfade]") {
+    std::vector<document::AudioClip> clips(2);
+    clips[0].timelineStart = 0;
+    clips[0].length = 10000;
+    clips[1].timelineStart = 8000;   // overlap [8000, 10000)
+    clips[1].length = 10000;
+
+    // Without complementary fades the lower clip is muted across the overlap.
+    REQUIRE(document::clipMuteIntervals(clips, 0).size() == 1);
+
+    // Add a crossfade — A fades out into the overlap, B fades in across it —
+    // and the mute stands down so both play.
+    clips[0].fadeOut = 2000;
+    clips[1].fadeIn = 2000;
+    CHECK(document::clipMuteIntervals(clips, 0).empty());
+}

@@ -68,6 +68,7 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit,
                                            int playbackChannels) {
     auto graph = std::make_unique<Graph>();
     master_.reset();
+    metronome_.reset();
     trackGains_.clear();
     meterTaps_.clear();
     clipNodes_.clear();
@@ -453,6 +454,18 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit,
             ++it;
         }
     }
+    // The metronome mixes straight into the hardware output, post everything,
+    // so it is audible whatever the track routing. It carries the tempo/meter
+    // maps to place its clicks; enable is toggled atomically (no rebuild).
+    metronome_ = std::make_shared<MetronomeNode>();
+    metronome_->configure(sampleRate, edit.tempoMap(), edit.meterMap());
+    const NodeId metroId = graph->addNode(metronome_);
+    const int metroCount = physicalChannels >= 2 ? 2 : 1;
+    const NodeId metroMap =
+        graph->addNode(std::make_shared<HardwareRouteNode>(0, metroCount));
+    graph->connect(metroId, 0, metroMap, 0);
+    graph->connect(metroMap, 0, hardwareRootId, 0);
+
     return graph;
 }
 

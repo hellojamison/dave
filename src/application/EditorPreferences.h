@@ -31,6 +31,11 @@ struct EditorPreferences {
     document::FadeShape defaultFadeInShape = document::FadeShape::Linear;
     document::FadeShape defaultFadeOutShape = document::FadeShape::Linear;
     int defaultFadeMs = 10;
+    // Crossfade defaults: the shape both sides take across an overlap (equal
+    // power is the constant-power default), and the length of the auto-fade on
+    // the clip's free edge when F crossfades an overlap.
+    document::FadeShape defaultCrossfadeShape = document::FadeShape::EqualPower;
+    int defaultCrossfadeMs = 20;
     // Pre-roll rolls playback in this far ahead of the cursor before the start
     // point; post-roll is the tail kept rolling past it. Milliseconds.
     bool preRollEnabled = false;

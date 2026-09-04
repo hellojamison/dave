@@ -236,6 +236,61 @@ static std::vector<PanAutomationPoint> panAutomationFromJson(
     return result;
 }
 
+// Clip payloads, shared by the track's live clips and its parked playlists so
+// a playlist round-trips exactly the way the track does.
+static json audioClipToJson(const AudioClip& c) {
+    return {{"id", c.id},
+            {"asset", c.asset.sha256},
+            {"timelineStart", c.timelineStart},
+            {"sourceOffset", c.sourceOffset},
+            {"length", c.length},
+            {"gain", c.gain},
+            {"muted", c.muted},
+            {"fadeIn", c.fadeIn},
+            {"fadeOut", c.fadeOut},
+            {"fadeInShape", static_cast<int>(c.fadeInShape)},
+            {"fadeOutShape", static_cast<int>(c.fadeOutShape)}};
+}
+
+static AudioClip readAudioClip(const json& jc) {
+    AudioClip c;
+    c.id = jc.value("id", "");
+    c.asset = AssetId{jc.value("asset", "")};
+    c.timelineStart = jc.value("timelineStart", int64_t(0));
+    c.sourceOffset = jc.value("sourceOffset", int64_t(0));
+    c.length = jc.value("length", int64_t(0));
+    c.gain = jc.value("gain", 1.0);
+    c.muted = jc.value("muted", false);
+    c.fadeIn = jc.value("fadeIn", int64_t(0));
+    c.fadeOut = jc.value("fadeOut", int64_t(0));
+    c.fadeInShape = static_cast<FadeShape>(jc.value("fadeInShape", 0));
+    c.fadeOutShape = static_cast<FadeShape>(jc.value("fadeOutShape", 0));
+    return c;
+}
+
+// Notes and tempi stay positional arrays: object keys per note turn a small
+// project into a megabyte of field names.
+static json midiClipToJson(const MidiClip& c) {
+    json notes = json::array();
+    for (const auto& n : c.notes) {
+        notes.push_back({n.startSample, n.lengthSamples, n.pitch, n.velocity,
+                         n.channel});
+    }
+    json tempi = json::array();
+    for (const auto& tempo : c.sourceTempi) {
+        tempi.push_back({tempo.tick, tempo.microsecondsPerQuarter});
+    }
+    return {{"id", c.id},
+            {"name", c.name},
+            {"timelineStart", c.timelineStart},
+            {"sourceOffset", c.sourceOffset},
+            {"length", c.length},
+            {"notes", std::move(notes)},
+            {"sourcePath", c.sourcePath},
+            {"sourcePpq", c.sourcePpq},
+            {"sourceTempi", std::move(tempi)}};
+}
+
 template <typename Channel>
 static void writeChannelRouting(json& value, const Channel& channel) {
     value["mainOutput"] = routeToJson(channel.mainOutput);
@@ -340,45 +395,30 @@ std::string serializeEdit(const Edit& edit) {
         writeChannelRouting(jt, t);
 
         json clips = json::array();
-        for (const auto& c : t.clips) {
-            clips.push_back({{"id", c.id},
-                             {"asset", c.asset.sha256},
-                             {"timelineStart", c.timelineStart},
-                             {"sourceOffset", c.sourceOffset},
-                             {"length", c.length},
-                             {"gain", c.gain},
-                             {"muted", c.muted},
-                             {"fadeIn", c.fadeIn},
-                             {"fadeOut", c.fadeOut},
-                             {"fadeInShape", static_cast<int>(c.fadeInShape)},
-                             {"fadeOutShape", static_cast<int>(c.fadeOutShape)}});
-        }
+        for (const auto& c : t.clips) clips.push_back(audioClipToJson(c));
         jt["clips"] = std::move(clips);
 
-        // Notes and tempi stay positional arrays: object keys per note turn a
-        // small project into a megabyte of field names.
         json midiClips = json::array();
-        for (const auto& c : t.midiClips) {
-            json notes = json::array();
-            for (const auto& n : c.notes) {
-                notes.push_back({n.startSample, n.lengthSamples, n.pitch,
-                                 n.velocity, n.channel});
-            }
-            json tempi = json::array();
-            for (const auto& tempo : c.sourceTempi) {
-                tempi.push_back({tempo.tick, tempo.microsecondsPerQuarter});
-            }
-            midiClips.push_back({{"id", c.id},
-                                 {"name", c.name},
-                                 {"timelineStart", c.timelineStart},
-                                 {"sourceOffset", c.sourceOffset},
-                                 {"length", c.length},
-                                 {"notes", std::move(notes)},
-                                 {"sourcePath", c.sourcePath},
-                                 {"sourcePpq", c.sourcePpq},
-                                 {"sourceTempi", std::move(tempi)}});
-        }
+        for (const auto& c : t.midiClips) midiClips.push_back(midiClipToJson(c));
         jt["midiClips"] = std::move(midiClips);
+
+        // Playlists: the parked takes. Only written once a track has a
+        // roster, so older-shaped tracks stay byte-for-byte the same.
+        if (!t.playlists.empty()) {
+            json playlists = json::array();
+            for (const auto& p : t.playlists) {
+                json pc = json::array();
+                for (const auto& c : p.clips) pc.push_back(audioClipToJson(c));
+                json pm = json::array();
+                for (const auto& c : p.midiClips) pm.push_back(midiClipToJson(c));
+                playlists.push_back({{"id", p.id},
+                                     {"name", p.name},
+                                     {"clips", std::move(pc)},
+                                     {"midiClips", std::move(pm)}});
+            }
+            jt["playlists"] = std::move(playlists);
+            jt["activePlaylistId"] = t.activePlaylistId;
+        }
         jt["instrument"] = pluginSlotToJson(t.instrument);
 
         json plugins = json::array();
@@ -625,21 +665,7 @@ ProjectResult deserializeEdit(const std::string& text, Edit& edit) {
             if (!legacyV1) readChannelRouting(jt, t);
             if (jt.contains("clips")) {
                 for (const auto& jc : jt["clips"]) {
-                    AudioClip c;
-                    c.id = jc.value("id", "");
-                    c.asset = AssetId{jc.value("asset", "")};
-                    c.timelineStart = jc.value("timelineStart", int64_t(0));
-                    c.sourceOffset = jc.value("sourceOffset", int64_t(0));
-                    c.length = jc.value("length", int64_t(0));
-                    c.gain = jc.value("gain", 1.0);
-                    c.muted = jc.value("muted", false);
-                    c.fadeIn = jc.value("fadeIn", int64_t(0));
-                    c.fadeOut = jc.value("fadeOut", int64_t(0));
-                    c.fadeInShape = static_cast<FadeShape>(
-                        jc.value("fadeInShape", 0));
-                    c.fadeOutShape = static_cast<FadeShape>(
-                        jc.value("fadeOutShape", 0));
-                    t.clips.push_back(std::move(c));
+                    t.clips.push_back(readAudioClip(jc));
                 }
             }
             // v4 rows carry whatever content they have. In v1..v3 these keys
@@ -648,6 +674,25 @@ ProjectResult deserializeEdit(const std::string& text, Edit& edit) {
                 for (const auto& jc : jt["midiClips"]) {
                     t.midiClips.push_back(readMidiClip(jc));
                 }
+            }
+            if (jt.contains("playlists") && jt["playlists"].is_array()) {
+                for (const auto& jp : jt["playlists"]) {
+                    Playlist p;
+                    p.id = jp.value("id", "");
+                    p.name = jp.value("name", "");
+                    if (jp.contains("clips")) {
+                        for (const auto& jc : jp["clips"]) {
+                            p.clips.push_back(readAudioClip(jc));
+                        }
+                    }
+                    if (jp.contains("midiClips")) {
+                        for (const auto& jc : jp["midiClips"]) {
+                            p.midiClips.push_back(readMidiClip(jc));
+                        }
+                    }
+                    if (!p.id.empty()) t.playlists.push_back(std::move(p));
+                }
+                t.activePlaylistId = jt.value("activePlaylistId", "");
             }
             if (jt.contains("instrument")) {
                 t.instrument = pluginSlotFromJson(jt["instrument"]);

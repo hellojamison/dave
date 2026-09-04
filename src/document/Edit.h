@@ -107,6 +107,31 @@ public:
     // Additional post-fader destinations beside the main output. Refused when
     // the route would be invalid or is already one of the track's outputs.
     bool addOutput(const std::string& ownerId, RouteTarget target);
+
+    // ─── Playlists ──────────────────────────────────────────────────────
+    // The active playlist's clips are Track::clips/midiClips; the others sit
+    // in Track::playlists. The roster is materialised on first use, so a
+    // track that never asked for a second playlist carries nothing extra.
+    const Playlist* playlist(const std::string& trackId,
+                             const std::string& playlistId) const;
+    // A new, empty playlist (or a copy of the active one, with fresh clip
+    // ids). Returns its id; the active playlist does not change.
+    std::string addPlaylist(const std::string& trackId, std::string name,
+                            bool duplicateActive);
+    // Swap the active playlist's clips out and the named one's in.
+    bool switchPlaylist(const std::string& trackId,
+                        const std::string& playlistId);
+    bool renamePlaylist(const std::string& trackId,
+                        const std::string& playlistId, std::string name);
+    // Only an inactive playlist can go; the active one is the track.
+    bool removePlaylist(const std::string& trackId,
+                        const std::string& playlistId);
+    // Replay helper: put a removed playlist back at its old index.
+    bool restorePlaylist_(const std::string& trackId, Playlist playlist,
+                          size_t index);
+    // The roster with the active entry first-class: id and name for every
+    // playlist, including the one that is playing.
+    std::vector<Playlist> playlistRoster(const std::string& trackId) const;
     bool removeOutput(const std::string& ownerId, const RouteTarget& target);
     bool setTrackHardwareInput(const std::string& trackId,
                                HardwareChannelSpan span);
@@ -230,6 +255,7 @@ public:
     bool clipGroupTracksFit_(const std::string& groupId, int rowDelta) const;
     void shiftClipGroupTracks_(const std::string& groupId, int rowDelta);
     int trackIndexOf_(const std::string& trackId) const;
+    void normalizePlaylists_(Track& track);
     int64_t earliestInClipGroup_(const std::string& groupId) const;
     void loadClipGroup_(ClipGroup group) {
         clipGroups_.push_back(std::move(group));

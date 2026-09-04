@@ -1282,6 +1282,126 @@ private:
     document::RouteTarget previous_ = document::RouteTarget::none();
 };
 
+// ─── Playlists ─────────────────────────────────────────────────────────────
+
+class AddPlaylistCommand : public Command {
+public:
+    AddPlaylistCommand(std::string trackId, std::string name,
+                       bool duplicateActive)
+        : trackId_(std::move(trackId)), name_(std::move(name)),
+          duplicate_(duplicateActive) {}
+    void perform(document::Edit& e) override {
+        if (playlistId_.empty()) {
+            playlistId_ = e.addPlaylist(trackId_, name_, duplicate_);
+        } else {
+            e.restorePlaylist_(trackId_, snapshot_, index_);
+        }
+    }
+    void undo(document::Edit& e) override {
+        // Keep the record so redo puts back the same id (and, for a
+        // duplicate, the same copied clips).
+        if (const auto* t = e.track(trackId_)) {
+            for (size_t i = 0; i < t->playlists.size(); ++i) {
+                if (t->playlists[i].id == playlistId_) {
+                    snapshot_ = t->playlists[i];
+                    index_ = i;
+                }
+            }
+        }
+        e.removePlaylist(trackId_, playlistId_);
+    }
+    std::string name() const override {
+        return duplicate_ ? "Duplicate Playlist" : "New Playlist";
+    }
+    const std::string& playlistId() const { return playlistId_; }
+private:
+    std::string trackId_;
+    std::string name_;
+    bool duplicate_ = false;
+    std::string playlistId_;
+    document::Playlist snapshot_;
+    size_t index_ = 0;
+};
+
+class SwitchPlaylistCommand : public Command {
+public:
+    SwitchPlaylistCommand(std::string trackId, std::string playlistId)
+        : trackId_(std::move(trackId)), playlistId_(std::move(playlistId)) {}
+    void perform(document::Edit& e) override {
+        if (const auto* t = e.track(trackId_)) previous_ = t->activePlaylistId;
+        applied_ = e.switchPlaylist(trackId_, playlistId_);
+        // The first switch materialises the roster, which names the
+        // previously-implicit playlist; read the id back for undo.
+        if (applied_ && previous_.empty()) {
+            if (const auto* t = e.track(trackId_)) {
+                for (const auto& p : t->playlists) {
+                    if (p.id != playlistId_) { previous_ = p.id; break; }
+                }
+            }
+        }
+    }
+    void undo(document::Edit& e) override {
+        if (applied_) e.switchPlaylist(trackId_, previous_);
+    }
+    std::string name() const override { return "Switch Playlist"; }
+private:
+    std::string trackId_;
+    std::string playlistId_;
+    std::string previous_;
+    bool applied_ = false;
+};
+
+class RenamePlaylistCommand : public Command {
+public:
+    RenamePlaylistCommand(std::string trackId, std::string playlistId,
+                          std::string name)
+        : trackId_(std::move(trackId)), playlistId_(std::move(playlistId)),
+          name_(std::move(name)) {}
+    void perform(document::Edit& e) override {
+        if (const auto* p = e.playlist(trackId_, playlistId_)) {
+            previous_ = p->name;
+        }
+        applied_ = e.renamePlaylist(trackId_, playlistId_, name_);
+    }
+    void undo(document::Edit& e) override {
+        if (applied_) e.renamePlaylist(trackId_, playlistId_, previous_);
+    }
+    std::string name() const override { return "Rename Playlist"; }
+private:
+    std::string trackId_;
+    std::string playlistId_;
+    std::string name_;
+    std::string previous_;
+    bool applied_ = false;
+};
+
+class RemovePlaylistCommand : public Command {
+public:
+    RemovePlaylistCommand(std::string trackId, std::string playlistId)
+        : trackId_(std::move(trackId)), playlistId_(std::move(playlistId)) {}
+    void perform(document::Edit& e) override {
+        if (const auto* t = e.track(trackId_)) {
+            for (size_t i = 0; i < t->playlists.size(); ++i) {
+                if (t->playlists[i].id == playlistId_) {
+                    snapshot_ = t->playlists[i];
+                    index_ = i;
+                }
+            }
+        }
+        applied_ = e.removePlaylist(trackId_, playlistId_);
+    }
+    void undo(document::Edit& e) override {
+        if (applied_) e.restorePlaylist_(trackId_, snapshot_, index_);
+    }
+    std::string name() const override { return "Delete Playlist"; }
+private:
+    std::string trackId_;
+    std::string playlistId_;
+    document::Playlist snapshot_;
+    size_t index_ = 0;
+    bool applied_ = false;
+};
+
 class AddOutputCommand : public Command {
 public:
     AddOutputCommand(std::string ownerId, document::RouteTarget target)

@@ -45,6 +45,7 @@ add_executable(dave_tests
     test_clipoverlap.cpp
     test_metronome.cpp
     test_sinesynth.cpp
+    test_playlists.cpp
     test_transientdetector.cpp
     test_transientcache.cpp
     test_transientnavigation.cpp

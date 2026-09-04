@@ -942,13 +942,25 @@ void drawTimeline(const document::Edit& edit,
     // selection, drag and command in the timeline indexes tracks by their
     // position in the document; compacting the table here would silently
     // renumber all of them the moment a track was hidden.
-    // The lanes an open track shows, top to bottom: one automation lane.
+    // The lanes an open track shows, top to bottom: one lane, automation or
+    // playlists, per the track's lane mode.
     auto lanesOf = [&](const std::string& id) -> std::vector<LaneMode> {
         if (!view.expandedTracks.contains(id)) return {};
-        return {LaneMode::Automation};
+        const auto it = view.trackLaneModes.find(id);
+        return {it != view.trackLaneModes.end() ? it->second
+                                                : LaneMode::Automation};
     };
-    auto laneHeightFor = [&](const document::Track&, LaneMode) -> float {
-        return automationLaneHeight;
+    // A playlists lane is one strip per parked playlist (at least one, for
+    // the empty message), each tall enough to read a clip name.
+    constexpr float playlistStripHeight = 34.0f;
+    auto laneHeightFor = [&](const document::Track& t, LaneMode mode) -> float {
+        if (mode == LaneMode::Automation) return automationLaneHeight;
+        size_t parked = 0;
+        for (const auto& p : t.playlists) {
+            if (p.id != t.activePlaylistId) ++parked;
+        }
+        return 8.0f + playlistStripHeight *
+                          static_cast<float>(std::max<size_t>(1, parked)) + 8.0f;
     };
     auto lanesHeightOf = [&](const document::Track& t) -> float {
         float h = 0.0f;
@@ -1427,14 +1439,19 @@ void drawTimeline(const document::Edit& edit,
     // parameter (Volume/Pan) and the higher-level lane mode (Sends/Inserts),
     // because they are mutually exclusive views of the same lane and a second
     // control would not fit beside the automation tools.
-    // The automation lane's parameter picker: which envelope the lane shows.
+    // The lane's content picker: which envelope it shows, or the track's
+    // other playlists instead.
     auto drawLaneModeCombo = [&](const std::string& ownerId, float top) {
+        const LaneMode mode = view.trackLaneModes.count(ownerId)
+                                  ? view.trackLaneModes[ownerId]
+                                  : LaneMode::Automation;
         const AutomationParameter parameter =
             view.automationParameters.count(ownerId)
                 ? view.automationParameters[ownerId]
                 : AutomationParameter::Volume;
         const char* label =
-            parameter == AutomationParameter::Pan ? "Pan" : "Volume";
+            mode == LaneMode::Playlists ? "Playlists"
+            : parameter == AutomationParameter::Pan ? "Pan" : "Volume";
         const ImVec2 savedCursor = ImGui::GetCursorScreenPos();
         ImGui::SetCursorScreenPos(
             ImVec2(origin.x + kGutterContentX - 4.0f, top + 5.0f));
@@ -1442,13 +1459,22 @@ void drawTimeline(const document::Edit& edit,
         ImGui::SetNextItemWidth(90.0f);
         if (ImGui::BeginCombo("##laneMode", label,
                               ImGuiComboFlags_HeightSmall)) {
-            for (const auto choice : {AutomationParameter::Volume,
-                                      AutomationParameter::Pan}) {
-                const bool selected = choice == parameter;
-                if (ImGui::Selectable(
-                        choice == AutomationParameter::Volume ? "Volume" : "Pan",
-                        selected)) {
-                    view.automationParameters[ownerId] = choice;
+            struct Entry { const char* name; LaneMode mode;
+                           AutomationParameter param; };
+            const Entry entries[] = {
+                {"Volume", LaneMode::Automation, AutomationParameter::Volume},
+                {"Pan", LaneMode::Automation, AutomationParameter::Pan},
+                {"Playlists", LaneMode::Playlists, AutomationParameter::Volume},
+            };
+            for (const auto& entry : entries) {
+                const bool selected =
+                    entry.mode == mode &&
+                    (mode == LaneMode::Playlists || entry.param == parameter);
+                if (ImGui::Selectable(entry.name, selected)) {
+                    view.trackLaneModes[ownerId] = entry.mode;
+                    if (entry.mode == LaneMode::Automation) {
+                        view.automationParameters[ownerId] = entry.param;
+                    }
                     cancelAutomationGesture(ownerId);
                     automationConsumedClick = true;
                 }
@@ -1457,7 +1483,7 @@ void drawTimeline(const document::Edit& edit,
             ImGui::EndCombo();
         }
         const bool hovered = ImGui::IsItemHovered();
-        if (hovered) ImGui::SetTooltip("Automation parameter");
+        if (hovered) ImGui::SetTooltip("Lane content");
         automationMouseOver = automationMouseOver || hovered;
         ImGui::PopID();
         ImGui::SetCursorScreenPos(savedCursor);
@@ -2296,6 +2322,201 @@ void drawTimeline(const document::Edit& edit,
         drawAutomationLane(ownerId, normalized, top, parameter);
     };
 
+    // The playlists lane: every parked playlist as a strip — its name in the
+    // gutter (click to make it the one that plays) and its clips drawn in
+    // the lane, read-only, so takes can be compared and picked by eye.
+    auto drawPlaylistsLane = [&](const document::Track& track, float top) {
+        const float bottom = top + laneHeightFor(track, LaneMode::Playlists);
+        const float laneLeft = origin.x + gutterWidth;
+        const float laneRight = origin.x + totalWidth;
+        dl->AddRectFilled(ImVec2(origin.x, top),
+                          ImVec2(laneLeft, bottom), C(pal.surfaceBase));
+        dl->AddRectFilled(ImVec2(laneLeft, top),
+                          ImVec2(laneRight, bottom), C(pal.trackLaneAlt));
+        dl->AddLine(ImVec2(origin.x, top), ImVec2(laneRight, top),
+                    C(pal.border));
+        dl->AddLine(ImVec2(origin.x, bottom), ImVec2(laneRight, bottom),
+                    C(pal.border));
+        drawLaneModeCombo(track.id, top);
+        // The lane is a picker, not an edit surface: a press here must not
+        // start a range selection or seek.
+        if (mouse.x >= origin.x && mouse.x <= laneRight && mouse.y >= top &&
+            mouse.y <= bottom) {
+            automationMouseOver = true;
+        }
+
+        const ImVec2 savedCursor = ImGui::GetCursorScreenPos();
+        ImGui::PushID((track.id + "#playlists").c_str());
+        // The strips start under the combo's row in the gutter but use the
+        // full lane width for their clips.
+        float stripY = top + 8.0f;
+        // The combo sits in the first strip's gutter; names go below it, so
+        // the first strip's name row is offset to clear the combo.
+        size_t parked = 0;
+        for (size_t pi = 0; pi < track.playlists.size(); ++pi) {
+            const auto& playlist = track.playlists[pi];
+            if (playlist.id == track.activePlaylistId) continue;
+            ImGui::PushID(static_cast<int>(pi));
+            const float stripBottom = stripY + playlistStripHeight;
+            // Alternate strip shading so adjacent takes separate.
+            if (parked % 2 == 1) {
+                dl->AddRectFilled(ImVec2(laneLeft, stripY),
+                                  ImVec2(laneRight, stripBottom),
+                                  C(pal.trackLaneSurface));
+            }
+            // Name button in the gutter: click to switch to this playlist.
+            const float nameX = origin.x + kGutterContentX - 4.0f +
+                                (parked == 0 ? 94.0f : 0.0f);
+            const float nameW = origin.x + gutterWidth - 8.0f - nameX;
+            ImGui::SetCursorScreenPos(ImVec2(nameX, stripY + 7.0f));
+            if (ImGui::Button(playlist.name.c_str(),
+                              ImVec2(std::max(40.0f, nameW), 20.0f))) {
+                undo.execute(std::make_unique<editing::SwitchPlaylistCommand>(
+                    track.id, playlist.id));
+                automationConsumedClick = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Switch the track to this playlist");
+            }
+            // The clips, as plain named blocks.
+            dl->PushClipRect(ImVec2(laneLeft, stripY),
+                             ImVec2(laneRight, stripBottom), true);
+            auto drawBlock = [&](int64_t start, int64_t length,
+                                 const ImVec4& body, const ImVec4& border,
+                                 const char* name) {
+                const double x = laneLeft +
+                    (start - view.scrollSamples) / view.samplesPerPixel;
+                double w = static_cast<double>(length) / view.samplesPerPixel;
+                if (w < 2.0) w = 2.0;
+                if (x + w < laneLeft || x > laneRight) return;
+                const ImVec2 a(static_cast<float>(x), stripY + 4.0f);
+                const ImVec2 b(static_cast<float>(x + w), stripBottom - 4.0f);
+                dl->AddRectFilled(a, b, C(body), 2.0f);
+                dl->AddRect(a, b, C(border), 2.0f);
+                if (name != nullptr && *name != '\0' && w > 24.0) {
+                    dl->PushClipRect(a, b, true);
+                    dl->AddText(ImVec2(a.x + 4.0f, a.y + 2.0f),
+                                C(pal.primaryText), name);
+                    dl->PopClipRect();
+                }
+            };
+            for (const auto& clip : playlist.clips) {
+                const auto* asset = edit.asset(clip.asset);
+                std::string label;
+                if (asset != nullptr) {
+                    const auto slash = asset->path.find_last_of("/\\");
+                    label = slash == std::string::npos
+                        ? asset->path : asset->path.substr(slash + 1);
+                }
+                drawBlock(clip.timelineStart, clip.length, pal.clipAudio,
+                          pal.clipAudioBorder, label.c_str());
+            }
+            for (const auto& clip : playlist.midiClips) {
+                drawBlock(clip.timelineStart, clip.length, pal.clipMidi,
+                          pal.clipMidiBorder, clip.name.c_str());
+            }
+            dl->PopClipRect();
+            dl->AddLine(ImVec2(origin.x, stripBottom),
+                        ImVec2(laneRight, stripBottom),
+                        C(ImVec4(pal.border.x, pal.border.y, pal.border.z,
+                                 pal.border.w * 0.5f)));
+            ImGui::PopID();
+            stripY = stripBottom;
+            ++parked;
+        }
+        if (parked == 0) {
+            dl->AddText(ImVec2(laneLeft + 10.0f, top + 12.0f),
+                        C(pal.textMuted),
+                        "No other playlists \xe2\x80\x94 use \xe2\x96\xbe by "
+                        "the track name to add one");
+        }
+        ImGui::PopID();
+        ImGui::SetCursorScreenPos(savedCursor);
+    };
+
+    // The playlist menu by the track name: which take plays, plus new,
+    // duplicate and delete. Drawn here rather than in the gutter routine
+    // because it needs the undo stack.
+    auto drawPlaylistMenu = [&](const document::Track& track, float y,
+                                int uid) {
+        const float btnW = 16.0f;
+        const float btnX = origin.x + gutterWidth - 110.0f - btnW - 2.0f;
+        const float btnY = y + rowPadding;
+        const ImVec2 bMin(btnX, btnY);
+        const ImVec2 bMax(btnX + btnW, btnY + labelHeight);
+        ImGui::PushID(uid + 12000);
+        ImGui::SetCursorScreenPos(bMin);
+        const bool pressed = ImGui::InvisibleButton("##playlists",
+                                                    ImVec2(btnW, labelHeight));
+        const bool hovered = ImGui::IsItemHovered();
+        // A small caret; the roster's count is shown when there is one.
+        const ImU32 col = C(hovered ? pal.text : pal.textMuted);
+        const float cx = (bMin.x + bMax.x) * 0.5f;
+        const float cy = (bMin.y + bMax.y) * 0.5f;
+        dl->AddTriangleFilled(ImVec2(cx - 4.0f, cy - 2.0f),
+                              ImVec2(cx + 4.0f, cy - 2.0f),
+                              ImVec2(cx, cy + 3.0f), col);
+        if (hovered) ImGui::SetTooltip("Playlists");
+        if (pressed) ImGui::OpenPopup("##playlistMenu");
+        if (ImGui::BeginPopup("##playlistMenu")) {
+            ImGui::TextDisabled("Playlists");
+            ImGui::Separator();
+            const auto roster = edit.playlistRoster(track.id);
+            for (size_t i = 0; i < roster.size(); ++i) {
+                const auto& p = roster[i];
+                const bool active =
+                    p.id.empty() || p.id == track.activePlaylistId;
+                ImGui::PushID(static_cast<int>(i));
+                if (ImGui::MenuItem(p.name.c_str(), nullptr, active) &&
+                    !active) {
+                    undo.execute(
+                        std::make_unique<editing::SwitchPlaylistCommand>(
+                            track.id, p.id));
+                }
+                ImGui::PopID();
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("New Playlist")) {
+                undo.execute(std::make_unique<editing::AddPlaylistCommand>(
+                    track.id, "", false));
+            }
+            if (ImGui::MenuItem("Duplicate Playlist")) {
+                undo.execute(std::make_unique<editing::AddPlaylistCommand>(
+                    track.id, "", true));
+            }
+            if (ImGui::MenuItem("Show Playlists Lane", nullptr,
+                                view.expandedTracks.contains(track.id) &&
+                                    view.trackLaneModes.count(track.id) &&
+                                    view.trackLaneModes[track.id] ==
+                                        LaneMode::Playlists)) {
+                view.expandedTracks.insert(track.id);
+                view.trackLaneModes[track.id] = LaneMode::Playlists;
+            }
+            bool anyParked = false;
+            for (const auto& p : roster) {
+                if (!p.id.empty() && p.id != track.activePlaylistId) {
+                    anyParked = true;
+                }
+            }
+            if (anyParked && ImGui::BeginMenu("Delete Playlist")) {
+                for (size_t i = 0; i < roster.size(); ++i) {
+                    const auto& p = roster[i];
+                    if (p.id.empty() || p.id == track.activePlaylistId) continue;
+                    ImGui::PushID(static_cast<int>(i));
+                    if (ImGui::MenuItem(p.name.c_str())) {
+                        undo.execute(
+                            std::make_unique<editing::RemovePlaylistCommand>(
+                                track.id, p.id));
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::EndMenu();
+            }
+            ImGui::EndPopup();
+        }
+        ImGui::PopID();
+    };
+
     // Sends and inserts in the track head. Rows are compact — target · level
     // · mute · × for a send, name · bypass · × for an insert — and only as
     // many as fit between the pan row and the row's bottom, then an add row.
@@ -2629,6 +2850,7 @@ void drawTimeline(const document::Edit& edit,
             // in whatever height the row has spare — pull the row taller to
             // see and assign them.
             drawHeadChain(track, headFree, y + baseHeightOf(track) - 4.0f);
+            drawPlaylistMenu(track, y, static_cast<int>(ti));
         }
         // MIDI content on the same row. A track can hold both — audio clips
         // drawn above, note blobs here — because nothing about the row says
@@ -2851,8 +3073,12 @@ void drawTimeline(const document::Edit& edit,
             const auto lanes = lanesOf(track.id);
             for (size_t li = 0; li < lanes.size(); ++li) {
                 const LaneMode laneMode = lanes[li];
-                drawChannelAutomationLane(track.id, track.volumeAutomation,
-                                          track.panAutomation, laneTop);
+                if (laneMode == LaneMode::Playlists) {
+                    drawPlaylistsLane(track, laneTop);
+                } else {
+                    drawChannelAutomationLane(track.id, track.volumeAutomation,
+                                              track.panAutomation, laneTop);
+                }
                 laneTop += laneHeightFor(track, laneMode);
             }
         }

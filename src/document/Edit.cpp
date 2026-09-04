@@ -1167,6 +1167,157 @@ void Edit::shiftClipGroupTracks_(const std::string& groupId, int rowDelta) {
     for (const auto& childId : children) shiftClipGroupTracks_(childId, rowDelta);
 }
 
+// ─── Playlists ──────────────────────────────────────────────────────────────
+
+// Give the track its roster if it has none yet: one record for what is
+// playing now, named after the track. Idempotent.
+void Edit::normalizePlaylists_(Track& track) {
+    const bool haveActive = std::any_of(
+        track.playlists.begin(), track.playlists.end(),
+        [&](const Playlist& p) { return p.id == track.activePlaylistId; });
+    if (!track.activePlaylistId.empty() && haveActive) return;
+    Playlist active;
+    active.id = newId("pl_");
+    ++idCounter_;
+    active.name = track.name + ".01";
+    track.playlists.insert(track.playlists.begin(), std::move(active));
+    track.activePlaylistId = track.playlists.front().id;
+}
+
+const Playlist* Edit::playlist(const std::string& trackId,
+                               const std::string& playlistId) const {
+    const Track* t = track(trackId);
+    if (t == nullptr) return nullptr;
+    for (const auto& p : t->playlists) {
+        if (p.id == playlistId) return &p;
+    }
+    return nullptr;
+}
+
+std::vector<Playlist> Edit::playlistRoster(const std::string& trackId) const {
+    const Track* t = track(trackId);
+    if (t == nullptr) return {};
+    std::vector<Playlist> roster;
+    for (const auto& p : t->playlists) {
+        Playlist entry;
+        entry.id = p.id;
+        entry.name = p.name;
+        roster.push_back(std::move(entry));
+    }
+    if (roster.empty()) {
+        // No roster yet: the one implicit playlist, unnamed until it is
+        // materialised. An empty id tells the caller it is the active one.
+        Playlist only;
+        only.name = t->name + ".01";
+        roster.push_back(std::move(only));
+    }
+    return roster;
+}
+
+std::string Edit::addPlaylist(const std::string& trackId, std::string name,
+                              bool duplicateActive) {
+    Track* t = track(trackId);
+    if (t == nullptr) return "";
+    normalizePlaylists_(*t);
+    Playlist next;
+    next.id = newId("pl_");
+    ++idCounter_;
+    if (name.empty()) {
+        char suffix[8];
+        std::snprintf(suffix, sizeof(suffix), ".%02zu",
+                      t->playlists.size() + 1);
+        name = t->name + suffix;
+    }
+    next.name = std::move(name);
+    if (duplicateActive) {
+        // Copies with their own ids: two playlists must never share a clip
+        // id, or a command aimed at one would find the other.
+        for (auto clip : t->clips) {
+            clip.id = newId("clip_");
+            ++idCounter_;
+            next.clips.push_back(std::move(clip));
+        }
+        for (auto clip : t->midiClips) {
+            clip.id = newId("mclip_");
+            ++idCounter_;
+            next.midiClips.push_back(std::move(clip));
+        }
+    }
+    t->playlists.push_back(std::move(next));
+    notifyChanged();
+    return t->playlists.back().id;
+}
+
+bool Edit::switchPlaylist(const std::string& trackId,
+                          const std::string& playlistId) {
+    Track* t = track(trackId);
+    if (t == nullptr) return false;
+    normalizePlaylists_(*t);
+    if (playlistId == t->activePlaylistId) return false;
+    auto find = [&](const std::string& id) {
+        return std::find_if(t->playlists.begin(), t->playlists.end(),
+                            [&](const Playlist& p) { return p.id == id; });
+    };
+    const auto next = find(playlistId);
+    const auto current = find(t->activePlaylistId);
+    if (next == t->playlists.end() || current == t->playlists.end()) {
+        return false;
+    }
+    // Park what is playing, bring the other in. Moves, not copies: the
+    // clips keep their ids and their assets either way.
+    current->clips = std::move(t->clips);
+    current->midiClips = std::move(t->midiClips);
+    t->clips = std::move(next->clips);
+    t->midiClips = std::move(next->midiClips);
+    next->clips.clear();
+    next->midiClips.clear();
+    t->activePlaylistId = playlistId;
+    notifyChanged();
+    return true;
+}
+
+bool Edit::renamePlaylist(const std::string& trackId,
+                          const std::string& playlistId, std::string name) {
+    Track* t = track(trackId);
+    if (t == nullptr || name.empty()) return false;
+    normalizePlaylists_(*t);
+    for (auto& p : t->playlists) {
+        if (p.id == playlistId) {
+            if (p.name == name) return false;
+            p.name = std::move(name);
+            notifyChanged();
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Edit::removePlaylist(const std::string& trackId,
+                          const std::string& playlistId) {
+    Track* t = track(trackId);
+    if (t == nullptr || playlistId == t->activePlaylistId) return false;
+    const auto it = std::find_if(t->playlists.begin(), t->playlists.end(),
+                                 [&](const Playlist& p) {
+                                     return p.id == playlistId;
+                                 });
+    if (it == t->playlists.end()) return false;
+    t->playlists.erase(it);
+    notifyChanged();
+    return true;
+}
+
+bool Edit::restorePlaylist_(const std::string& trackId, Playlist playlist,
+                            size_t index) {
+    Track* t = track(trackId);
+    if (t == nullptr || playlist.id.empty()) return false;
+    if (this->playlist(trackId, playlist.id) != nullptr) return false;
+    const size_t at = std::min(index, t->playlists.size());
+    t->playlists.insert(t->playlists.begin() + static_cast<ptrdiff_t>(at),
+                        std::move(playlist));
+    notifyChanged();
+    return true;
+}
+
 bool Edit::restoreClipGroup_(ClipGroup group, size_t index) {
     if (group.id.empty()) return false;
     if (clipGroup(group.id) != nullptr) return false;

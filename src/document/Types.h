@@ -346,6 +346,19 @@ struct MidiClip {
 // clips route through `instrument`, audio clips bypass it straight into the
 // chain, and the code that handles each is genuinely different. An empty
 // vector costs nothing and keeps both paths honest.
+// An alternate set of clips for a track. A track plays exactly one playlist
+// at a time — the active one, whose clips live in Track::clips/midiClips —
+// and keeps the others here, silent, ready to be switched in. The active
+// playlist's record is in the list too (for its id and name) with empty clip
+// vectors, so the list is the complete roster and the track's own vectors are
+// the only place a live clip ever is.
+struct Playlist {
+    std::string id;
+    std::string name;
+    std::vector<AudioClip> clips;
+    std::vector<MidiClip> midiClips;
+};
+
 struct Track {
     std::string id;              // stable id
     std::string name;
@@ -396,6 +409,11 @@ struct Track {
     // reverb that guitar is feeding.
     bool soloSafe = false;
     std::vector<PluginSlot> plugins;
+    // Alternate takes, Pro Tools style. Empty means the track has the one
+    // implicit playlist it always had; Edit materialises the roster the first
+    // time a second one is asked for. See Playlist above for the invariant.
+    std::vector<Playlist> playlists;
+    std::string activePlaylistId;
     // The order everything above happens in. Holds one entry per plugin, one
     // per send, one Meter and one Fader; `plugins` and `sends` are storage,
     // this is sequence. Empty means "not built yet" and is filled in by

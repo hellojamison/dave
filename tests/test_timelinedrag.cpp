@@ -605,6 +605,43 @@ TEST_CASE("shift-clicking the lane selects from the playhead to the click",
     CHECK(rig.committedPosition() == 96000);
 }
 
+TEST_CASE("dragging a lane selection onto another row spans both rows",
+          "[timelinedrag][selection]") {
+    // A range dragged from one track down onto the next covers both: the
+    // selection is a rectangle of rows, not a single lane, so an edit made
+    // on it touches every row it was dragged across.
+    TimelineRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string a = rig.edit.addTrack("A");
+    rig.edit.addTrack("B");
+    rig.edit.addClip(a, [] {
+        document::AudioClip c;
+        c.timelineStart = 0;
+        c.length = 48000;
+        return c;
+    }());
+    const float probeX = rig.xOfSample(24000);
+    const float rowAY =
+        rig.findRowY(probeX, gui::TimelineViewState::DragKind::AudioClip);
+    REQUIRE(rowAY > 0.0f);
+    rig.tick(-100.0f, -100.0f, false);
+    rig.tick(-100.0f, -100.0f, false);
+    rig.view.dragKind = gui::TimelineViewState::DragKind::None;
+    rig.view.hasSelection = false;
+
+    // Empty lane on A, dragged down one row (rows are kTrackHeight apart
+    // when nothing is expanded) and along in time.
+    const float fromX = rig.xOfSample(100000);
+    const float toX = rig.xOfSample(200000);
+    rig.dragFrom(ImVec2(fromX, rowAY), ImVec2(toX, rowAY + kTrackHeight));
+
+    CHECK(rig.view.hasSelection);
+    CHECK(rig.view.selectionRow >= 0);
+    CHECK(rig.view.selectionRowEnd == rig.view.selectionRow + 1);
+    CHECK(std::min(rig.view.selectionStart, rig.view.selectionEnd) == 100000);
+    CHECK(std::max(rig.view.selectionStart, rig.view.selectionEnd) == 200000);
+}
+
 TEST_CASE("a clip drags from one track onto another", "[timelinedrag]") {
     // Cross-track drag: grab a clip on the first track and release it over the
     // second, and it should belong to the second track afterwards.

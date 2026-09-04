@@ -627,6 +627,7 @@ void DaveApp::navigateTimeline(gui::NavigationDirection direction,
         view_.selectionStart = selection.start;
         view_.selectionEnd = selection.end;
         view_.selectionRow = selected;
+        view_.selectionRowEnd = selected;
         audio_.transport().seek(selection.start);
     }
     pendingTransientNavigation_.reset();

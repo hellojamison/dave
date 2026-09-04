@@ -252,6 +252,9 @@ struct TimelineViewState {
     // lane stays in that lane, so selecting a range on one track cannot
     // silently arm an edit on its neighbours.
     int selectionRow = -1;
+    // The far row of a selection dragged across tracks; the range covers
+    // every row between it and selectionRow. -1 or equal = one row.
+    int selectionRowEnd = -1;
     // Where the press actually landed, before the format snap. A click that
     // turns out not to be a drag seeks here: the cursor goes where you
     // clicked, while a selection edge goes to the nearest division.
@@ -260,8 +263,10 @@ struct TimelineViewState {
     // channel reveals one parameter-selectable automation lane below its row.
     std::unordered_set<std::string> expandedTracks;
     std::unordered_map<std::string, AutomationParameter> automationParameters;
-    // Which content the expanded lane shows per track. Absent = Automation.
-    std::unordered_map<std::string, LaneMode> trackLaneModes;
+    // The lanes an expanded track shows, top to bottom. Absent or empty means
+    // one Automation lane. At most one Automation lane per track (its edit
+    // state is keyed by track); Sends and Inserts lanes can be added freely.
+    std::unordered_map<std::string, std::vector<LaneMode>> trackLanes;
     // Automation editing tools are global like the pointer tools in a DAW,
     // even though their compact toggle is repeated inside each open lane.
     AutomationTool automationTool = AutomationTool::Pencil;

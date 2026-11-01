@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "application/DaveApp.h"
 #include "application/MainEditorLayout.h"
+#include "application/PlaybackRange.h"
 #include "document/MarkerCsv.h"
 #include "document/ProjectFile.h"
 #include "editing/Commands.h"
@@ -1352,19 +1353,11 @@ void DaveApp::togglePlayback() {
         ? static_cast<int64_t>(editorPreferences_.preRollMs * sr / 1000.0) : 0;
     const int64_t post = editorPreferences_.postRollEnabled
         ? static_cast<int64_t>(editorPreferences_.postRollMs * sr / 1000.0) : 0;
-    const bool rolling =
-        editorPreferences_.preRollEnabled || editorPreferences_.postRollEnabled;
-    playStopAt_ = -1;
-    int64_t startAt = tr.position();
-    if (rolling && view_.hasSelection &&
-        view_.selectionEnd != view_.selectionStart) {
-        // Audition the selection: roll in ahead of its start and, with
-        // post-roll on, stop a tail past its end.
-        const int64_t selStart = std::min(view_.selectionStart, view_.selectionEnd);
-        const int64_t selEnd = std::max(view_.selectionStart, view_.selectionEnd);
-        startAt = selStart;
-        if (editorPreferences_.postRollEnabled) playStopAt_ = selEnd + post;
-    }
+    const auto range = playbackRange(
+        tr.position(), view_.hasSelection, view_.selectionStart,
+        view_.selectionEnd, loopEnabled_, post);
+    const int64_t startAt = range.start;
+    playStopAt_ = range.stop;
     // The pre-roll is a lead-in, not a jump: rewind from wherever playback would
     // begin.
     int64_t from = std::max<int64_t>(0, startAt - pre);

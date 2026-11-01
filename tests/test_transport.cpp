@@ -7,6 +7,7 @@
 // position the UI thread can see (currentPosition_) lags the position a
 // pending seek has already committed to — press play immediately after a
 // click and a naive implementation records the pre-click position.
+#include "application/PlaybackRange.h"
 #include "document/Edit.h"
 #include "document/ProjectFile.h"
 #include "engine/transport/Transport.h"
@@ -297,4 +298,26 @@ TEST_CASE("a loop shorter than one block still advances", "[transport]") {
         pump(t);
         REQUIRE(t.position() >= 0);
     }
+}
+
+TEST_CASE("playback starts at the selected range and stops at its end", "[transport][selection]") {
+    using application::playbackRange;
+    const auto forward = playbackRange(700000, true, 96000, 192000, false, 0);
+    CHECK(forward.start == 96000);
+    CHECK(forward.stop == 192000);
+    const auto reverse = playbackRange(700000, true, 192000, 96000, false, 0);
+    CHECK(reverse.start == 96000);
+    CHECK(reverse.stop == 192000);
+    const auto postRoll = playbackRange(700000, true, 96000, 192000, false, 48000);
+    CHECK(postRoll.start == 96000);
+    CHECK(postRoll.stop == 240000);
+    const auto loop = playbackRange(700000, true, 96000, 192000, true, 0);
+    CHECK(loop.start == 96000);
+    CHECK(loop.stop == -1);
+    const auto none = playbackRange(700000, false, 96000, 192000, false, 0);
+    CHECK(none.start == 700000);
+    CHECK(none.stop == -1);
+    const auto empty = playbackRange(700000, true, 96000, 96000, false, 0);
+    CHECK(empty.start == 700000);
+    CHECK(empty.stop == -1);
 }

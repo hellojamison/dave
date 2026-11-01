@@ -1820,10 +1820,9 @@ void DaveApp::drawUI() {
     const float menuH = 0.0f;
     const float baseX = vp->WorkPos.x;
     const float baseY = vp->WorkPos.y;
-    // Keep every existing control reachable when the window narrows. Groups
-    // wrap together rather than disappearing beyond the right edge.
-    const float toolbarH = vp->WorkSize.x < 400.0f ? 150.0f
-                         : vp->WorkSize.x < 750.0f ? 116.0f : 82.0f;
+    // Keep the toolbar on one row. At narrower sizes its horizontal
+    // scrollbar keeps the controls at the far end reachable.
+    const float toolbarH = vp->WorkSize.x < 1400.0f ? 58.0f : 44.0f;
     const float splitterSize = 6.0f;
     const float contentY = baseY + menuH + toolbarH;
     const float contentH = vp->WorkSize.y - toolbarH;
@@ -2009,7 +2008,7 @@ void DaveApp::drawUI() {
     // ─── Transport bar (full width, below menu) ──────────────────────────
     ImGui::SetNextWindowPos(ImVec2(baseX, baseY + menuH), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x, toolbarH), ImGuiCond_Always);
-    // Controls use compact rows; the bar reserves room for wrapping above.
+    // Controls stay on one horizontal row.
     const float kToolbarControlH = 30.0f;
     ImGui::PushStyleColor(ImGuiCol_WindowBg, pal.toolbarSurface);
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 1.0f);
@@ -2017,7 +2016,7 @@ void DaveApp::drawUI() {
         ImGuiStyleVar_WindowPadding,
         ImVec2(6.0f, 6.0f));
     ImGui::Begin("Transport", nullptr,
-                 panelFlags | ImGuiWindowFlags_NoScrollbar |
+                 panelFlags | ImGuiWindowFlags_HorizontalScrollbar |
                      ImGuiWindowFlags_NoScrollWithMouse);
     ImGui::PopStyleVar();
     {
@@ -2044,13 +2043,7 @@ void DaveApp::drawUI() {
             ImGui::TextColored(pal.textMuted, "%s", text);
             ImGui::SameLine(0.0f, kLabelGap);
         };
-        auto groupSeparator = [&](float nextGroupWidth) {
-            if (ImGui::GetItemRectMax().x + groupGap * 2.0f +
-                    nextGroupWidth > baseX + vp->WorkSize.x - 6.0f) {
-                ImGui::SetCursorScreenPos(
-                    ImVec2(baseX + 6.0f, ImGui::GetItemRectMax().y + 4.0f));
-                return;
-            }
+        auto groupSeparator = [&]() {
             ImGui::SameLine(0.0f, groupGap);
             const ImVec2 lineTop = ImGui::GetCursorScreenPos();
             ImGui::Dummy(ImVec2(1.0f, controlH));
@@ -2101,12 +2094,7 @@ void DaveApp::drawUI() {
                                   transport.position());
         }
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Zoom in horizontally");
-        if (wideToolbar) {
-            ImGui::SetCursorScreenPos(ImVec2(baseX + vp->WorkSize.x * 0.26f,
-                                            baseY + 6.0f));
-        } else {
-            groupSeparator(compactToolbar ? 150.0f : 170.0f);
-        }
+        groupSeparator();
 
         // Position readout — double-click to edit (type a timecode to seek).
         int64_t pos = transport.position();
@@ -2323,7 +2311,7 @@ void DaveApp::drawUI() {
             }
             ImGui::EndPopup();
         }
-        groupSeparator(compactToolbar ? 190.0f : 235.0f);
+        groupSeparator();
 
         // Editable selection start/end — smaller than the main counter. Each
         // field mirrors the selection until you focus it, then parses on blur.
@@ -2354,6 +2342,9 @@ void DaveApp::drawUI() {
                     if (parsed >= 0) value = parsed;
                 }
             };
+            const ImVec2 selectionGroupOrigin = ImGui::GetCursorScreenPos();
+            const float selectionRight = selectionGroupOrigin.x + 142.0f + groupGap;
+            const float selectionTop = selectionGroupOrigin.y;
             int64_t selS = std::min(view_.selectionStart, view_.selectionEnd);
             int64_t selE = std::max(view_.selectionStart, view_.selectionEnd);
             if (wideToolbar) {
@@ -2392,10 +2383,12 @@ void DaveApp::drawUI() {
             view_.selectionEnd = selE;
             if (selE > selS) view_.hasSelection = true;
             if (wideToolbar) {
-                ImGui::SetCursorScreenPos(ImVec2(baseX + vp->WorkSize.x * 0.55f,
-                                                baseY + 6.0f));
+                // The selection display has two small fields inside the one
+                // row. Resume at its right edge, at the row's original top.
+                ImGui::SetCursorScreenPos(ImVec2(
+                    selectionRight, selectionTop));
             } else {
-                groupSeparator(225.0f);
+                groupSeparator();
             }
         }
 
@@ -2526,7 +2519,7 @@ void DaveApp::drawUI() {
             }
             ImGui::EndPopup();
         }
-        groupSeparator(60.0f);
+        groupSeparator();
 
         // Pre-roll / post-roll. The button tints when either is on; it opens a
         // popup for the toggles and lengths. Pre-roll rewinds before playback
@@ -2615,11 +2608,7 @@ void DaveApp::drawUI() {
                 }
                 ImGui::EndPopup();
             }
-            // Grid and navigation form the toolbar's second row, like the
-            // compact controls in the reference Edit window.
-            ImGui::SetCursorScreenPos(
-                ImVec2(baseX + (wideToolbar ? vp->WorkSize.x * 0.42f : 6.0f),
-                       ImGui::GetItemRectMax().y + 4.0f));
+            groupSeparator();
         }
 
         // No +Track here: the timeline carries a + above its topmost row,

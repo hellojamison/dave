@@ -96,6 +96,12 @@ constexpr double kMaxSamplesPerPixel = 1'000'000.0;   // ~5.8 hours / 1000 px
 
 struct TimelineViewState {
     double samplesPerPixel = 200.0;  // zoom; lower = zoomed in
+    // Automatic grid/snap resolution is anchored before the first zoom.
+    double gridReferenceSamplesPerPixel = 0.0;
+    double gridReferenceZoom() const {
+        return gridReferenceSamplesPerPixel > 0.0
+            ? gridReferenceSamplesPerPixel : samplesPerPixel;
+    }
     double scrollSamples = 0.0;      // leftmost visible sample
     // Vertical scroll of the track rows, in pixels. Managed by the timeline
     // itself rather than the host window's scroll, so the ruler, marker lane
@@ -216,8 +222,7 @@ struct TimelineViewState {
     int64_t snapIncrementSamples = 0;
     // Visual grid-line increment in samples, chosen the same way. 0 follows the
     // timecode format; a positive value draws lines at that fixed spacing —
-    // but only while they stay far enough apart to read (below that the format
-    // grid is drawn instead, so the view never fills with lines).
+    // Dense lines may be skipped on screen without changing the chosen spacing.
     int64_t gridIncrementSamples = 0;
     // Vertical zoom for the track rows: Control+scroll grows or shrinks it.
     float trackHeightScale = 1.0f;
@@ -370,6 +375,8 @@ struct TimelineViewState {
     // counter). The buffers reflect the selection until the field is focused.
     bool editingSelStart = false;
     bool editingSelEnd = false;
+    bool selStartFocusPending = false;
+    bool selEndFocusPending = false;
     char selStartInput[32] = {};
     char selEndInput[32] = {};
     // Set the frame the editor opens so focus is grabbed once. Grabbing it

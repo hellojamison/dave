@@ -1965,3 +1965,40 @@ TEST_CASE("dragging track volume shows a fader and changes the level", "[timelin
     CHECK(ImGui::GetForegroundDrawList(ImGui::GetMainViewport())->VtxBuffer.Size > 0);
     rig.tick(x, y - 12.0f, false);
 }
+
+TEST_CASE("zoom keeps automatic and selected grid timing steady", "[timelinegrid][zoom]") {
+    gui::TimelineViewState view;
+    view.samplesPerPixel = 500.0;
+    view.gridIncrementSamples = 4800;
+    view.snapIncrementSamples = 2400;
+    const auto before = gui::gridStepFor(view.tcMode, view.gridReferenceZoom());
+    const auto snapBefore = gui::snapStepFor(view.tcMode, view.gridReferenceZoom());
+    for (double zoom : {250.0, 1000.0, 50000.0, 5.0}) {
+        gui::zoomAroundSample(view, zoom, 24000);
+        const auto after = gui::gridStepFor(view.tcMode, view.gridReferenceZoom());
+        CHECK(after.minor == before.minor);
+        CHECK(after.major == before.major);
+        CHECK(gui::snapStepFor(view.tcMode, view.gridReferenceZoom()) == snapBefore);
+        CHECK(view.gridIncrementSamples == 4800);
+        CHECK(view.snapIncrementSamples == 2400);
+    }
+}
+
+TEST_CASE("zooming keeps actual selection snapping on the same divisions", "[timelinegrid][zoom]") {
+    LayoutRig rig;
+    rig.view.snapEnabled = true;
+    rig.edit.addMarkerTrack("Markers");
+    rig.edit.addTrack("Audio 1");
+    rig.settle();
+    const auto snapBefore = gui::snapStepFor(rig.view.tcMode, rig.view.gridReferenceZoom());
+    gui::zoomAroundSample(rig.view, 2000.0, 0);
+    const float y = rig.origin.y + kRulerHeight + kMarkerLaneHeight + kTrackHeight * 0.5f;
+    const float x = rig.origin.x + kGutterWidth + 101.0f;
+    rig.tick(x, y, false);
+    rig.tick(x, y, true);
+    rig.tick(x + 37.0f, y, true);
+    rig.tick(x + 37.0f, y, false);
+    REQUIRE(rig.view.hasSelection);
+    CHECK(rig.view.selectionStart % snapBefore == 0);
+    CHECK(rig.view.selectionEnd % snapBefore == 0);
+}

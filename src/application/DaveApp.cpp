@@ -473,11 +473,11 @@ void DaveApp::handleShortcuts() {
         toggleRecording();
     } else if (!primaryModifier && shift && ImGui::IsKeyPressed(ImGuiKey_R, false)) {
         toggleSelectedTrackArm();
-    } else if (ImGui::IsKeyPressed(ImGuiKey_T, false)) {
+    } else if (!primaryModifier && !shift && !alt && ImGui::IsKeyPressed(ImGuiKey_T, false)) {
         // T = zoom in (Pro Tools convention).
         gui::zoomAroundSample(view_, view_.samplesPerPixel * 0.5,
                               audio_.transport().position());
-    } else if (!primaryModifier && !shift && ImGui::IsKeyPressed(ImGuiKey_R, false)) {
+    } else if (!primaryModifier && !shift && !alt && ImGui::IsKeyPressed(ImGuiKey_R, false)) {
         // R = zoom out.
         gui::zoomAroundSample(view_, view_.samplesPerPixel * 2.0,
                               audio_.transport().position());
@@ -2077,8 +2077,8 @@ void DaveApp::drawUI() {
                 view_.snapEnabled = true;
             }
             ImGui::SameLine(0.0f, 1.0f);
-            if (modeButton("Slip", !view_.snapEnabled,
-                           "Slip mode: free, sample-accurate movement")) {
+            if (modeButton("Slide", !view_.snapEnabled,
+                           "Slide mode: free, sample-accurate movement")) {
                 view_.snapEnabled = false;
             }
         }
@@ -2324,22 +2324,52 @@ void DaveApp::drawUI() {
             };
             const float selFieldW = compactToolbar ? 74.0f : 92.0f;
             auto timeField = [&](const char* id, char* buf, bool& editing,
-                                 int64_t& value) {
+                                 bool& focusPending, int64_t& value) {
+                const ImVec2 fieldOrigin = ImGui::GetCursorScreenPos();
+                const float fieldHeight = ImGui::GetFrameHeight();
                 if (!editing) {
-                    const std::string t = fmtSel(value);
-                    std::strncpy(buf, t.c_str(), 31);
-                    buf[31] = '\0';
-                }
-                ImGui::SetNextItemWidth(selFieldW);
-                ImGui::InputText(id, buf, 32,
-                                 ImGuiInputTextFlags_EnterReturnsTrue);
-                if (ImGui::IsItemActivated()) editing = true;
-                if (ImGui::IsItemDeactivated()) {
-                    editing = false;
-                    const int64_t parsed = gui::parseTimecodeToSamples(
-                        buf, view_.tcMode, selSr, 24.0, &edit_.tempoMap(),
-                        &edit_.meterMap());
-                    if (parsed >= 0) value = parsed;
+                    const std::string text = fmtSel(value);
+                    ImGui::PushID(id);
+                    ImGui::InvisibleButton("##selectionCounter",
+                                           ImVec2(selFieldW, fieldHeight));
+                    auto* draw = ImGui::GetWindowDrawList();
+                    draw->AddRectFilled(fieldOrigin,
+                        ImVec2(fieldOrigin.x + selFieldW, fieldOrigin.y + fieldHeight),
+                        IM_COL32(8, 10, 9, 255));
+                    const ImVec2 textSize = ImGui::CalcTextSize(text.c_str());
+                    draw->PushClipRect(fieldOrigin,
+                        ImVec2(fieldOrigin.x + selFieldW, fieldOrigin.y + fieldHeight), true);
+                    draw->AddText(ImVec2(fieldOrigin.x + (selFieldW - textSize.x) * 0.5f,
+                                         fieldOrigin.y + (fieldHeight - textSize.y) * 0.5f),
+                                  IM_COL32(91, 215, 135, 255), text.c_str());
+                    draw->PopClipRect();
+                    if (ImGui::IsItemHovered() &&
+                        ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                        std::strncpy(buf, text.c_str(), 31);
+                        buf[31] = '\0';
+                        editing = true;
+                        focusPending = true;
+                    }
+                    ImGui::PopID();
+                } else {
+                    ImGui::SetNextItemWidth(selFieldW);
+                    if (focusPending) {
+                        ImGui::SetKeyboardFocusHere();
+                        focusPending = false;
+                    }
+                    const bool entered = ImGui::InputText(
+                        id, buf, 32, ImGuiInputTextFlags_EnterReturnsTrue);
+                    const bool escaped = ImGui::IsKeyPressed(ImGuiKey_Escape);
+                    const bool deactivated = ImGui::IsItemDeactivated();
+                    if (entered || (deactivated && !escaped)) {
+                        const int64_t parsed = gui::parseTimecodeToSamples(
+                            buf, view_.tcMode, selSr, 24.0, &edit_.tempoMap(),
+                            &edit_.meterMap());
+                        if (parsed >= 0) value = parsed;
+                        editing = false;
+                    } else if (escaped) {
+                        editing = false;
+                    }
                 }
             };
             const ImVec2 selectionGroupOrigin = ImGui::GetCursorScreenPos();
@@ -2361,23 +2391,25 @@ void DaveApp::drawUI() {
                 ImGui::TextUnformatted("Start");
                 ImGui::SameLine(0.0f, 3.0f);
                 timeField("##selStart", view_.selStartInput, view_.editingSelStart,
-                          selS);
+                          view_.selStartFocusPending, selS);
                 ImGui::SetCursorScreenPos(ImVec2(selectionOrigin.x, selectionOrigin.y + 15.0f));
                 ImGui::TextUnformatted("End  ");
                 ImGui::SameLine(0.0f, 3.0f);
-                timeField("##selEnd", view_.selEndInput, view_.editingSelEnd, selE);
+                timeField("##selEnd", view_.selEndInput, view_.editingSelEnd,
+                          view_.selEndFocusPending, selE);
                 ImGui::PopStyleColor(2);
                 ImGui::PopStyleVar();
                 ImGui::PopFont();
             } else {
                 label("Sel");
                 timeField("##selStart", view_.selStartInput, view_.editingSelStart,
-                          selS);
+                          view_.selStartFocusPending, selS);
                 ImGui::SameLine(0.0f, 3.0f);
                 ImGui::AlignTextToFramePadding();
                 ImGui::TextColored(pal.textMuted, "\xe2\x80\x93");  // en dash
                 ImGui::SameLine(0.0f, 3.0f);
-                timeField("##selEnd", view_.selEndInput, view_.editingSelEnd, selE);
+                timeField("##selEnd", view_.selEndInput, view_.editingSelEnd,
+                          view_.selEndFocusPending, selE);
             }
             view_.selectionStart = selS;
             view_.selectionEnd = selE;
@@ -2738,13 +2770,13 @@ void DaveApp::drawUI() {
         // The value the format grid resolves to at the current zoom, so the
         // grid combo can show it instead of a bare label.
         const gui::GridStep autoGrid = gui::gridStepFor(
-            view_.tcMode, view_.samplesPerPixel,
+            view_.tcMode, view_.gridReferenceZoom(),
             static_cast<double>(edit_.sampleRate()), 24.0, edit_.tempoBpm(),
             &edit_.meterMap(), &edit_.tempoMap());
         // The snap step the format resolves to now, for the snap combo's
         // custom-field default (its preview stays "Grid").
         const std::int64_t snapAuto = gui::snapStepFor(
-            view_.tcMode, view_.samplesPerPixel,
+            view_.tcMode, view_.gridReferenceZoom(),
             static_cast<double>(edit_.sampleRate()), 24.0, edit_.tempoBpm(),
             &edit_.meterMap(), &edit_.tempoMap());
 

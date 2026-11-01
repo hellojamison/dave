@@ -230,6 +230,8 @@ void zoomAroundSample(TimelineViewState& view, double newSamplesPerPixel,
                       int64_t anchorSample) {
     const double oldSamplesPerPixel = std::clamp(
         view.samplesPerPixel, kMinSamplesPerPixel, kMaxSamplesPerPixel);
+    if (view.gridReferenceSamplesPerPixel <= 0.0)
+        view.gridReferenceSamplesPerPixel = oldSamplesPerPixel;
     view.samplesPerPixel = std::clamp(
         newSamplesPerPixel, kMinSamplesPerPixel, kMaxSamplesPerPixel);
     // Before the first frame the widget has not reported its width yet, so
@@ -1110,17 +1112,13 @@ void drawTimeline(const document::Edit& edit,
     const double bpm = edit.tempoBpm();
     const auto& meterMap = edit.meterMap();
     const auto& tempoMap = edit.tempoMap();
-    GridStep grid = gridStepFor(view.tcMode, view.samplesPerPixel, sr,
+    GridStep grid = gridStepFor(view.tcMode, view.gridReferenceZoom(), sr,
                                 24.0, bpm, &meterMap, &tempoMap);
-    // A chosen grid increment overrides the format grid, but only while its
-    // lines stay at least a few pixels apart — otherwise a fine increment
-    // zoomed out would draw thousands of lines, so the format grid stands in.
-    bool gridOverridden = false;
-    if (view.gridIncrementSamples > 0 &&
-        view.gridIncrementSamples / view.samplesPerPixel >= 4.0) {
+    // Preserve the chosen grid even when its lines are too close to draw.
+    const bool gridOverridden = view.gridIncrementSamples > 0;
+    if (gridOverridden) {
         grid.minor = view.gridIncrementSamples;
-        grid.major = view.gridIncrementSamples * 5;
-        gridOverridden = true;
+        grid.major = grid.minor <= INT64_MAX / 5 ? grid.minor * 5 : INT64_MAX;
     }
     // One snap policy serves automation points, seeks, clip moves and range
     // edges. Turning Snap off preserves the raw sample under the pointer.
@@ -1131,7 +1129,7 @@ void drawTimeline(const document::Edit& edit,
             const int64_t inc = view.snapIncrementSamples;
             return ((pos + inc / 2) / inc) * inc;
         }
-        return snapSampleToFormat(pos, view.tcMode, view.samplesPerPixel, sr,
+        return snapSampleToFormat(pos, view.tcMode, view.gridReferenceZoom(), sr,
                                   24.0, bpm, &meterMap, &tempoMap);
     };
 
@@ -1141,6 +1139,13 @@ void drawTimeline(const document::Edit& edit,
     // tick would go missing.
     auto forEachUniformLine = [&](int64_t step, auto&& fn) {
         if (step <= 0) return;
+        // Draw a subset of the actual divisions when zoomed far out. This
+        // bounds drawing work without replacing the user's grid with another.
+        const double stride = std::ceil(4.0 * view.samplesPerPixel / step);
+        if (stride > 1.0) {
+            if (stride > static_cast<double>(INT64_MAX / step)) return;
+            step *= static_cast<int64_t>(stride);
+        }
         const int64_t first = std::max<int64_t>(
             0, static_cast<int64_t>(std::floor(view.scrollSamples / step)) * step);
         for (int64_t sample = first; ; sample += step) {
@@ -5159,7 +5164,7 @@ float drawMarkerLane(const document::Edit& edit,
             const int64_t inc = view.snapIncrementSamples;
             return ((sample + inc / 2) / inc) * inc;
         }
-        return snapSampleToFormat(sample, view.tcMode, samplesPerPixel,
+        return snapSampleToFormat(sample, view.tcMode, view.gridReferenceZoom(),
                                   static_cast<double>(edit.sampleRate()),
                                   24.0, edit.tempoBpm(), &edit.meterMap(),
                                   &edit.tempoMap());
@@ -5473,7 +5478,7 @@ float drawVideoLane(const document::Edit& edit,
             const int64_t inc = view.snapIncrementSamples;
             return ((sample + inc / 2) / inc) * inc;
         }
-        return snapSampleToFormat(sample, view.tcMode, samplesPerPixel,
+        return snapSampleToFormat(sample, view.tcMode, view.gridReferenceZoom(),
                                   static_cast<double>(edit.sampleRate()),
                                   24.0, edit.tempoBpm(), &edit.meterMap(),
                                   &edit.tempoMap());

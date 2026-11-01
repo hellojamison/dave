@@ -1458,6 +1458,18 @@ void DaveApp::configureTransientScreenshot() {
     prefetchSelectedTrackTransients();
 }
 
+void DaveApp::configureEditScreenshot() {
+    showTrackList_ = true;
+    rightPanel_ = RightPanel::None;
+    if (!edit_.tracks().empty()) {
+        view_.selectedTrackIndex = 0;
+        view_.selectedTrackIds = {edit_.tracks().front().id};
+        view_.hasSelection = true;
+        view_.selectionStart = 0;
+        view_.selectionEnd = edit_.sampleRate();
+    }
+}
+
 void DaveApp::onEditChanged() {
     bool armRefused = false;
     if (recordingSession_) {
@@ -2044,6 +2056,37 @@ void DaveApp::drawUI() {
             ImGui::SameLine(0.0f, groupGap);
         };
 
+        // Edit mode: Grid snaps clip boundaries and edits to the increment
+        // beside it; Slide moves freely, sample by sample. One state, two
+        // buttons, so the current mode reads at a glance.
+        {
+            const float modeH = ImGui::GetFrameHeight();
+            auto modeButton = [&](const char* label, bool active,
+                                  const char* tip) {
+                if (active) {
+                    ImGui::PushStyleColor(ImGuiCol_Button, pal.accentDeep);
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                                          pal.accentDeep);
+                    ImGui::PushStyleColor(ImGuiCol_Text, pal.primaryText);
+                }
+                const bool pressed = ImGui::Button(label, ImVec2(0.0f, modeH));
+                if (active) ImGui::PopStyleColor(3);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+                return pressed;
+            };
+            if (modeButton("Grid", view_.snapEnabled,
+                           "Grid mode: clip edges and edits snap to the "
+                           "increment beside this")) {
+                view_.snapEnabled = true;
+            }
+            ImGui::SameLine(0.0f, 1.0f);
+            if (modeButton("Slide", !view_.snapEnabled,
+                           "Slide mode: free, sample-accurate movement")) {
+                view_.snapEnabled = false;
+            }
+        }
+        groupSeparator(compactToolbar ? 150.0f : 170.0f);
+
         // Position readout — double-click to edit (type a timecode to seek).
         int64_t pos = transport.position();
         const char* tcModes[] = {"min:sec", "timecode", "bars|beats", "feet+frames", "samples"};
@@ -2306,6 +2349,27 @@ void DaveApp::drawUI() {
             groupSeparator(190.0f);
         }
 
+        if (gui::theme::iconButton(
+                "##transportRewind", gui::theme::TransportIcon::ReturnToStart,
+                "Stop and return to start (Return)", ImVec2(controlH, controlH))) {
+            transport.stop();
+            transport.seek(0);
+        }
+
+        ImGui::SameLine(0.0f, kGap);
+        const bool wasPlaying = transport.isPlaying();
+        if (gui::theme::iconButton(
+                "##transportPlay",
+                wasPlaying ? gui::theme::TransportIcon::Stop
+                           : gui::theme::TransportIcon::Play,
+                wasPlaying ? "Stop (Space)" : "Play (Space)",
+                ImVec2(controlH, controlH),
+                wasPlaying ? gui::theme::ButtonVariant::Primary
+                           : gui::theme::ButtonVariant::Normal)) {
+            togglePlayback();
+        }
+
+        ImGui::SameLine(0.0f, kGap);
         const bool wasRecording = recordingActive();
         if (gui::theme::iconButton(
                 "##transportRecord", gui::theme::TransportIcon::Record,
@@ -2329,27 +2393,6 @@ void DaveApp::drawUI() {
         if (ImGui::IsItemHovered() && !recordingActive()) {
             ImGui::SetTooltip("Record and roll (Cmd/Ctrl+R)\n"
                               "Right-click for take file names");
-        }
-
-        ImGui::SameLine(0.0f, kGap);
-        const bool wasPlaying = transport.isPlaying();
-        if (gui::theme::iconButton(
-                "##transportPlay",
-                wasPlaying ? gui::theme::TransportIcon::Stop
-                           : gui::theme::TransportIcon::Play,
-                wasPlaying ? "Stop (Space)" : "Play (Space)",
-                ImVec2(controlH, controlH),
-                wasPlaying ? gui::theme::ButtonVariant::Primary
-                           : gui::theme::ButtonVariant::Normal)) {
-            togglePlayback();
-        }
-
-        ImGui::SameLine(0.0f, kGap);
-        if (gui::theme::iconButton(
-                "##transportRewind", gui::theme::TransportIcon::ReturnToStart,
-                "Stop and return to start (Return)", ImVec2(controlH, controlH))) {
-            transport.stop();
-            transport.seek(0);
         }
 
         ImGui::SameLine(0.0f, kGap);
@@ -2514,7 +2557,7 @@ void DaveApp::drawUI() {
                 }
                 ImGui::EndPopup();
             }
-            groupSeparator(narrowToolbar ? 280.0f : compactToolbar ? 340.0f : 390.0f);
+            groupSeparator(narrowToolbar ? 210.0f : compactToolbar ? 250.0f : 290.0f);
         }
 
         // No +Track here: the timeline carries a + above its topmost row,
@@ -2665,36 +2708,7 @@ void DaveApp::drawUI() {
                        "Grid line increment \u2014 Auto follows the ruler format");
 
         ImGui::SameLine(0.0f, kGap);
-        // Edit mode: Grid snaps clip boundaries and edits to the increment
-        // beside it; Slide moves freely, sample by sample. One state, two
-        // buttons, so the current mode reads at a glance.
-        {
-            const float modeH = ImGui::GetFrameHeight();
-            auto modeButton = [&](const char* label, bool active,
-                                  const char* tip) {
-                if (active) {
-                    ImGui::PushStyleColor(ImGuiCol_Button, pal.accentDeep);
-                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-                                          pal.accentDeep);
-                    ImGui::PushStyleColor(ImGuiCol_Text, pal.primaryText);
-                }
-                const bool pressed = ImGui::Button(label, ImVec2(0.0f, modeH));
-                if (active) ImGui::PopStyleColor(3);
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
-                return pressed;
-            };
-            if (modeButton("Grid", view_.snapEnabled,
-                           "Grid mode: clip edges and edits snap to the "
-                           "increment beside this")) {
-                view_.snapEnabled = true;
-            }
-            ImGui::SameLine(0.0f, 1.0f);
-            if (modeButton("Slide", !view_.snapEnabled,
-                           "Slide mode: free, sample-accurate movement")) {
-                view_.snapEnabled = false;
-            }
-        }
-        ImGui::SameLine(0.0f, 4.0f);
+        label("Snap");
         incrementCombo("##snapIncrement", "##snapCustom",
                        view_.snapIncrementSamples, snapCustomMs_, true,
                        "Grid", 0, snapAuto,

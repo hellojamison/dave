@@ -22,7 +22,7 @@ void printUsage(const char* executable) {
         " [--screenshot <out.png> [--frames N]"
         " [--width W] [--height H] [--demo-audio <file.wav>]"
         " [--demo-midi <file.mid>] [--automation-demo]"
-        " [--transient-demo]"
+        " [--transient-demo] [--edit-demo]"
         " [--samples-per-pixel N]]\n",
         executable);
 }
@@ -64,6 +64,7 @@ int main(int argc, char** argv) {
     double screenshotSamplesPerPixel = 0.0;
     bool automationDemo = false;
     bool transientDemo = false;
+    bool editDemo = false;
     bool startVideoPoppedOut = false;
     bool noAudio = false;
 
@@ -133,6 +134,9 @@ int main(int argc, char** argv) {
         } else if (arg == "--transient-demo") {
             screenshotOnlyOptionProvided = true;
             transientDemo = true;
+        } else if (arg == "--edit-demo") {
+            screenshotOnlyOptionProvided = true;
+            editDemo = true;
         } else if (arg == "--samples-per-pixel") {
             screenshotOnlyOptionProvided = true;
             if (++i >= argc || !parseSamplesPerPixel(argv[i], screenshotSamplesPerPixel)) {
@@ -189,6 +193,9 @@ int main(int argc, char** argv) {
     }
     if (transientDemo) {
         app.configureTransientScreenshot();
+    }
+    if (editDemo) {
+        app.configureEditScreenshot();
     }
     app.run();
     if (screenshotRequested && !dave::platform::Window::screenshotSucceeded()) {

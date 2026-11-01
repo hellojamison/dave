@@ -1819,8 +1819,7 @@ void DaveApp::drawUI() {
     // Keep every existing control reachable when the window narrows. Groups
     // wrap together rather than disappearing beyond the right edge.
     const float toolbarH = vp->WorkSize.x < 400.0f ? 150.0f
-                         : vp->WorkSize.x < 750.0f ? 116.0f
-                         : vp->WorkSize.x < 1250.0f ? 82.0f : 48.0f;
+                         : vp->WorkSize.x < 750.0f ? 116.0f : 82.0f;
     const float splitterSize = 6.0f;
     const float contentY = baseY + menuH + toolbarH;
     const float contentH = vp->WorkSize.y - toolbarH;
@@ -1965,7 +1964,7 @@ void DaveApp::drawUI() {
         }
         if (ImGui::BeginMenu("Transport")) {
             if (ImGui::MenuItem(transport.isPlaying() ? "Stop" : "Play", "Space"))
-                recordingActive() ? stopRecording() : togglePlayback();
+                togglePlayback();
             if (ImGui::MenuItem(recordingActive() ? "Stop Recording" : "Record",
                                 "Ctrl+R"))
                 toggleRecording();
@@ -2021,6 +2020,7 @@ void DaveApp::drawUI() {
         const float controlH = kToolbarControlH;
         const bool compactToolbar = vp->WorkSize.x < 1050.0f;
         const bool narrowToolbar = vp->WorkSize.x < 400.0f;
+        const bool wideToolbar = vp->WorkSize.x >= 1500.0f;
         // Every framed control derives its height from FramePadding, so one
         // value here makes buttons, combos and the checkbox agree instead of
         // each settling at whatever its own content implies.
@@ -2080,12 +2080,17 @@ void DaveApp::drawUI() {
                 view_.snapEnabled = true;
             }
             ImGui::SameLine(0.0f, 1.0f);
-            if (modeButton("Slide", !view_.snapEnabled,
-                           "Slide mode: free, sample-accurate movement")) {
+            if (modeButton("Slip", !view_.snapEnabled,
+                           "Slip mode: free, sample-accurate movement")) {
                 view_.snapEnabled = false;
             }
         }
-        groupSeparator(compactToolbar ? 150.0f : 170.0f);
+        if (wideToolbar) {
+            ImGui::SetCursorScreenPos(ImVec2(baseX + vp->WorkSize.x * 0.26f,
+                                            baseY + 6.0f));
+        } else {
+            groupSeparator(compactToolbar ? 150.0f : 170.0f);
+        }
 
         // Position readout — double-click to edit (type a timecode to seek).
         int64_t pos = transport.position();
@@ -2335,38 +2340,75 @@ void DaveApp::drawUI() {
             };
             int64_t selS = std::min(view_.selectionStart, view_.selectionEnd);
             int64_t selE = std::max(view_.selectionStart, view_.selectionEnd);
-            label("Sel");
-            timeField("##selStart", view_.selStartInput, view_.editingSelStart,
-                      selS);
-            ImGui::SameLine(0.0f, 3.0f);
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextColored(pal.textMuted, "\xe2\x80\x93");  // en dash
-            ImGui::SameLine(0.0f, 3.0f);
-            timeField("##selEnd", view_.selEndInput, view_.editingSelEnd, selE);
+            if (wideToolbar) {
+                const ImVec2 selectionOrigin = ImGui::GetCursorScreenPos();
+                ImGui::GetWindowDrawList()->AddRectFilled(
+                    selectionOrigin,
+                    ImVec2(selectionOrigin.x + 142.0f, selectionOrigin.y + controlH),
+                    IM_COL32(8, 10, 9, 255));
+                ImGui::PushFont(gui::theme::fonts().small != nullptr
+                                    ? gui::theme::fonts().small : ImGui::GetFont());
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(3.0f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_FrameBg, gui::theme::hex(0x080a09ff));
+                ImGui::PushStyleColor(ImGuiCol_Text, gui::theme::hex(0x5bd787ff));
+                ImGui::TextUnformatted("Start");
+                ImGui::SameLine(0.0f, 3.0f);
+                timeField("##selStart", view_.selStartInput, view_.editingSelStart,
+                          selS);
+                ImGui::SetCursorScreenPos(ImVec2(selectionOrigin.x, selectionOrigin.y + 15.0f));
+                ImGui::TextUnformatted("End  ");
+                ImGui::SameLine(0.0f, 3.0f);
+                timeField("##selEnd", view_.selEndInput, view_.editingSelEnd, selE);
+                ImGui::PopStyleColor(2);
+                ImGui::PopStyleVar();
+                ImGui::PopFont();
+            } else {
+                label("Sel");
+                timeField("##selStart", view_.selStartInput, view_.editingSelStart,
+                          selS);
+                ImGui::SameLine(0.0f, 3.0f);
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextColored(pal.textMuted, "\xe2\x80\x93");  // en dash
+                ImGui::SameLine(0.0f, 3.0f);
+                timeField("##selEnd", view_.selEndInput, view_.editingSelEnd, selE);
+            }
             view_.selectionStart = selS;
             view_.selectionEnd = selE;
             if (selE > selS) view_.hasSelection = true;
-            groupSeparator(190.0f);
+            if (wideToolbar) {
+                ImGui::SetCursorScreenPos(ImVec2(baseX + vp->WorkSize.x * 0.55f,
+                                                baseY + 6.0f));
+            } else {
+                groupSeparator(225.0f);
+            }
         }
 
         if (gui::theme::iconButton(
                 "##transportRewind", gui::theme::TransportIcon::ReturnToStart,
                 "Stop and return to start (Return)", ImVec2(controlH, controlH))) {
             transport.stop();
-            transport.seek(0);
+            if (capturing()) endCapture();
+            if (!capturing()) transport.seek(0);
         }
 
         ImGui::SameLine(0.0f, kGap);
         const bool wasPlaying = transport.isPlaying();
         if (gui::theme::iconButton(
-                "##transportPlay",
-                wasPlaying ? gui::theme::TransportIcon::Stop
-                           : gui::theme::TransportIcon::Play,
-                wasPlaying ? "Stop (Space)" : "Play (Space)",
+                "##transportStop", gui::theme::TransportIcon::Stop,
+                "Stop (Space)", ImVec2(controlH, controlH),
+                !wasPlaying ? gui::theme::ButtonVariant::Primary
+                            : gui::theme::ButtonVariant::Normal)) {
+            if (transport.isPlaying()) togglePlayback();
+        }
+
+        ImGui::SameLine(0.0f, kGap);
+        if (gui::theme::iconButton(
+                "##transportPlay", gui::theme::TransportIcon::Play,
+                "Play (Space)",
                 ImVec2(controlH, controlH),
                 wasPlaying ? gui::theme::ButtonVariant::Primary
                            : gui::theme::ButtonVariant::Normal)) {
-            togglePlayback();
+            if (!transport.isPlaying()) togglePlayback();
         }
 
         ImGui::SameLine(0.0f, kGap);
@@ -2557,7 +2599,11 @@ void DaveApp::drawUI() {
                 }
                 ImGui::EndPopup();
             }
-            groupSeparator(narrowToolbar ? 210.0f : compactToolbar ? 250.0f : 290.0f);
+            // Grid and navigation form the toolbar's second row, like the
+            // compact controls in the reference Edit window.
+            ImGui::SetCursorScreenPos(
+                ImVec2(baseX + (wideToolbar ? vp->WorkSize.x * 0.42f : 6.0f),
+                       ImGui::GetItemRectMax().y + 4.0f));
         }
 
         // No +Track here: the timeline carries a + above its topmost row,
@@ -2935,7 +2981,8 @@ void DaveApp::drawUI() {
     const auto transientSnapshots = selectedTrackTransientSnapshots();
     gui::drawTimeline(
         edit_, undo_, transport, peaks_, view_, builder_.assetBuffers(),
-        trackRowHeight, 30.0f, transientSnapshots, &builder_.trackGains());
+        trackRowHeight, 30.0f, transientSnapshots, &builder_.trackGains(), true,
+        static_cast<int>(audio_.playbackChannelCount()));
     if (view_.requestTransientNavigation) {
         const auto direction = view_.transientNavigationDirection;
         const bool extend = view_.requestTransientSelectionExtension;
@@ -4359,6 +4406,8 @@ void DaveApp::serviceViewRequests() {
         const std::string trackId =
             std::move(view_.requestChannelStripTrackId);
         view_.requestChannelStripTrackId.clear();
+        const bool forceOpen = view_.requestChannelStripOpen;
+        view_.requestChannelStripOpen = false;
         const auto& rows = edit_.tracks();
         for (size_t i = 0; i < rows.size(); ++i) {
             if (rows[i].id != trackId) continue;
@@ -4369,7 +4418,7 @@ void DaveApp::serviceViewRequests() {
             const int row = static_cast<int>(i);
             const bool alreadyShowing = rightPanel_ == RightPanel::Strip &&
                                         view_.selectedTrackIndex == row;
-            rightPanel_ = alreadyShowing ? RightPanel::None
+            rightPanel_ = alreadyShowing && !forceOpen ? RightPanel::None
                                          : RightPanel::Strip;
             showChannelStrip_ = rightPanel_ == RightPanel::Strip;
             // The plugin scan is deferred to the first time a picker is opened

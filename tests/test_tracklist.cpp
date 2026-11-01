@@ -47,6 +47,7 @@ TEST_CASE("edit styling leaves the mixer theme intact", "[theme][edit]") {
     dave::testing::ImGuiRig rig;
     const ImVec4 before = gui::theme::palette().surfaceBase;
     const ImVec4 buttonBefore = ImGui::GetStyle().Colors[ImGuiCol_Button];
+    const ImVec4 sliderBefore = ImGui::GetStyle().Colors[ImGuiCol_SliderGrab];
     const float roundingBefore = ImGui::GetStyle().FrameRounding;
     gui::theme::pushEditTheme();
     CHECK(gui::theme::palette().surfaceBase.x != before.x);
@@ -54,6 +55,7 @@ TEST_CASE("edit styling leaves the mixer theme intact", "[theme][edit]") {
     gui::theme::popEditTheme();
     CHECK(gui::theme::palette().surfaceBase.x == before.x);
     CHECK(ImGui::GetStyle().Colors[ImGuiCol_Button].x == buttonBefore.x);
+    CHECK(ImGui::GetStyle().Colors[ImGuiCol_SliderGrab].x == sliderBefore.x);
     CHECK(ImGui::GetStyle().FrameRounding == roundingBefore);
 }
 

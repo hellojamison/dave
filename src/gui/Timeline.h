@@ -171,6 +171,7 @@ struct TimelineViewState {
     // A track asking for the channel strip. The strip is opt-in, so the E
     // button on a row is how it opens — the app selects that row and shows it.
     std::string requestChannelStripTrackId;
+    bool requestChannelStripOpen = false;
     // A track asking to be hidden, and a request to bring every hidden one
     // back. Serviced by the application, which owns the undo stack.
     std::string requestHideTrackId;
@@ -470,7 +471,9 @@ void drawTimeline(const document::Edit& edit,
                   // Live post-fader levels, keyed by track id. Null draws the
                   // meters at silence rather than omitting them, so the header
                   // keeps its shape whether or not a graph is live.
-                  const TrackGainNodes* gainNodes = nullptr);
+                  const TrackGainNodes* gainNodes = nullptr,
+                  bool showEditColumns = false,
+                  int playbackChannels = 2);
 
 // Duplicate whatever clip the timeline currently has selected, placing the
 // copy immediately after it. Dispatches on which clip vector actually holds

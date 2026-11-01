@@ -235,7 +235,7 @@ private:
     // The track list on the left. Off by default like the strip: a session
     // with nothing hidden has nothing to look up.
     bool showTrackList_ = false;
-    float trackListWidth_ = 190.0f;
+    float trackListWidth_ = 260.0f;
     float sidebarWidth_ = 260.0f;
     gui::ChannelStripState channelStrip_;
     float videoHeight_ = 322.0f;

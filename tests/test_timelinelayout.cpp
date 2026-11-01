@@ -68,6 +68,7 @@ float effectiveTrackHeight() {
 
 struct LayoutRig : ImGuiRig {
     LayoutRig() { view.samplesPerPixel = 500.0; }
+    bool showEditColumns = false;
 
     // drawTimeline draws from the host window's cursor, which sits inside the
     // window padding. Capturing it rather than assuming (0,0) keeps the probe
@@ -76,7 +77,7 @@ struct LayoutRig : ImGuiRig {
         frame(x, y, down, [&] {
             origin = ImGui::GetCursorScreenPos();
             gui::drawTimeline(edit, undo, transport, peaks, view, assetBuffers,
-                              kTrackHeight);
+                              kTrackHeight, 30.0f, {}, nullptr, showEditColumns);
         });
     }
 
@@ -144,6 +145,69 @@ struct LayoutRig : ImGuiRig {
     gui::PeakCache peaks;
     std::unordered_map<std::string, audio::DecodedAudioAssetPtr> assetBuffers;
 };
+
+TEST_CASE("wide edit columns open the existing track controls",
+          "[timelinelayout][edit-columns]") {
+    LayoutRig rig;
+    rig.showEditColumns = true;
+    rig.edit.addMarkerTrack("Markers");
+    const std::string track = rig.edit.addTrack("Dialogue");
+    rig.settle();
+    const float top = rig.origin.y + kRulerHeight + kMarkerLaneHeight;
+
+    rig.clickTimelineAt(rig.origin.x + 260.0f + 20.0f, top + 10.0f);
+    CHECK(rig.view.requestPickerTrackId == track);
+    CHECK(rig.view.requestPicker == gui::TimelineViewState::PluginPicker::AudioFx);
+
+    rig.view.requestChannelStripTrackId.clear();
+    rig.clickTimelineAt(rig.origin.x + 260.0f + 100.0f, top + 10.0f);
+    CHECK(rig.view.requestChannelStripTrackId == track);
+    CHECK(rig.view.requestChannelStripOpen);
+
+    document::PluginSlot insert;
+    insert.name = "Equalizer";
+    const std::string insertId = rig.edit.addPlugin(track, insert);
+    REQUIRE_FALSE(insertId.empty());
+    rig.settle();
+    rig.clickTimelineAt(rig.origin.x + 260.0f + 20.0f, top + 10.0f);
+    CHECK(rig.view.requestPluginEditorSlotId == insertId);
+
+    // In the wide layout, the record and solo controls sit below the name.
+    rig.clickTimelineAt(rig.origin.x + kGutterContentX + 34.0f, top + 32.0f);
+    CHECK(rig.edit.track(track)->recordArm);
+    rig.clickTimelineAt(rig.origin.x + kGutterContentX + 58.0f, top + 32.0f);
+    CHECK(rig.edit.track(track)->solo);
+}
+
+TEST_CASE("scrolled edit column controls cannot capture clicks above tracks",
+          "[timelinelayout][edit-columns]") {
+    LayoutRig rig;
+    rig.showEditColumns = true;
+    rig.edit.addMarkerTrack("Markers");
+    for (int i = 0; i < 30; ++i) rig.edit.addTrack("Track");
+    rig.settle();
+    rig.view.verticalScroll = 40.0f;
+    rig.tick(-100.0f, -100.0f, false);
+    const float hiddenButtonY = rig.origin.y + kRulerHeight +
+                                kMarkerLaneHeight - 40.0f + 10.0f;
+    rig.clickTimelineAt(rig.origin.x + 280.0f, hiddenButtonY);
+    CHECK(rig.view.requestPicker == gui::TimelineViewState::PluginPicker::None);
+}
+
+TEST_CASE("timeline seeking accounts for wide edit columns",
+          "[timelinelayout][edit-columns]") {
+    LayoutRig rig;
+    rig.showEditColumns = true;
+    rig.view.snapEnabled = false;
+    rig.edit.addMarkerTrack("Markers");
+    rig.edit.addTrack("Dialogue");
+    rig.settle();
+    const float laneY = rig.origin.y + kRulerHeight + kMarkerLaneHeight + 30.0f;
+    rig.clickTimelineAt(rig.origin.x + 520.0f + 100.0f, laneY);
+    engine::TimeInfo time{};
+    rig.transport.advanceAndFill(time, 0, 48000.0);
+    CHECK(rig.transport.position() == 50000);
+}
 
 document::VideoClip videoClip() {
     document::VideoClip c;

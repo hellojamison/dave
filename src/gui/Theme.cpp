@@ -340,10 +340,14 @@ void pushEditTheme() {
     ImGui::PushStyleColor(ImGuiCol_Header, p.surfaceSoft);
     ImGui::PushStyleColor(ImGuiCol_HeaderHovered, p.trackSelected);
     ImGui::PushStyleColor(ImGuiCol_HeaderActive, p.surfaceStrong);
+    ImGui::PushStyleColor(ImGuiCol_CheckMark, p.accentStrong);
+    ImGui::PushStyleColor(ImGuiCol_SliderGrab, p.accent);
+    ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, p.accentStrong);
+    ImGui::PushStyleColor(ImGuiCol_Separator, p.border);
 }
 
 void popEditTheme() {
-    ImGui::PopStyleColor(14);
+    ImGui::PopStyleColor(18);
     ImGui::PopStyleVar();
     g_palette = g_paletteBeforeEdit;
 }

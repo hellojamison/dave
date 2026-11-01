@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "repository": "hellojamison/dave",
+  "provider": "github",
+  "asana_project_gid": "1220104275753847",
+  "main_branch": "main",
+  "timezone": "America/Los_Angeles",
+  "sections": {
+    "review": "Needs Review",
+    "active": "In Progress",
+    "backlog": "ToDo",
+    "done": "Solved"
+  },
+  "section_gids": {
+    "review": "1220113526844468",
+    "active": "1220110284690920",
+    "backlog": "1220109401445633",
+    "done": "1220113526844274"
+  },
+  "default_assignee_gid": "189584921995",
+  "assignee_section_sync": {
+    "user_task_list_gid": "1218208584917151",
+    "sections": {
+      "backlog": "Should Work On",
+      "active": "In Progress",
+      "review": "Needs Review",
+      "done": "Solved"
+    }
+  },
+  "protected_sections": [
+    {
+      "gid": "1220107958038630",
+      "name": "Dead / Parked",
+      "policy": "Preserve section and task memberships; change only on a specific user instruction."
+    }
+  ],
+  "preserve_custom_sections": true
+}

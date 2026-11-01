@@ -527,6 +527,9 @@ float drawTrackGutter(const GutterLayout& g, TimelineViewState& view,
                                               nullptr, false, !isMain && !view.recordingActive)) {
                 view.requestToggleInactiveTrackId = *f.trackId;
             }
+            if (menuTrack && ImGui::MenuItem("Delete Track", nullptr, false, !isMain)) {
+                view.requestRemoveTrackId = *f.trackId;
+            }
             if (ImGui::MenuItem("Hide Track", nullptr, false, !isMain)) {
                 if (f.trackId != nullptr) {
                     view.requestHideTrackId = *f.trackId;

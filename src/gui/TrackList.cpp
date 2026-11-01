@@ -215,7 +215,7 @@ void drawTrackList(const document::Edit& edit, TimelineViewState& view) {
             }
             // Main is permanent; deleting it would leave the session with no
             // output bus, so the item is disabled rather than absent.
-            if (ImGui::MenuItem("Delete", nullptr, false, !ctx->isMain)) {
+            if (ImGui::MenuItem("Delete Track", nullptr, false, !ctx->isMain)) {
                 view.requestRemoveTrackId = view.trackListContextId;
             }
         }

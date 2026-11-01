@@ -467,6 +467,8 @@ TEST_CASE("clicking a clip selects its range", "[timelinedrag][selection]") {
     REQUIRE(rowCenterY > 0.0f);
 
     rig.view.hasSelection = false;
+    rig.transport.seek(700000);
+    REQUIRE(rig.committedPosition() == 700000);
     rig.tick(grabX, rowCenterY, false);
     rig.tick(grabX, rowCenterY, true);
 
@@ -477,10 +479,7 @@ TEST_CASE("clicking a clip selects its range", "[timelinedrag][selection]") {
     // Scoped to the clip's own row, so a range edit cannot reach its
     // neighbours' clips.
     CHECK(rig.view.selectionRow >= 0);
-    // And the cursor goes to the head of it, the same as a dragged range —
-    // a selection made by clicking and one made by dragging should leave the
-    // playhead in the same place.
-    CHECK(rig.committedPosition() == 96000);
+    CHECK(rig.committedPosition() == 700000);
 
     rig.tick(grabX, rowCenterY, false);
 }
@@ -504,6 +503,8 @@ TEST_CASE("clicking a group clip selects the group's range",
     REQUIRE(rowCenterY > 0.0f);
 
     rig.view.hasSelection = false;
+    rig.transport.seek(700000);
+    REQUIRE(rig.committedPosition() == 700000);
     rig.tick(grabX, rowCenterY, false);
     rig.tick(grabX, rowCenterY, true);
 
@@ -511,7 +512,7 @@ TEST_CASE("clicking a group clip selects the group's range",
     CHECK(rig.view.selectedClipId == g);
     CHECK(rig.view.selectionStart == 48000);
     CHECK(rig.view.selectionEnd == 336000);
-    CHECK(rig.committedPosition() == 48000);
+    CHECK(rig.committedPosition() == 700000);
     rig.tick(grabX, rowCenterY, false);
 }
 
@@ -675,7 +676,7 @@ TEST_CASE("a clip drags from one track onto another", "[timelinedrag]") {
     CHECK(rig.edit.track(b)->clips.empty());
 }
 
-TEST_CASE("selecting while playing leaves the playhead alone",
+TEST_CASE("clip selection leaves the playhead alone",
           "[timelinedrag][selection]") {
     // Making a selection mid-playback marks the range without snapping the
     // playhead back to its head — playback carries on from where it reached.
@@ -687,10 +688,10 @@ TEST_CASE("selecting while playing leaves the playhead alone",
 
     gui::TimelineViewState view;
 
-    SECTION("stopped: it seeks to the selection head") {
+    SECTION("stopped: no seek is requested") {
         gui::selectClipRange(view, transport, 0, 96000, 480000);
         transport.advanceAndFill(time, 0, 48000.0);
-        CHECK(transport.position() == 96000);
+        CHECK(transport.position() == 500000);
     }
     SECTION("playing: no seek is requested") {
         transport.play();

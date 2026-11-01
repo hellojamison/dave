@@ -4019,13 +4019,6 @@ void drawTimeline(const document::Edit& edit,
     // The ruler always seeks (even if a clip visually overlaps below it) —
     // that's the standard DAW affordance. The track area seeks only when the
     // click isn't on a clip (so clip-drag still works there).
-    auto seekToMouseX = [&]() {
-        double localX = mouse.x - (origin.x + gutterWidth);
-        int64_t seekTo = static_cast<int64_t>(
-            view.scrollSamples + std::max(0.0, localX) * view.samplesPerPixel);
-        transport.seek(snapPosition(seekTo));
-    };
-
     // Sample position under the mouse, clamped to the start of the timeline.
     auto sampleAtMouseX = [&]() -> int64_t {
         const double localX = mouse.x - (origin.x + gutterWidth);
@@ -4039,21 +4032,10 @@ void drawTimeline(const document::Edit& edit,
         return snapPosition(sampleAtMouseX());
     };
 
-    // Ruler: the press seeks, and dragging from it selects the range across
-    // every track — the one gesture that reaches all lanes at once. (This
-    // replaces drag-to-scrub: the playhead can follow the mouse or the drag
-    // can mark a range, not both.)
+    // A ruler drag marks a range across tracks. Wait for release to tell a
+    // plain seek click from a selection, so a drag never moves the playhead.
     if (rulerHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-        // While stopped the press seeks; while playing it only begins a range,
-        // so dragging out a selection never interrupts playback. A plain click
-        // (no drag) still relocates on release, via the click path below. The
-        // selector (command) never seeks — it is for marking, not locating.
-        // Shift: the range runs from the playhead to the click, the way a
-        // shift-click extends a selection from the cursor in any editor.
         const bool fromPlayhead = ImGui::GetIO().KeyShift;
-        if (!transport.isPlaying() && !selectorMode && !fromPlayhead) {
-            seekToMouseX();
-        }
         view.selectionPressSample = selectionSampleAtMouseX();
         const int64_t s = selectionSampleAtMouseX();
         const int64_t anchor = fromPlayhead ? transport.position() : s;
@@ -4150,19 +4132,7 @@ void drawTimeline(const document::Edit& edit,
                 transport.seek(view.selectionPressSample);
             }
             view.hasSelection = false;
-        } else if (fromPlayhead) {
-            // Anchored at the playhead on purpose: leave it there.
-        } else if (view.hasSelection) {
-            // A finished selection puts the cursor at its head, so play
-            // starts from the top of the range — and, with loop on, so does
-            // the loop. The head is the lower edge whichever direction the
-            // drag ran: dragging right to left selects the same range, and
-            // dropping the cursor at the pointer would leave it at the tail.
-            // Not while playing, and not under the selector: both cases want
-            // the range marked without the playhead snapping to it.
-            if (!transport.isPlaying() && !selectorMode) {
-                transport.seek(std::min(view.selectionStart, view.selectionEnd));
-            }
+
         }
     }
     // Clear selection on Escape or clicking elsewhere.
@@ -4426,10 +4396,8 @@ void selectClipRange(TimelineViewState& view, engine::Transport& transport,
     // not anchored; a clip's head is the natural anchor.
     view.selectionAnchor = view.selectionStart;
     view.selectionFocus = view.selectionEnd;
-    // The head of the range, so play starts from the top of what is selected
-    // — and, with loop on, so does the loop. Not while already playing, though:
-    // selecting mid-playback marks the range without yanking the playhead back.
-    if (!transport.isPlaying()) transport.seek(view.selectionStart);
+    // Selecting a clip does not reposition the playhead.
+    (void)transport;
 }
 
 std::vector<document::ClipGroup::Member> clipsInRange(

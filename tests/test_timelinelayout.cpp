@@ -903,10 +903,8 @@ TEST_CASE("ctrl+wheel zoom preserves the playhead screen position",
           Catch::Approx(kPlayheadPixel).margin(1.0));
 }
 
-TEST_CASE("finishing a selection puts the playhead at its head",
+TEST_CASE("making a selection leaves the playhead in place",
           "[timelinelayout]") {
-    // So that pressing play — or turning on loop — starts at the top of the
-    // range rather than wherever the transport happened to be.
     LayoutRig rig;
     rig.edit.addMarkerTrack("Markers");
     rig.edit.addTrack("Audio 1");
@@ -930,9 +928,7 @@ TEST_CASE("finishing a selection puts the playhead at its head",
     SECTION("dragging left to right") {
         dragBetween(x0, x0 + 300.0f);
         REQUIRE(rig.view.hasSelection);
-        CHECK(rig.transport.position() ==
-              std::min(rig.view.selectionStart, rig.view.selectionEnd));
-        CHECK(rig.transport.position() < rig.view.selectionEnd);
+        CHECK(rig.transport.position() == 2'000'000);
     }
 
     SECTION("dragging right to left lands on the same edge") {
@@ -941,8 +937,22 @@ TEST_CASE("finishing a selection puts the playhead at its head",
         REQUIRE(rig.view.hasSelection);
         const int64_t head =
             std::min(rig.view.selectionStart, rig.view.selectionEnd);
-        CHECK(rig.transport.position() == head);
+        CHECK(rig.transport.position() == 2'000'000);
         CHECK(head < std::max(rig.view.selectionStart, rig.view.selectionEnd));
+    }
+
+    SECTION("ruler drag leaves the playhead alone throughout") {
+        const float rulerY = rig.origin.y + 10.0f;
+        rig.tick(x0, rulerY, false);
+        rig.tick(x0, rulerY, true);
+        engine::TimeInfo time{};
+        rig.transport.advanceAndFill(time, 0, 48000.0);
+        CHECK(rig.transport.position() == 2'000'000);
+        rig.tick(x0 + 300.0f, rulerY, true);
+        rig.tick(x0 + 300.0f, rulerY, false);
+        rig.transport.advanceAndFill(time, 0, 48000.0);
+        CHECK(rig.view.hasSelection);
+        CHECK(rig.transport.position() == 2'000'000);
     }
 
     SECTION("a click that is not a drag still seeks to the click") {

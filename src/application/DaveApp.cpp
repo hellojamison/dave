@@ -1030,6 +1030,10 @@ void DaveApp::toggleTrackArm(const std::string& trackId) {
         edit_.notifyChanged();
         return;
     }
+    if (track->inactive) {
+        showStatus("Make the track active before arming it", true);
+        return;
+    }
     if (projectPath_.empty()) {
         showStatus("Save the project before arming a track", true);
         return;
@@ -1067,7 +1071,7 @@ bool DaveApp::beginCapture() {
 
     std::vector<document::Track*> armed;
     for (auto& track : edit_.tracksMut()) {
-        if (track.recordArm) armed.push_back(&track);
+        if (track.recordArm && !track.inactive) armed.push_back(&track);
     }
     if (armed.empty()) {
         showStatus("Arm at least one audio track before recording", true);
@@ -1169,7 +1173,7 @@ void DaveApp::beginCaptureIfArmed() {
     if (capturing()) return;
     const bool anyArmed = std::any_of(
         edit_.tracks().begin(), edit_.tracks().end(),
-        [](const document::Track& track) { return track.recordArm; });
+        [](const document::Track& track) { return track.recordArm && !track.inactive; });
     if (!anyArmed) return;
     if (!audio_.captureAvailable()) return;
     beginCapture();
@@ -4386,6 +4390,17 @@ void DaveApp::serviceViewRequests() {
         if (const auto* track = edit_.track(trackId)) {
             undo_.execute(std::make_unique<editing::SetTrackHiddenCommand>(
                 trackId, !track->hidden));
+        }
+    }
+    if (!view_.requestToggleInactiveTrackId.empty()) {
+        const std::string id = std::move(view_.requestToggleInactiveTrackId);
+        view_.requestToggleInactiveTrackId.clear();
+        if (capturing()) {
+            showStatus("Stop recording before changing track activity", true);
+        } else if (const auto* track = edit_.track(id); track && !track->isMain) {
+            const bool inactive = !track->inactive;
+            undo_.execute(std::make_unique<editing::SetTrackInactiveCommand>(id, inactive));
+            showStatus(inactive ? "Track inactive" : "Track active");
         }
     }
     if (!view_.requestRemoveTrackId.empty()) {

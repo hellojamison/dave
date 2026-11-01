@@ -1555,6 +1555,23 @@ private:
     bool applied_ = false;
 };
 
+class SetTrackInactiveCommand : public Command {
+public:
+    SetTrackInactiveCommand(std::string id, bool inactive)
+        : id_(std::move(id)), inactive_(inactive) {}
+    void perform(document::Edit& e) override {
+        if (const auto* t = e.track(id_)) previous_ = t->inactive;
+        applied_ = e.setTrackInactive(id_, inactive_);
+    }
+    void undo(document::Edit& e) override {
+        if (applied_) e.setTrackInactive(id_, previous_);
+    }
+    std::string name() const override { return inactive_ ? "Make Track Inactive" : "Make Track Active"; }
+private:
+    std::string id_;
+    bool inactive_, previous_ = false, applied_ = false;
+};
+
 // Exempt a track from other tracks' solos. Undoable like the other per-track
 // switches — it changes what you hear, and Cmd-clicking a button you meant to
 // click plainly is easy to do.

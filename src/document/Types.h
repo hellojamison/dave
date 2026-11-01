@@ -404,6 +404,7 @@ struct Track {
     // on playing, recording and receiving sends exactly as before — which is
     // the whole point of hiding one rather than muting it.
     bool hidden = false;
+    bool inactive = false;  // excluded from the audio graph
     // Exempt from other tracks' solos. A talkback, a click, a reverb return
     // you always want to hear — soloing a guitar should not silence the
     // reverb that guitar is feeding.

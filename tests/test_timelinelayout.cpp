@@ -1592,7 +1592,7 @@ TEST_CASE("latest automation draw values use lane-specific readouts",
     CHECK(gui::formatAutomationDrawValue(
               gui::AutomationParameter::Volume, 0.0) == "+0.0 dB");
     CHECK(gui::formatAutomationDrawValue(
-              gui::AutomationParameter::Pan, -0.5) == "L50");
+              gui::AutomationParameter::Pan, -0.5) == "-25");
 }
 
 TEST_CASE("double-clicking an automation point opens an undoable dB editor",
@@ -1646,7 +1646,7 @@ TEST_CASE("double-clicking an automation point opens an undoable dB editor",
           Catch::Approx(-12.0));
 }
 
-TEST_CASE("pan automation lane edits normalized pan with percent entry",
+TEST_CASE("pan automation lane edits normalized pan with 50-point entry",
           "[timelinelayout][automation][pan]") {
     LayoutRig rig;
     rig.edit.addMarkerTrack("Markers");
@@ -1673,12 +1673,12 @@ TEST_CASE("pan automation lane edits normalized pan with percent entry",
     CHECK(rig.view.activeAutomationParameter ==
           gui::AutomationParameter::Pan);
 
-    rig.typeText("75");
+    rig.typeText("25");
     rig.pressKey(ImGuiKey_Enter);
     REQUIRE_FALSE(rig.view.editingAutomationValue);
     REQUIRE(rig.edit.track(track)->panAutomation.size() == 1);
     CHECK(rig.edit.track(track)->panAutomation.front().pan ==
-          Catch::Approx(0.75));
+          Catch::Approx(0.5));
     CHECK(rig.edit.track(track)->volumeAutomation.empty());
 
     REQUIRE(rig.undo.canUndo());
@@ -1929,3 +1929,39 @@ TEST_CASE("an eraser swipe over empty lane commits nothing",
     CHECK(rig.undo.undoDepth() == 0);
 }
 // temporary probe appended
+
+TEST_CASE("shift clicking track headers selects the range", "[timelinelayout][selection]") {
+    LayoutRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const auto a = rig.edit.addTrack("One");
+    const auto b = rig.edit.addTrack("Two");
+    const auto c = rig.edit.addTrack("Three");
+    rig.settle();
+    const float top = rig.origin.y + kRulerHeight + kMarkerLaneHeight;
+    rig.clickTimelineAt(rig.origin.x + 90.0f, top + 10.0f);
+    ImGui::GetIO().AddKeyEvent(ImGuiMod_Shift, true);
+    rig.clickTimelineAt(rig.origin.x + 90.0f, top + 2.0f * effectiveTrackHeight() + 10.0f);
+    ImGui::GetIO().AddKeyEvent(ImGuiMod_Shift, false);
+    rig.tick(-100.0f, -100.0f, false);
+    CHECK(rig.view.selectedTrackIds.size() == 3);
+    CHECK(rig.view.selectedTrackIds.count(a) == 1);
+    CHECK(rig.view.selectedTrackIds.count(b) == 1);
+    CHECK(rig.view.selectedTrackIds.count(c) == 1);
+}
+
+TEST_CASE("dragging track volume shows a fader and changes the level", "[timelinelayout][gain]") {
+    LayoutRig rig;
+    rig.showEditColumns = true;
+    rig.edit.addMarkerTrack("Markers");
+    const auto id = rig.edit.addTrack("Dialog");
+    rig.settle();
+    const float top = rig.origin.y + kRulerHeight + kMarkerLaneHeight;
+    const float x = rig.origin.x + 160.0f + 175.0f + 20.0f;
+    const float y = top + 2.0f + 40.0f + 7.0f;
+    rig.tick(x, y, false);
+    rig.tick(x, y, true);
+    rig.tick(x, y - 12.0f, true);
+    CHECK(rig.edit.track(id)->gain > 1.0);
+    CHECK(ImGui::GetForegroundDrawList(ImGui::GetMainViewport())->VtxBuffer.Size > 0);
+    rig.tick(x, y - 12.0f, false);
+}

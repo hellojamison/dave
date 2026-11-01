@@ -435,6 +435,7 @@ std::string serializeEdit(const Edit& edit) {
                 chain.push_back(json{{"kind", kind}, {"id", slot.id}});
             }
             jt["hidden"] = t.hidden;
+            jt["inactive"] = t.inactive;
             jt["soloSafe"] = t.soloSafe;
             jt["chain"] = std::move(chain);
         }
@@ -740,6 +741,7 @@ ProjectResult deserializeEdit(const std::string& text, Edit& edit) {
             t.hidden = jt.value("hidden", false);
             t.soloSafe = jt.value("soloSafe", false);
             t.isMain = t.id == kMainBusId && jt.value("isMain", true);
+            t.inactive = !t.isMain && jt.value("inactive", false);
             if (jt.contains("plugins")) {
                 for (const auto& jp : jt["plugins"]) {
                     t.plugins.push_back(pluginSlotFromJson(jp));

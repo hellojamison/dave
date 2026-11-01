@@ -218,3 +218,29 @@ TEST_CASE("solo safe is undoable and persists", "[trackvisibility]") {
     REQUIRE(document::deserializeEdit(text, reloaded).ok);
     CHECK(reloaded.track(t)->soloSafe);
 }
+
+TEST_CASE("inactive tracks leave the graph and survive save and undo", "[trackvisibility][inactive]") {
+    document::Edit edit;
+    editing::UndoStack undo{edit};
+    const auto id = edit.addTrack("Inactive");
+    edit.track(id)->solo = true;
+    engine::GraphBuilder builder;
+    auto graph = builder.build(edit, 48000.0, 2);
+    REQUIRE(builder.trackGains().count(id) == 1);
+    undo.execute(std::make_unique<editing::SetTrackInactiveCommand>(id, true));
+    CHECK(edit.track(id)->inactive);
+    CHECK_FALSE(edit.anySoloed());
+    graph = builder.build(edit, 48000.0, 2);
+    CHECK(builder.trackGains().count(id) == 0);
+    CHECK(builder.meterTaps().count(id) == 0);
+    document::Edit restored;
+    REQUIRE(document::deserializeEdit(document::serializeEdit(edit), restored).ok);
+    CHECK(restored.track(id)->inactive);
+    undo.undo();
+    CHECK_FALSE(edit.track(id)->inactive);
+    graph = builder.build(edit, 48000.0, 2);
+    CHECK(builder.trackGains().count(id) == 1);
+    undo.redo();
+    CHECK(edit.track(id)->inactive);
+    CHECK_FALSE(edit.setTrackInactive(std::string(document::kMainBusId), true));
+}

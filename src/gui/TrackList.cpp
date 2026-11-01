@@ -159,7 +159,7 @@ void drawTrackList(const document::Edit& edit, TimelineViewState& view) {
         dl->PushClipRect(ImVec2(swatchX + 8.0f, y),
                          ImVec2(rowMax.x - 4.0f, rowMax.y), true);
         dl->AddText(ImVec2(swatchX + 8.0f, y + 3.0f),
-                    ImGui::GetColorU32(track.hidden ? pal.textSubtle : pal.text),
+                    ImGui::GetColorU32((track.hidden || track.inactive) ? pal.textSubtle : pal.text),
                     track.name.c_str());
         dl->PopClipRect();
 
@@ -209,6 +209,10 @@ void drawTrackList(const document::Edit& edit, TimelineViewState& view) {
         if (ctx != nullptr) {
             ImGui::TextDisabled("%s", ctx->name.c_str());
             ImGui::Separator();
+            if (ImGui::MenuItem(ctx->inactive ? "Make Active" : "Make Inactive",
+                                nullptr, false, !ctx->isMain && !view.recordingActive)) {
+                view.requestToggleInactiveTrackId = ctx->id;
+            }
             // Main is permanent; deleting it would leave the session with no
             // output bus, so the item is disabled rather than absent.
             if (ImGui::MenuItem("Delete", nullptr, false, !ctx->isMain)) {

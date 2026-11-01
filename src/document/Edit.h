@@ -142,6 +142,7 @@ public:
     // Hide a track from the timeline. Main is refused: it is where everything
     // ends up, and a session with no visible Main has no visible output.
     bool setTrackHidden(const std::string& trackId, bool hidden);
+    bool setTrackInactive(const std::string& trackId, bool inactive);
     // Exempt a track from other tracks' solos.
     bool setTrackSoloSafe(const std::string& trackId, bool safe);
     std::vector<VolumeAutomationPoint>* volumeAutomation(

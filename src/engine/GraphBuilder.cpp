@@ -123,7 +123,7 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit,
             rememberRoute(channel.id, send.target);
         }
     };
-    for (const auto& track : edit.tracks()) rememberChannel(track);
+    for (const auto& track : edit.tracks()) if (!track.inactive) rememberChannel(track);
 
     const bool anySoloed = edit.anySoloed();
     std::unordered_set<std::string> soloActive;
@@ -161,7 +161,7 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit,
         };
         upstream(id);
     };
-    for (const auto& track : edit.tracks()) if (track.solo) activateSolo(track.id);
+    for (const auto& track : edit.tracks()) if (track.solo && !track.inactive) activateSolo(track.id);
 
     // Solo-safe keeps a track's OUTPUT path alive without pulling its inputs
     // along. Walking upstream too would un-silence everything feeding it — a
@@ -184,7 +184,7 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit,
     };
     if (anySoloed) {
         for (const auto& track : edit.tracks()) {
-            if (track.soloSafe) activateSoloSafe(track.id);
+            if (track.soloSafe && !track.inactive) activateSoloSafe(track.id);
         }
     }
 
@@ -291,8 +291,9 @@ std::unique_ptr<Graph> GraphBuilder::build(const document::Edit& edit,
         return gainId;
     };
 
-    // Create every receiver before connecting any document route.
+    // Create every active receiver before connecting any document route.
     for (const auto& track : edit.tracks()) {
+        if (track.inactive) continue;
         const NodeId input = graph->addNode(std::make_shared<SummingNode>(1));
         channels[track.id].input = input;
 

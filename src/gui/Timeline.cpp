@@ -491,7 +491,9 @@ float drawTrackGutter(const GutterLayout& g, TimelineViewState& view,
                 true);
             dl->AddText(nameFont, g.labelHeight,
                         ImVec2(origin.x + contentX, y + g.rowPadding),
-                        selected ? IM_COL32(24, 28, 29, 255) : C(pal.text),
+                        (f.trackId && edit.track(*f.trackId) && edit.track(*f.trackId)->inactive)
+                            ? C(pal.textSubtle)
+                            : (selected ? IM_COL32(24, 28, 29, 255) : C(pal.text)),
                         f.name->c_str());
             dl->PopClipRect();
         }
@@ -518,6 +520,11 @@ float drawTrackGutter(const GutterLayout& g, TimelineViewState& view,
             }
             const bool isMain = f.trackId != nullptr &&
                                 *f.trackId == document::kMainBusId;
+            const auto* menuTrack = f.trackId ? edit.track(*f.trackId) : nullptr;
+            if (menuTrack && ImGui::MenuItem(menuTrack->inactive ? "Make Active" : "Make Inactive",
+                                              nullptr, false, !isMain && !view.recordingActive)) {
+                view.requestToggleInactiveTrackId = *f.trackId;
+            }
             if (ImGui::MenuItem("Hide Track", nullptr, false, !isMain)) {
                 if (f.trackId != nullptr) {
                     view.requestHideTrackId = *f.trackId;
@@ -2139,7 +2146,7 @@ void drawTimeline(const document::Edit& edit,
                 view.automationEditOwnerId = ownerId;
                 view.automationEditPointId = found->id;
                 view.automationEditValue = isPan
-                    ? found->db * 100.0 : found->db;
+                    ? found->db * 50.0 : found->db;
                 automationConsumedClick = true;
             }
         }
@@ -2189,7 +2196,7 @@ void drawTimeline(const document::Edit& edit,
                 if (ImGui::IsItemHovered()) {
                     if (isPan) {
                         ImGui::SetTooltip(
-                            "Pan (-100 = left, 0 = centre, +100 = right)");
+                            "Pan (-50 = left, 0 = centre, +50 = right)");
                     } else {
                         ImGui::SetTooltip("Volume (%+.1f to %+.1f dB)",
                                           document::kMinVolumeAutomationDb,
@@ -2208,7 +2215,7 @@ void drawTimeline(const document::Edit& edit,
                 } else if (submitted || deactivated) {
                     auto updated = *editedPoint;
                     updated.db = clampLaneValue(isPan
-                        ? view.automationEditValue / 100.0
+                        ? view.automationEditValue / 50.0
                         : view.automationEditValue);
                     if (updated.db != editedPoint->db) {
                         movePoint(updated);
@@ -2872,10 +2879,26 @@ void drawTimeline(const document::Edit& edit,
             ImGui::SetNextItemWidth(80.0f);
             float gainDb = 20.0f * std::log10(
                 std::max(0.0001f, static_cast<float>(mutableTrack.gain)));
-            const bool changed = ImGui::SliderFloat("##editGain", &gainDb, -60.0f, 6.0f,
-                                                     "vol %.1f");
+            const bool changed = ImGui::DragFloat("##editGain", &gainDb, 0.4f, -60.0f, 6.0f,
+                                                   "vol %.1f", ImGuiSliderFlags_NoInput);
             const bool reset = theme::altClickedReset();
-            if (changed || reset) {
+            bool verticalChange = false;
+            if (ImGui::IsItemActive() && !ImGui::GetIO().KeyAlt) {
+                const float dy = ImGui::GetIO().MouseDelta.y;
+                if (dy != 0.0f) {
+                    gainDb = std::clamp(gainDb - dy * 0.4f, -60.0f, 6.0f);
+                    verticalChange = true;
+                }
+                const ImVec2 itemMax = ImGui::GetItemRectMax();
+                const ImVec2 p(itemMax.x + 4.0f, ImGui::GetItemRectMin().y);
+                ImDrawList* overlay = ImGui::GetForegroundDrawList();
+                overlay->AddRectFilled(p, ImVec2(p.x + 32.0f, p.y + 112.0f), IM_COL32(38, 38, 38, 255), 2.0f);
+                overlay->AddRect(p, ImVec2(p.x + 32.0f, p.y + 112.0f), IM_COL32(95, 95, 95, 255), 2.0f);
+                overlay->AddLine(ImVec2(p.x + 16.0f, p.y + 12.0f), ImVec2(p.x + 16.0f, p.y + 100.0f), IM_COL32(12, 12, 12, 255), 3.0f);
+                const float knobY = p.y + 100.0f - (gainDb + 60.0f) / 66.0f * 88.0f;
+                overlay->AddRectFilled(ImVec2(p.x + 7.0f, knobY - 4.0f), ImVec2(p.x + 25.0f, knobY + 4.0f), IM_COL32(185, 185, 185, 255), 2.0f);
+            }
+            if (changed || reset || verticalChange) {
                 mutableTrack.gain = reset ? 1.0 : std::pow(10.0, gainDb / 20.0);
                 const_cast<document::Edit&>(edit).notifyChanged();
             }
@@ -2886,8 +2909,9 @@ void drawTimeline(const document::Edit& edit,
             ImGui::SetCursorScreenPos(ImVec2(x + 175.0f, ioY));
             ImGui::SetNextItemWidth(80.0f);
             float pan = static_cast<float>(mutableTrack.pan);
+            const std::string panLabel = "pan " + theme::formatPan(pan);
             const bool changed = ImGui::SliderFloat("##editPan", &pan, -1.0f, 1.0f,
-                                                     "pan %.2f");
+                                                     panLabel.c_str());
             const bool reset = theme::altClickedReset();
             if (changed || reset) {
                 mutableTrack.pan = reset ? 0.0 : pan;
@@ -3284,6 +3308,17 @@ void drawTimeline(const document::Edit& edit,
         if (gutterHovered &&
             mouse.y >= y && mouse.y <= y + rowH &&
             ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            if (ImGui::GetIO().KeyShift && view.trackSelectAnchor >= 0 &&
+                view.trackSelectAnchor < static_cast<int>(tracks.size())) {
+                const int lo = std::min(view.trackSelectAnchor, static_cast<int>(ti));
+                const int hi = std::max(view.trackSelectAnchor, static_cast<int>(ti));
+                view.selectedTrackIds.clear();
+                for (int i = lo; i <= hi; ++i) view.selectedTrackIds.insert(tracks[static_cast<size_t>(i)].id);
+            } else {
+                view.selectedTrackIds.clear();
+                view.selectedTrackIds.insert(track.id);
+                view.trackSelectAnchor = static_cast<int>(ti);
+            }
             view.selectedTrackIndex = static_cast<int>(ti);
         }
 

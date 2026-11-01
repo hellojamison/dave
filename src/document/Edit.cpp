@@ -1408,6 +1408,14 @@ bool Edit::setTrackSoloSafe(const std::string& trackId, bool safe) {
     return true;
 }
 
+bool Edit::setTrackInactive(const std::string& trackId, bool inactive) {
+    Track* t = track(trackId);
+    if (!t || (t->isMain && inactive) || t->inactive == inactive) return false;
+    t->inactive = inactive;
+    notifyChanged();
+    return true;
+}
+
 bool Edit::setTrackHidden(const std::string& trackId, bool hidden) {
     Track* t = track(trackId);
     if (t == nullptr) return false;
@@ -1645,7 +1653,7 @@ bool Edit::setMidiInstrument(const std::string& trackId, PluginSlot slot) {
 }
 
 bool Edit::anySoloed() const {
-    for (const auto& t : tracks_) if (t.solo) return true;
+    for (const auto& t : tracks_) if (t.solo && !t.inactive) return true;
     return false;
 }
 

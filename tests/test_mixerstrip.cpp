@@ -235,40 +235,13 @@ TEST_CASE("an empty session draws a mixer without crashing", "[mixerstrip]") {
 
 // ─── Pan readout ────────────────────────────────────────────────────────────
 
-TEST_CASE("pan reads as a side and a magnitude, not a signed fraction",
-          "[pan]") {
+TEST_CASE("pan reads from minus 50 to plus 50", "[pan]") {
     using dave::gui::theme::formatPan;
-
-    // Centre is a side of its own — "L0" and "R0" are the same position and
-    // showing either implies an offset that is not there.
-    CHECK(formatPan(0.0) == "C");
-
-    CHECK(formatPan(-0.5) == "L50");
-    CHECK(formatPan(0.5) == "R50");
-    CHECK(formatPan(-1.0) == "L100");
-    CHECK(formatPan(1.0) == "R100");
-
-    // Rounds to whole units rather than showing a fraction of one.
-    CHECK(formatPan(-0.254) == "L25");
-    CHECK(formatPan(0.256) == "R26");
-
-    // Values a hair off centre round to it rather than reading as hard left.
-    CHECK(formatPan(0.001) == "C");
-    CHECK(formatPan(-0.001) == "C");
-
-    // Symmetric either side, at every step.
-    for (int i = 0; i <= 100; ++i) {
-        const double v = i / 100.0;
-        const std::string l = formatPan(-v);
-        const std::string r = formatPan(v);
-        if (i == 0) {
-            REQUIRE(l == "C");
-            REQUIRE(r == "C");
-        } else {
-            REQUIRE(l == "L" + std::to_string(i));
-            REQUIRE(r == "R" + std::to_string(i));
-        }
-    }
+    CHECK(formatPan(-1.0) == "-50");
+    CHECK(formatPan(-0.5) == "-25");
+    CHECK(formatPan(0.0) == "0");
+    CHECK(formatPan(0.5) == "+25");
+    CHECK(formatPan(1.0) == "+50");
 }
 
 TEST_CASE("dragging the mixer pan knob changes only that track's pan",

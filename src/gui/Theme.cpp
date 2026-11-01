@@ -164,12 +164,12 @@ const Fonts& fonts() {
 
 std::string formatPan(double pan) {
     const int magnitude =
-        static_cast<int>(std::lround(std::fabs(pan) * 100.0));
+        static_cast<int>(std::lround(std::fabs(pan) * 50.0));
     if (magnitude == 0) {
-        return "C";
+        return "0";
     }
     char buf[8];
-    std::snprintf(buf, sizeof(buf), "%c%d", pan < 0.0 ? 'L' : 'R', magnitude);
+    std::snprintf(buf, sizeof(buf), "%c%d", pan < 0.0 ? '-' : '+', magnitude);
     return buf;
 }
 

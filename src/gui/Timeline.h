@@ -178,6 +178,7 @@ struct TimelineViewState {
     // A track whose eye was clicked in the list — toggled rather than set, so
     // the one control does both directions.
     std::string requestToggleHiddenTrackId;
+    std::string requestToggleInactiveTrackId;
     // A track the list asked to delete (right-click -> Delete), and the row the
     // list's context menu is currently for.
     std::string requestRemoveTrackId;

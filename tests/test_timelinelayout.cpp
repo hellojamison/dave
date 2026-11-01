@@ -10,6 +10,8 @@
 // the old positions with every command still correct.
 #include "ImGuiTestRig.h"
 
+#include <imgui_internal.h>
+
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
@@ -158,11 +160,6 @@ TEST_CASE("wide edit columns open the existing track controls",
     rig.clickTimelineAt(rig.origin.x + 160.0f + 20.0f, top + 10.0f);
     CHECK(rig.view.requestPickerTrackId == track);
     CHECK(rig.view.requestPicker == gui::TimelineViewState::PluginPicker::AudioFx);
-
-    rig.view.requestChannelStripTrackId.clear();
-    rig.clickTimelineAt(rig.origin.x + 160.0f + 100.0f, top + 10.0f);
-    CHECK(rig.view.requestChannelStripTrackId == track);
-    CHECK(rig.view.requestChannelStripOpen);
 
     document::PluginSlot insert;
     insert.name = "Equalizer";
@@ -2089,4 +2086,63 @@ TEST_CASE("clicking a marker label seeks to the marker", "[timelinelayout][marke
     rig.transport.advanceAndFill(time, 0, 48000.0);
     CHECK(rig.transport.position() == marker.position);
     CHECK(rig.edit.markerTrack(mt)->markers.front().position == marker.position);
+}
+
+TEST_CASE("track send button assigns a destination without opening the strip", "[timelinelayout][sends]") {
+    LayoutRig rig;
+    rig.showEditColumns = true;
+    rig.edit.addMarkerTrack("Markers");
+    const auto track = rig.edit.addTrack("Dialogue");
+    const auto bus = rig.edit.addTrack("Effects");
+    rig.settle();
+    const float top = rig.origin.y + kRulerHeight + kMarkerLaneHeight;
+    const float x = rig.origin.x + 160.0f + 89.0f + 20.0f;
+    rig.clickTimelineAt(x, top + 10.0f);
+    REQUIRE_FALSE(rig.view.requestChannelStripOpen);
+    auto& stack = ImGui::GetCurrentContext()->OpenPopupStack;
+    REQUIRE(stack.Size == 1);
+    REQUIRE(stack[0].Window != nullptr);
+    const ImVec2 popup = stack[0].Window->Pos;
+    const float row = ImGui::GetTextLineHeightWithSpacing();
+    // The destination list starts with None, this track (disabled), then Effects.
+    rig.clickTimelineAt(popup.x + 20.0f,
+                        popup.y + ImGui::GetStyle().WindowPadding.y + 2.5f * row);
+    REQUIRE(rig.view.routing.requests().size() == 1);
+    const auto& request = rig.view.routing.requests().front();
+    CHECK(request.kind == gui::RoutingRequest::Kind::AddSend);
+    CHECK(request.ownerId == track);
+    CHECK(request.send.target.targetId == bus);
+    CHECK_FALSE(rig.view.requestChannelStripOpen);
+}
+
+TEST_CASE("track send button changes an existing destination in place", "[timelinelayout][sends]") {
+    LayoutRig rig;
+    rig.showEditColumns = true;
+    rig.edit.addMarkerTrack("Markers");
+    const auto track = rig.edit.addTrack("Dialogue");
+    const auto bus = rig.edit.addTrack("Effects");
+    document::AuxSend send;
+    send.target = document::RouteTarget::bus();
+    send.gain = 0.42;
+    const auto sendId = rig.edit.addSend(track, send);
+    REQUIRE_FALSE(sendId.empty());
+    rig.settle();
+    const float top = rig.origin.y + kRulerHeight + kMarkerLaneHeight;
+    const float x = rig.origin.x + 160.0f + 89.0f + 20.0f;
+    rig.clickTimelineAt(x, top + 10.0f);
+    auto& stack = ImGui::GetCurrentContext()->OpenPopupStack;
+    REQUIRE(stack.Size == 1);
+    REQUIRE(stack[0].Window != nullptr);
+    const ImVec2 popup = stack[0].Window->Pos;
+    const float row = ImGui::GetTextLineHeightWithSpacing();
+    rig.clickTimelineAt(popup.x + 20.0f,
+                        popup.y + ImGui::GetStyle().WindowPadding.y + 2.5f * row);
+    REQUIRE(rig.view.routing.requests().size() == 1);
+    const auto& request = rig.view.routing.requests().front();
+    CHECK(request.kind == gui::RoutingRequest::Kind::UpdateSend);
+    CHECK(request.ownerId == track);
+    CHECK(request.send.id == sendId);
+    CHECK(request.send.target.targetId == bus);
+    CHECK(request.send.gain == Catch::Approx(0.42));
+    CHECK_FALSE(rig.view.requestChannelStripOpen);
 }

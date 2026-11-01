@@ -2840,14 +2840,72 @@ void drawTimeline(const document::Edit& edit,
             ImGui::PushID(send.id.c_str());
             ImGui::SetCursorScreenPos(ImVec2(x + 89.0f, y));
             const auto name = routeTargetLabel(edit, send.target, playbackChannels);
-            if (ImGui::Button(name.c_str(), ImVec2(80.0f, rowH))) openStrip();
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Edit send: %s", name.c_str());
+            if (ImGui::Button(name.c_str(), ImVec2(80.0f, rowH))) {
+                ImGui::OpenPopup("##editRetargetSend");
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Change send destination: %s", name.c_str());
+            if (ImGui::BeginPopup("##editRetargetSend")) {
+                const auto options = routingTargetOptions(edit, track.id, playbackChannels, true);
+                for (size_t i = 0; i < options.size(); ++i) {
+                    const auto& option = options[i];
+                    ImGui::PushID(static_cast<int>(i));
+                    if (ImGui::Selectable(option.label.c_str(), send.target == option.target,
+                                          option.enabled ? ImGuiSelectableFlags_None
+                                                         : ImGuiSelectableFlags_Disabled)) {
+                        RoutingRequest request;
+                        request.kind = RoutingRequest::Kind::UpdateSend;
+                        request.ownerId = track.id;
+                        request.send = send;
+                        request.send.target = option.target;
+                        view.routing.request(std::move(request));
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::Separator();
+                if (ImGui::Selectable("Remove Send")) {
+                    RoutingRequest request;
+                    request.kind = RoutingRequest::Kind::RemoveSend;
+                    request.ownerId = track.id;
+                    request.send.id = send.id;
+                    view.routing.request(std::move(request));
+                }
+                ImGui::EndPopup();
+            }
             ImGui::PopID();
             y += rowH + 2.0f;
         }
         if (y + rowH <= bottom) {
             ImGui::SetCursorScreenPos(ImVec2(x + 89.0f, y));
-            if (ImGui::Button("+ Send", ImVec2(80.0f, rowH))) openStrip();
+            ImGui::BeginDisabled(track.isMain);
+            if (ImGui::Button("+ Send", ImVec2(80.0f, rowH))) {
+                ImGui::OpenPopup("##editAddSend");
+            }
+            ImGui::EndDisabled();
+            if (ImGui::BeginPopup("##editAddSend")) {
+                const auto options = routingTargetOptions(edit, track.id, playbackChannels, true);
+                for (size_t i = 0; i < options.size(); ++i) {
+                    const auto& option = options[i];
+                    ImGui::PushID(static_cast<int>(i));
+                    if (ImGui::Selectable(option.label.c_str(), false,
+                                          option.enabled ? ImGuiSelectableFlags_None
+                                                         : ImGuiSelectableFlags_Disabled)) {
+                        RoutingRequest request;
+                        request.kind = RoutingRequest::Kind::AddSend;
+                        request.ownerId = track.id;
+                        request.send.target = option.target;
+                        view.routing.request(std::move(request));
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::Separator();
+                if (ImGui::Selectable("+ New bus…")) {
+                    RoutingRequest request;
+                    request.kind = RoutingRequest::Kind::AddBusAndSend;
+                    request.ownerId = track.id;
+                    view.routing.request(std::move(request));
+                }
+                ImGui::EndPopup();
+            }
         }
         const auto output = routeTargetLabel(edit, track.mainOutput, playbackChannels);
         float ioY = top + 2.0f;

@@ -429,7 +429,10 @@ float drawTrackGutter(const GutterLayout& g, TimelineViewState& view,
     const auto& pal = theme::palette();
     ImDrawList* dl = g.dl;
     const ImVec2 origin = g.origin;
+    const float contentX = g.editColumns ? 28.0f : kGutterContentX;
 
+    const float nameRight = g.editColumns ? g.gutterWidth - kMeterW - 20.0f
+        : g.gutterWidth - (f.recordArm != nullptr ? 110.0f : 86.0f);
     // Double-click the name to rename (inline text input).
     {
         char renameId[32];
@@ -447,10 +450,9 @@ float drawTrackGutter(const GutterLayout& g, TimelineViewState& view,
             const float framePadX = ImGui::GetStyle().FramePadding.x;
             const float framePadY = ImGui::GetStyle().FramePadding.y;
             ImGui::SetCursorScreenPos(
-                ImVec2(origin.x + kGutterContentX - framePadX,
+                ImVec2(origin.x + contentX - framePadX,
                        y + g.rowPadding - framePadY));
-            ImGui::PushItemWidth(
-                g.gutterWidth - (f.recordArm != nullptr ? 118.0f : 88.0f));
+            ImGui::PushItemWidth(std::max(30.0f, nameRight - contentX));
             ImGui::SetKeyboardFocusHere();
             char nameBuf[128];
             std::strncpy(nameBuf, f.name->c_str(), sizeof(nameBuf) - 1);
@@ -477,28 +479,25 @@ float drawTrackGutter(const GutterLayout& g, TimelineViewState& view,
                 ? theme::fonts().label : ImGui::GetFont();
             if (selected) {
                 dl->AddRectFilled(
-                    ImVec2(origin.x + kGutterContentX - 2.0f, y + g.rowPadding - 1.0f),
-                    ImVec2(origin.x + g.gutterWidth -
-                               (f.recordArm != nullptr ? 110.0f : 86.0f),
+                    ImVec2(origin.x + contentX - 2.0f, y + g.rowPadding - 1.0f),
+                    ImVec2(origin.x + nameRight,
                            y + g.rowPadding + g.headerHeight + 1.0f),
                     IM_COL32(205, 220, 222, 255));
             }
             dl->PushClipRect(
-                ImVec2(origin.x + kGutterContentX, y),
-                ImVec2(origin.x + g.gutterWidth -
-                           (f.recordArm != nullptr ? 110.0f : 86.0f),
+                ImVec2(origin.x + contentX, y),
+                ImVec2(origin.x + nameRight,
                        y + g.headerHeight + g.rowPadding * 2.0f),
                 true);
             dl->AddText(nameFont, g.labelHeight,
-                        ImVec2(origin.x + kGutterContentX, y + g.rowPadding),
+                        ImVec2(origin.x + contentX, y + g.rowPadding),
                         selected ? IM_COL32(24, 28, 29, 255) : C(pal.text),
                         f.name->c_str());
             dl->PopClipRect();
         }
         const bool overName = g.gutterHovered &&
-            g.mouse.x >= origin.x + 16.0f &&
-            g.mouse.x <= origin.x + g.gutterWidth -
-                             (f.recordArm != nullptr ? 110.0f : 86.0f) &&
+            g.mouse.x >= origin.x + contentX &&
+            g.mouse.x <= origin.x + nameRight &&
             g.mouse.y >= y &&
             g.mouse.y <= y + g.headerHeight + g.rowPadding * 2.0f;
 
@@ -563,7 +562,7 @@ float drawTrackGutter(const GutterLayout& g, TimelineViewState& view,
         // it opens a panel rather than holding a state the row can show.
         const int slotCount = toggleCount + 1;
         float msX = g.editColumns
-            ? origin.x + kGutterContentX
+            ? origin.x + contentX
             : origin.x + g.gutterWidth -
                 (msSize.x * static_cast<float>(slotCount) +
                  msGap * static_cast<float>(slotCount - 1)) - 12.0f;
@@ -688,6 +687,12 @@ float drawTrackGutter(const GutterLayout& g, TimelineViewState& view,
             msX += msSize.x + msGap;
         }
         ImGui::PopID();
+    }
+
+    // In the wide layout these same controls sit in the I/O column.
+    if (g.editColumns) {
+        return y + g.rowPadding + g.headerHeight + g.rowGap +
+               g.compactControlHeight + g.rowGap;
     }
 
     // Interactive gain + pan controls.
@@ -901,8 +906,8 @@ void drawTimeline(const document::Edit& edit,
     // On wider windows, the edit head exposes the existing insert, send and
     // routing controls in columns. On narrow windows the channel strip keeps
     // those controls available without squeezing the timeline away.
-    constexpr float trackHeaderWidth = 260.0f;
     const bool columnsVisible = showEditColumns && avail.x >= 1050.0f;
+    const float trackHeaderWidth = columnsVisible ? 160.0f : 260.0f;
     const float gutterWidth = trackHeaderWidth + (columnsVisible ? 260.0f : 0.0f);
     const float totalWidth = avail.x;
     // Reported outward so every zoom path can preserve the playhead's lane X
@@ -916,10 +921,11 @@ void drawTimeline(const document::Edit& edit,
     const float compactControlHeight = ImGui::GetFontSize() + 2.0f;
     const float labelHeight = static_cast<float>(theme::typeScale().label);
     const float headerHeight = std::max(labelHeight, compactControlHeight);
-    const float minTrackHeight =
+    const float minTrackHeight = std::max(
         rowPadding * 2.0f + headerHeight +
-        compactControlHeight * (columnsVisible ? 3.0f : 2.0f) +
-        rowGap * (columnsVisible ? 3.0f : 2.0f);
+            compactControlHeight * (columnsVisible ? 3.0f : 2.0f) +
+            rowGap * (columnsVisible ? 3.0f : 2.0f),
+        columnsVisible ? 84.0f : 0.0f);
     // Control+scroll scales the row height (see the wheel handler); the
     // format-derived minimum is still enforced so controls never clip.
     trackHeight = std::max(trackHeight * view.trackHeightScale, minTrackHeight);
@@ -1228,7 +1234,9 @@ void drawTimeline(const document::Edit& edit,
             const auto found = gainNodes->find(trackId);
             if (found != gainNodes->end()) node = found->second.get();
         }
-        if (drawLevelMeter(node, ImVec2(origin.x + kMeterX, meterTop),
+        const float meterX = columnsVisible
+            ? trackHeaderWidth - kMeterW - 4.0f : kMeterX;
+        if (drawLevelMeter(node, ImVec2(origin.x + meterX, meterTop),
                            meterHeight, view.meterOptions, 2,
                            LevelMeterStyle{},
                            sessionHasFloatHeadroom(edit.bitDepth()))) {
@@ -2478,7 +2486,8 @@ void drawTimeline(const document::Edit& edit,
     auto drawPlaylistMenu = [&](const document::Track& track, float y,
                                 int uid) {
         const float btnW = 16.0f;
-        const float btnX = origin.x + trackHeaderWidth - 110.0f - btnW - 2.0f;
+        const float btnX = origin.x + trackHeaderWidth -
+            (columnsVisible ? kMeterW + 20.0f : 110.0f + btnW + 2.0f);
         const float btnY = y + rowPadding;
         const ImVec2 bMin(btnX, btnY);
         const ImVec2 bMax(btnX + btnW, btnY + labelHeight);
@@ -2849,7 +2858,44 @@ void drawTimeline(const document::Edit& edit,
             ImGui::SetCursorScreenPos(ImVec2(x + 175.0f, ioY));
             if (ImGui::Button(output.c_str(), ImVec2(80.0f, rowH))) openStrip();
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Edit routing: %s", output.c_str());
+            ioY += rowH + 2.0f;
         }
+        auto& mutableTrack = const_cast<document::Track&>(track);
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, theme::hex(0x080a09ff));
+        ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, theme::hex(0x16251cff));
+        ImGui::PushStyleColor(ImGuiCol_FrameBgActive, theme::hex(0x1d3425ff));
+        ImGui::PushStyleColor(ImGuiCol_SliderGrab, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_Text, theme::hex(0x5bd787ff));
+        if (ioY + rowH <= bottom) {
+            ImGui::SetCursorScreenPos(ImVec2(x + 175.0f, ioY));
+            ImGui::SetNextItemWidth(80.0f);
+            float gainDb = 20.0f * std::log10(
+                std::max(0.0001f, static_cast<float>(mutableTrack.gain)));
+            const bool changed = ImGui::SliderFloat("##editGain", &gainDb, -60.0f, 6.0f,
+                                                     "vol %.1f");
+            const bool reset = theme::altClickedReset();
+            if (changed || reset) {
+                mutableTrack.gain = reset ? 1.0 : std::pow(10.0, gainDb / 20.0);
+                const_cast<document::Edit&>(edit).notifyChanged();
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Track gain (Option-click for 0 dB)");
+            ioY += rowH + 2.0f;
+        }
+        if (ioY + rowH <= bottom) {
+            ImGui::SetCursorScreenPos(ImVec2(x + 175.0f, ioY));
+            ImGui::SetNextItemWidth(80.0f);
+            float pan = static_cast<float>(mutableTrack.pan);
+            const bool changed = ImGui::SliderFloat("##editPan", &pan, -1.0f, 1.0f,
+                                                     "pan %.2f");
+            const bool reset = theme::altClickedReset();
+            if (changed || reset) {
+                mutableTrack.pan = reset ? 0.0 : pan;
+                const_cast<document::Edit&>(edit).notifyChanged();
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Track pan (Option-click for centre)");
+        }
+        ImGui::PopStyleColor(6);
         ImGui::PopStyleVar(2);
         ImGui::PopID();
         ImGui::PopClipRect();
@@ -2962,7 +3008,9 @@ void drawTimeline(const document::Edit& edit,
             // Sends and inserts live in the head too, below gain and pan,
             // in whatever height the row has spare — pull the row taller to
             // see and assign them.
-            drawHeadChain(track, headFree, y + baseHeightOf(track) - 4.0f);
+            if (!columnsVisible) {
+                drawHeadChain(track, headFree, y + baseHeightOf(track) - 4.0f);
+            }
             drawPlaylistMenu(track, y, static_cast<int>(ti));
             drawEditColumns(track, y, baseHeightOf(track));
         }

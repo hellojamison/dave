@@ -155,12 +155,12 @@ TEST_CASE("wide edit columns open the existing track controls",
     rig.settle();
     const float top = rig.origin.y + kRulerHeight + kMarkerLaneHeight;
 
-    rig.clickTimelineAt(rig.origin.x + 260.0f + 20.0f, top + 10.0f);
+    rig.clickTimelineAt(rig.origin.x + 160.0f + 20.0f, top + 10.0f);
     CHECK(rig.view.requestPickerTrackId == track);
     CHECK(rig.view.requestPicker == gui::TimelineViewState::PluginPicker::AudioFx);
 
     rig.view.requestChannelStripTrackId.clear();
-    rig.clickTimelineAt(rig.origin.x + 260.0f + 100.0f, top + 10.0f);
+    rig.clickTimelineAt(rig.origin.x + 160.0f + 100.0f, top + 10.0f);
     CHECK(rig.view.requestChannelStripTrackId == track);
     CHECK(rig.view.requestChannelStripOpen);
 
@@ -169,14 +169,23 @@ TEST_CASE("wide edit columns open the existing track controls",
     const std::string insertId = rig.edit.addPlugin(track, insert);
     REQUIRE_FALSE(insertId.empty());
     rig.settle();
-    rig.clickTimelineAt(rig.origin.x + 260.0f + 20.0f, top + 10.0f);
+    rig.clickTimelineAt(rig.origin.x + 160.0f + 20.0f, top + 10.0f);
     CHECK(rig.view.requestPluginEditorSlotId == insertId);
 
     // In the wide layout, the record and solo controls sit below the name.
-    rig.clickTimelineAt(rig.origin.x + kGutterContentX + 34.0f, top + 32.0f);
+    rig.clickTimelineAt(rig.origin.x + 28.0f + 34.0f, top + 32.0f);
     CHECK(rig.edit.track(track)->recordArm);
-    rig.clickTimelineAt(rig.origin.x + kGutterContentX + 58.0f, top + 32.0f);
+    rig.clickTimelineAt(rig.origin.x + 28.0f + 58.0f, top + 32.0f);
     CHECK(rig.edit.track(track)->solo);
+
+    rig.edit.track(track)->gain = 0.25;
+    rig.edit.track(track)->pan = -0.75;
+    rig.holdAlt(true);
+    rig.clickTimelineAt(rig.origin.x + 160.0f + 215.0f, top + 50.0f);
+    rig.clickTimelineAt(rig.origin.x + 160.0f + 215.0f, top + 70.0f);
+    rig.holdAlt(false);
+    CHECK(rig.edit.track(track)->gain == 1.0);
+    CHECK(rig.edit.track(track)->pan == 0.0);
 }
 
 TEST_CASE("scrolled edit column controls cannot capture clicks above tracks",
@@ -190,7 +199,7 @@ TEST_CASE("scrolled edit column controls cannot capture clicks above tracks",
     rig.tick(-100.0f, -100.0f, false);
     const float hiddenButtonY = rig.origin.y + kRulerHeight +
                                 kMarkerLaneHeight - 40.0f + 10.0f;
-    rig.clickTimelineAt(rig.origin.x + 280.0f, hiddenButtonY);
+    rig.clickTimelineAt(rig.origin.x + 180.0f, hiddenButtonY);
     CHECK(rig.view.requestPicker == gui::TimelineViewState::PluginPicker::None);
 }
 
@@ -203,7 +212,7 @@ TEST_CASE("timeline seeking accounts for wide edit columns",
     rig.edit.addTrack("Dialogue");
     rig.settle();
     const float laneY = rig.origin.y + kRulerHeight + kMarkerLaneHeight + 30.0f;
-    rig.clickTimelineAt(rig.origin.x + 520.0f + 100.0f, laneY);
+    rig.clickTimelineAt(rig.origin.x + 420.0f + 100.0f, laneY);
     engine::TimeInfo time{};
     rig.transport.advanceAndFill(time, 0, 48000.0);
     CHECK(rig.transport.position() == 50000);

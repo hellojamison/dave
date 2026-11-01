@@ -5271,6 +5271,7 @@ float drawMarkerLane(const document::Edit& edit,
     std::string pendingDeleteTrackId;
     std::string pendingDeleteMarkerId;
 
+    bool markerUnderPointer = false;
     // Draw markers.
     for (const auto& [m, mt] : items) {
         ImU32 col = parseHexColor(m->color, markerColor(m->kind));
@@ -5324,10 +5325,25 @@ float drawMarkerLane(const document::Edit& edit,
         // Hit-test + drag.
         struct Rect { ImVec2 a, b; bool hit(ImVec2 p) const {
             return p.x >= a.x && p.x <= b.x && p.y >= a.y && p.y <= b.y; } };
+        // The label is part of a point marker's clickable area. Stop that
+        // area before the next flag so it cannot hide a neighboring marker.
+        double pointHitRight = mx + 6.0;
+        if (!isRegion && !m->name.empty()) {
+            pointHitRight = mx + 8.0 + ImGui::CalcTextSize(m->name.c_str()).x;
+            for (const auto& [other, otherTrack] : items) {
+                (void)otherTrack;
+                if (other == m) continue;
+                const double otherX = origin.x + gutterWidth +
+                    (other->position - scrollSamples) / samplesPerPixel;
+                if (otherX > mx) pointHitRight = std::min(pointHitRight, otherX - 6.0);
+            }
+            pointHitRight = std::max(mx + 6.0, pointHitRight);
+        }
         Rect hit = isRegion
             ? Rect{ImVec2(mx, origin.y + 4), ImVec2(mx + std::max(8.0, static_cast<double>(m->length) / samplesPerPixel), origin.y + laneHeight - 4)}
-            : Rect{ImVec2(mx - 6, origin.y), ImVec2(mx + 6, origin.y + laneHeight)};
+            : Rect{ImVec2(mx - 6, origin.y), ImVec2(pointHitRight, origin.y + laneHeight)};
         const bool markerHovered = laneHovered && hit.hit(mouse);
+        markerUnderPointer = markerUnderPointer || markerHovered;
         // Option-click is invisible without a cue, so arm it visibly: while
         // the modifier is down, the marker under the pointer wears the danger
         // colour and clicking removes it rather than dragging it.
@@ -5354,16 +5370,23 @@ float drawMarkerLane(const document::Edit& edit,
     if (view.isDragging(TimelineViewState::DragKind::Marker) &&
         !view.selectedClipId.empty()) {
         if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
-            // Find the selected marker and compute its new position from mouse X.
+            // A click navigates without moving or snapping the marker. A drag
+            // moves it by the pointer delta, preserving where it was grabbed.
+            const ImVec2 delta = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
             for (const auto& mt : edit.markerTracks()) {
                 for (const auto& m : mt.markers) {
                     if (m.id == view.selectedClipId) {
-                        double localX = mouse.x - (origin.x + gutterWidth);
-                        int64_t newPos = snapPosition(static_cast<int64_t>(
-                            std::max(0.0, scrollSamples +
-                                              localX * samplesPerPixel)));
-                        undo.execute(std::make_unique<editing::MoveMarkerCommand>(
-                            mt.id, m.id, newPos, m.length));
+                        if (delta.x == 0.0f && delta.y == 0.0f) {
+                            transport.seek(m.position);
+                        } else {
+                            const int64_t moved = view.dragClipOriginalStart +
+                                static_cast<int64_t>(delta.x * samplesPerPixel);
+                            const int64_t newPos = snapPosition(moved);
+                            if (newPos != m.position) {
+                                undo.execute(std::make_unique<editing::MoveMarkerCommand>(
+                                    mt.id, m.id, newPos, m.length));
+                            }
+                        }
                         break;
                     }
                 }
@@ -5378,14 +5401,8 @@ float drawMarkerLane(const document::Edit& edit,
 
     // Double-click empty lane to add a point marker on the first marker track.
     if (laneHovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-        // Make sure we didn't hit an existing marker (those capture the click).
-        bool hitMarker = false;
-        for (const auto& [m, mt] : items) {
-            double mx = origin.x + gutterWidth +
-                (m->position - scrollSamples) / samplesPerPixel;
-            if (std::fabs(mouse.x - mx) < 8.0) { hitMarker = true; break; }
-        }
-        if (!hitMarker) {
+        // Marker flags, labels and regions own their double-clicks too.
+        if (!markerUnderPointer) {
             const auto& target = edit.markerTracks().front();
             double localX = mouse.x - (origin.x + gutterWidth);
             int64_t pos = snapPosition(static_cast<int64_t>(
@@ -5433,22 +5450,6 @@ float drawMarkerLane(const document::Edit& edit,
             }
         }
         ImGui::EndPopup();
-    }
-
-    // Single-click on a marker seeks the transport to it (navigation). Skipped
-    // during a drag so the playhead doesn't jump while you're moving a marker,
-    // and while Option is down — that click is a delete, and seeking to a
-    // marker the same click removes is a jump to nowhere.
-    if (laneHovered && !altHeld && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
-        !view.isDragging()) {
-        for (const auto& [m, mt] : items) {
-            double mx = origin.x + gutterWidth +
-                (m->position - scrollSamples) / samplesPerPixel;
-            if (std::fabs(mouse.x - mx) < 8.0) {
-                transport.seek(m->position);
-                break;
-            }
-        }
     }
 
     // Deferred from the draw loop, where `items` still pointed into the vector

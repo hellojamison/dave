@@ -2002,3 +2002,81 @@ TEST_CASE("zooming keeps actual selection snapping on the same divisions", "[tim
     CHECK(rig.view.selectionStart % snapBefore == 0);
     CHECK(rig.view.selectionEnd % snapBefore == 0);
 }
+
+TEST_CASE("clicking a marker seeks exactly without moving it", "[timelinelayout][marker]") {
+    LayoutRig rig;
+    const auto mt = rig.edit.addMarkerTrack("Markers");
+    rig.edit.addTrack("Audio 1");
+    document::Marker marker;
+    marker.name = "Cue";
+    marker.position = 100123;
+    rig.edit.addMarker(mt, marker);
+    rig.view.snapEnabled = true;
+    rig.view.snapIncrementSamples = 4800;
+    rig.settle();
+    const float x = rig.origin.x + kGutterWidth + marker.position / rig.view.samplesPerPixel;
+    const float y = rig.origin.y + kRulerHeight + kMarkerLaneHeight * 0.5f;
+    rig.clickTimelineAt(x + 2.0f, y);
+    engine::TimeInfo time{};
+    rig.transport.advanceAndFill(time, 0, 48000.0);
+    CHECK(rig.transport.position() == marker.position);
+    CHECK(rig.edit.markerTrack(mt)->markers.front().position == marker.position);
+    CHECK_FALSE(rig.undo.canUndo());
+}
+
+TEST_CASE("clicking a region marker seeks to its start without moving it", "[timelinelayout][marker]") {
+    LayoutRig rig;
+    const auto mt = rig.edit.addMarkerTrack("Markers");
+    rig.edit.addTrack("Audio 1");
+    document::Marker marker;
+    marker.position = 90000;
+    marker.length = 50000;
+    rig.edit.addMarker(mt, marker);
+    rig.settle();
+    const float x = rig.origin.x + kGutterWidth + (marker.position + 20000) / rig.view.samplesPerPixel;
+    const float y = rig.origin.y + kRulerHeight + kMarkerLaneHeight * 0.5f;
+    rig.clickTimelineAt(x, y);
+    engine::TimeInfo time{};
+    rig.transport.advanceAndFill(time, 0, 48000.0);
+    CHECK(rig.transport.position() == marker.position);
+    CHECK(rig.edit.markerTrack(mt)->markers.front().position == marker.position);
+}
+
+TEST_CASE("dragging a region marker keeps its grab offset and is undoable", "[timelinelayout][marker]") {
+    LayoutRig rig;
+    const auto mt = rig.edit.addMarkerTrack("Markers");
+    rig.edit.addTrack("Audio 1");
+    document::Marker marker;
+    marker.position = 90000;
+    marker.length = 50000;
+    rig.edit.addMarker(mt, marker);
+    rig.settle();
+    const float x = rig.origin.x + kGutterWidth + (marker.position + 20000) / rig.view.samplesPerPixel;
+    const float y = rig.origin.y + kRulerHeight + kMarkerLaneHeight * 0.5f;
+    rig.tick(x, y, false);
+    rig.tick(x, y, true);
+    rig.tick(x + 20.0f, y, true);
+    rig.tick(x + 20.0f, y, false);
+    CHECK(rig.edit.markerTrack(mt)->markers.front().position == 100000);
+    REQUIRE(rig.undo.canUndo());
+    rig.undo.undo();
+    CHECK(rig.edit.markerTrack(mt)->markers.front().position == marker.position);
+}
+
+TEST_CASE("clicking a marker label seeks to the marker", "[timelinelayout][marker]") {
+    LayoutRig rig;
+    const auto mt = rig.edit.addMarkerTrack("Markers");
+    rig.edit.addTrack("Audio 1");
+    document::Marker marker;
+    marker.name = "Dialogue cue";
+    marker.position = 100000;
+    rig.edit.addMarker(mt, marker);
+    rig.settle();
+    const float x = rig.origin.x + kGutterWidth + marker.position / rig.view.samplesPerPixel + 20.0f;
+    const float y = rig.origin.y + kRulerHeight + kMarkerLaneHeight * 0.5f;
+    rig.clickTimelineAt(x, y);
+    engine::TimeInfo time{};
+    rig.transport.advanceAndFill(time, 0, 48000.0);
+    CHECK(rig.transport.position() == marker.position);
+    CHECK(rig.edit.markerTrack(mt)->markers.front().position == marker.position);
+}

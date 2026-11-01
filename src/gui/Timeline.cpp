@@ -708,6 +708,8 @@ float drawTrackGutter(const GutterLayout& g, TimelineViewState& view,
     }
 
     // Interactive gain + pan controls.
+    const bool haveTrackReadoutFont = theme::fonts().readoutSmall != nullptr;
+    if (haveTrackReadoutFont) ImGui::PushFont(theme::fonts().readoutSmall, ImGui::GetFontSize());
     // Option-click (Alt-click) resets to default: gain=0 dB, pan=center.
     ImGui::PushID(uid);
     float controlY = y + g.rowPadding + g.headerHeight + g.rowGap +
@@ -782,6 +784,7 @@ float drawTrackGutter(const GutterLayout& g, TimelineViewState& view,
         ImGui::PopItemWidth();
     }
     ImGui::PopID();
+    if (haveTrackReadoutFont) ImGui::PopFont();
     return controlY + g.compactControlHeight + g.rowGap;
 }
 
@@ -1233,8 +1236,8 @@ void drawTimeline(const document::Edit& edit,
         forEachUniformLine(step, fn);
     };
 
-    ImFont* rulerFont = theme::fonts().monoSmall != nullptr
-        ? theme::fonts().monoSmall : ImGui::GetFont();
+    ImFont* rulerFont = theme::fonts().readoutSmall != nullptr
+        ? theme::fonts().readoutSmall : ImGui::GetFont();
     const float rulerFontSize = static_cast<float>(theme::typeScale().caption);
     dl->PushClipRect(ImVec2(origin.x + gutterWidth, origin.y),
                      ImVec2(origin.x + totalWidth, origin.y + timelineHeight), true);
@@ -2957,6 +2960,8 @@ void drawTimeline(const document::Edit& edit,
         ImGui::PushStyleColor(ImGuiCol_SliderGrab, ImVec4(0, 0, 0, 0));
         ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, ImVec4(0, 0, 0, 0));
         ImGui::PushStyleColor(ImGuiCol_Text, theme::hex(0x5bd787ff));
+        const bool haveReadout = theme::fonts().readoutSmall != nullptr;
+        if (haveReadout) ImGui::PushFont(theme::fonts().readoutSmall, ImGui::GetFontSize());
         if (ioY + rowH <= bottom) {
             ImGui::SetCursorScreenPos(ImVec2(x + 175.0f, ioY));
             float gainDb = 20.0f * std::log10(
@@ -3006,6 +3011,7 @@ void drawTimeline(const document::Edit& edit,
             }
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Track pan (Option-click for centre)");
         }
+        if (haveReadout) ImGui::PopFont();
         ImGui::PopStyleColor(6);
         ImGui::PopStyleVar(2);
         ImGui::PopID();

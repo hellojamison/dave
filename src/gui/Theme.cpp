@@ -189,7 +189,7 @@ bool loadDefaultFont() {
 
 #ifdef __APPLE__
     constexpr const char* sansPrimary = "/System/Library/Fonts/SFNS.ttf";
-    constexpr const char* monoPrimary = "/System/Library/Fonts/SFNSMono.ttf";
+    constexpr const char* readoutPrimary = "/System/Library/Fonts/HelveticaNeue.ttc";
     constexpr const char* sansFallback = "/System/Library/Fonts/Helvetica.ttc";
 
     const auto& scale = typeScale();
@@ -201,24 +201,24 @@ bool loadDefaultFont() {
         "label", static_cast<float>(scale.label), {sansPrimary, sansFallback});
     g_fonts.heading = loadFontRole(
         "heading", static_cast<float>(scale.title), {sansPrimary, sansFallback});
-    g_fonts.monoSmall = loadFontRole(
-        "mono-small", 13.0f, {monoPrimary, sansPrimary, sansFallback});
-    g_fonts.monoLarge = loadFontRole(
-        "mono-large", 20.0f, {monoPrimary, sansPrimary, sansFallback});
+    g_fonts.readoutSmall = loadFontRole(
+        "readout-small", 13.0f, {readoutPrimary, sansPrimary, sansFallback});
+    g_fonts.readoutLarge = loadFontRole(
+        "readout-large", 20.0f, {readoutPrimary, sansPrimary, sansFallback});
 #else
     const auto& scale = typeScale();
     g_fonts.body = loadFontRole("body", static_cast<float>(scale.body), {});
     g_fonts.small = loadFontRole("small", static_cast<float>(scale.caption), {});
     g_fonts.label = loadFontRole("label", static_cast<float>(scale.label), {});
     g_fonts.heading = loadFontRole("heading", static_cast<float>(scale.title), {});
-    g_fonts.monoSmall = loadFontRole("mono-small", 13.0f, {});
-    g_fonts.monoLarge = loadFontRole("mono-large", 20.0f, {});
+    g_fonts.readoutSmall = loadFontRole("readout-small", 13.0f, {"C:/Windows/Fonts/segoeui.ttf"});
+    g_fonts.readoutLarge = loadFontRole("readout-large", 20.0f, {"C:/Windows/Fonts/segoeui.ttf"});
 #endif
 
     io.FontDefault = g_fonts.body;
     return g_fonts.body != nullptr && g_fonts.small != nullptr &&
            g_fonts.label != nullptr && g_fonts.heading != nullptr &&
-           g_fonts.monoSmall != nullptr && g_fonts.monoLarge != nullptr;
+           g_fonts.readoutSmall != nullptr && g_fonts.readoutLarge != nullptr;
 }
 
 void applyTheme() {

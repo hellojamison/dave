@@ -2116,8 +2116,8 @@ void DaveApp::drawUI() {
                 counterMin, ImVec2(counterMin.x + counterW,
                                    counterMin.y + controlH),
                 IM_COL32(8, 10, 9, 255));
-            ImFont* counterFont = gui::theme::fonts().monoLarge != nullptr
-                ? gui::theme::fonts().monoLarge : ImGui::GetFont();
+            ImFont* counterFont = gui::theme::fonts().readoutLarge != nullptr
+                ? gui::theme::fonts().readoutLarge : ImGui::GetFont();
             constexpr float counterFontSize = 20.0f;
             const ImVec2 textSize =
                 counterFont->CalcTextSizeA(counterFontSize, FLT_MAX, 0.0f,
@@ -2146,9 +2146,9 @@ void DaveApp::drawUI() {
             // edit changes neither the number's size nor its position — only
             // that a caret now blinks in it.
             constexpr float editFontSize = 20.0f;
-            const bool haveMono = gui::theme::fonts().monoLarge != nullptr;
-            if (haveMono) {
-                ImGui::PushFont(gui::theme::fonts().monoLarge, editFontSize);
+            const bool haveReadoutFont = gui::theme::fonts().readoutLarge != nullptr;
+            if (haveReadoutFont) {
+                ImGui::PushFont(gui::theme::fonts().readoutLarge, editFontSize);
             }
             ImGui::PushStyleVar(
                 ImGuiStyleVar_FramePadding,
@@ -2243,7 +2243,7 @@ void DaveApp::drawUI() {
                 view_.editingPosition = false;
             }
             ImGui::PopStyleVar();   // FramePadding
-            if (haveMono) ImGui::PopFont();
+            if (haveReadoutFont) ImGui::PopFont();
         }
         // The format is a property of the counter beside it, so it hangs off
         // the counter as a disclosure arrow rather than restating the current
@@ -2326,6 +2326,8 @@ void DaveApp::drawUI() {
             bool selectionEdited = false;
             auto timeField = [&](const char* id, char* buf, bool& editing,
                                  bool& focusPending, int64_t& value) {
+                const bool haveReadout = gui::theme::fonts().readoutSmall != nullptr;
+                if (haveReadout) ImGui::PushFont(gui::theme::fonts().readoutSmall, ImGui::GetFontSize());
                 const ImVec2 fieldOrigin = ImGui::GetCursorScreenPos();
                 const float fieldHeight = ImGui::GetFrameHeight();
                 if (!editing) {
@@ -2375,6 +2377,7 @@ void DaveApp::drawUI() {
                         editing = false;
                     }
                 }
+                if (haveReadout) ImGui::PopFont();
             };
             const ImVec2 selectionGroupOrigin = ImGui::GetCursorScreenPos();
             const float selectionRight = selectionGroupOrigin.x + 142.0f + groupGap;

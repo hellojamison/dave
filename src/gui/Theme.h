@@ -112,14 +112,13 @@ struct Fonts {
     ImFont* small = nullptr;
     ImFont* label = nullptr;
     ImFont* heading = nullptr;
-    ImFont* monoSmall = nullptr;
-    ImFont* monoLarge = nullptr;
+    ImFont* readoutSmall = nullptr;
+    ImFont* readoutLarge = nullptr;
 };
 
 const Fonts& fonts();
 
-// Loads every role into one atlas, preferring SF Pro/SF Mono, then Helvetica,
-// then ImGui's embedded font. Each selected face is logged to stderr.
+// Loads UI and numeric readout fonts into one atlas with platform fallbacks.
 bool loadDefaultFont();
 
 // Kept while ImGuiLayer still calls the former single-size API. The hierarchy

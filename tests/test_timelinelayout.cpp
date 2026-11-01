@@ -2146,3 +2146,45 @@ TEST_CASE("track send button changes an existing destination in place", "[timeli
     CHECK(request.send.gain == Catch::Approx(0.42));
     CHECK_FALSE(rig.view.requestChannelStripOpen);
 }
+
+TEST_CASE("sideways track volume drags do not change the level", "[timelinelayout][gain]") {
+    LayoutRig rig;
+    rig.showEditColumns = true;
+    rig.edit.addMarkerTrack("Markers");
+    const auto id = rig.edit.addTrack("Dialog");
+    rig.edit.track(id)->gain = 0.5;
+    rig.settle();
+    const float top = rig.origin.y + kRulerHeight + kMarkerLaneHeight;
+    const float x = rig.origin.x + 160.0f + 175.0f + 20.0f;
+    const float y = top + 2.0f + 40.0f + 7.0f;
+    rig.tick(x, y, false);
+    rig.tick(x, y, true);
+    rig.tick(x + 30.0f, y, true);
+    CHECK(rig.edit.track(id)->gain == Catch::Approx(0.5));
+    rig.tick(x - 30.0f, y, true);
+    CHECK(rig.edit.track(id)->gain == Catch::Approx(0.5));
+    rig.tick(x - 30.0f, y - 10.0f, true);
+    CHECK(rig.edit.track(id)->gain > 0.5);
+    const double raised = rig.edit.track(id)->gain;
+    rig.tick(x - 30.0f, y - 14.0f, true);
+    CHECK(rig.edit.track(id)->gain > raised);
+    rig.tick(x - 30.0f, y - 14.0f, false);
+}
+
+TEST_CASE("compact track volume ignores sideways dragging", "[timelinelayout][gain]") {
+    LayoutRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    const auto id = rig.edit.addTrack("Dialog");
+    rig.edit.track(id)->gain = 0.5;
+    rig.settle();
+    const float top = rig.origin.y + kRulerHeight + kMarkerLaneHeight;
+    const float x = rig.origin.x + 160.0f;
+    const float y = top + 31.5f;
+    rig.tick(x, y, false);
+    rig.tick(x, y, true);
+    rig.tick(x + 30.0f, y, true);
+    CHECK(rig.edit.track(id)->gain == Catch::Approx(0.5));
+    rig.tick(x + 30.0f, y - 10.0f, true);
+    CHECK(rig.edit.track(id)->gain > 0.5);
+    rig.tick(x + 30.0f, y - 10.0f, false);
+}

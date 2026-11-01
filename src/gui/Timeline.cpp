@@ -728,18 +728,35 @@ float drawTrackGutter(const GutterLayout& g, TimelineViewState& view,
                            controlY + 1.0f), C(pal.textSubtle), gainText);
         ImGui::SetCursorScreenPos(
             ImVec2(origin.x + controlX + controlLabelW, controlY));
-        ImGui::PushItemWidth(sliderW);
-        // The readout lives beside, not on, the grab so centre remains usable.
-        const bool gainDragged =
-            ImGui::SliderFloat("##gain", &gainDb, -60.0f, 6.0f, "");
+        const ImVec2 gainMin = ImGui::GetCursorScreenPos();
+        const float gainHeight = ImGui::GetFrameHeight();
+        ImGui::InvisibleButton("##gain", ImVec2(sliderW, gainHeight));
         const bool gainReset = theme::altClickedReset();
+        const bool active = ImGui::IsItemActive();
+        const bool hovered = ImGui::IsItemHovered();
+        bool gainDragged = false;
+        if (active && !ImGui::GetIO().KeyAlt && ImGui::GetIO().MouseDelta.y != 0.0f) {
+            gainDb = std::clamp(gainDb - ImGui::GetIO().MouseDelta.y * 0.4f,
+                                -60.0f, 6.0f);
+            gainDragged = true;
+        }
         if (gainReset) gainDb = 0.0f;
+        const ImVec2 gainMax(gainMin.x + sliderW, gainMin.y + gainHeight);
+        dl->AddRectFilled(gainMin, gainMax, ImGui::GetColorU32(
+            active ? ImGuiCol_FrameBgActive : hovered ? ImGuiCol_FrameBgHovered
+                                                       : ImGuiCol_FrameBg), 2.0f);
+        const float grabX = gainMin.x + 5.0f +
+            (std::clamp(gainDb, -60.0f, 6.0f) + 60.0f) / 66.0f *
+                std::max(0.0f, sliderW - 10.0f);
+        dl->AddRectFilled(ImVec2(grabX - 4.0f, gainMin.y + 2.0f),
+                          ImVec2(grabX + 4.0f, gainMax.y - 2.0f),
+                          ImGui::GetColorU32(active ? ImGuiCol_SliderGrabActive
+                                                    : ImGuiCol_SliderGrab), 2.0f);
         const double nextGain = std::pow(10.0f, gainDb / 20.0f);
         if ((gainDragged || gainReset) && *f.gain != nextGain) {
             *f.gain = nextGain;
             edit.notifyChanged();
         }
-        ImGui::PopItemWidth();
     }
     controlY += g.compactControlHeight + g.rowGap;
     // Pan: -1=L to +1=R. Option-click resets to center (0.0).
@@ -2942,11 +2959,15 @@ void drawTimeline(const document::Edit& edit,
         ImGui::PushStyleColor(ImGuiCol_Text, theme::hex(0x5bd787ff));
         if (ioY + rowH <= bottom) {
             ImGui::SetCursorScreenPos(ImVec2(x + 175.0f, ioY));
-            ImGui::SetNextItemWidth(80.0f);
             float gainDb = 20.0f * std::log10(
                 std::max(0.0001f, static_cast<float>(mutableTrack.gain)));
-            const bool changed = ImGui::DragFloat("##editGain", &gainDb, 0.4f, -60.0f, 6.0f,
-                                                   "vol %.1f", ImGuiSliderFlags_NoInput);
+            char gainLabel[32];
+            std::snprintf(gainLabel, sizeof(gainLabel), "vol %.1f###editGain", gainDb);
+            ImGui::PushStyleColor(ImGuiCol_Button, theme::hex(0x080a09ff));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, theme::hex(0x16251cff));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, theme::hex(0x1d3425ff));
+            ImGui::Button(gainLabel, ImVec2(80.0f, rowH));
+            ImGui::PopStyleColor(3);
             const bool reset = theme::altClickedReset();
             bool verticalChange = false;
             if (ImGui::IsItemActive() && !ImGui::GetIO().KeyAlt) {
@@ -2964,7 +2985,7 @@ void drawTimeline(const document::Edit& edit,
                 const float knobY = p.y + 100.0f - (gainDb + 60.0f) / 66.0f * 88.0f;
                 overlay->AddRectFilled(ImVec2(p.x + 7.0f, knobY - 4.0f), ImVec2(p.x + 25.0f, knobY + 4.0f), IM_COL32(185, 185, 185, 255), 2.0f);
             }
-            if (changed || reset || verticalChange) {
+            if (reset || verticalChange) {
                 mutableTrack.gain = reset ? 1.0 : std::pow(10.0, gainDb / 20.0);
                 const_cast<document::Edit&>(edit).notifyChanged();
             }

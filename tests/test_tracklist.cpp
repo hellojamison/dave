@@ -43,6 +43,20 @@ struct ListRig : dave::testing::ImGuiRig {
 
 } // namespace
 
+TEST_CASE("edit styling leaves the mixer theme intact", "[theme][edit]") {
+    dave::testing::ImGuiRig rig;
+    const ImVec4 before = gui::theme::palette().surfaceBase;
+    const ImVec4 buttonBefore = ImGui::GetStyle().Colors[ImGuiCol_Button];
+    const float roundingBefore = ImGui::GetStyle().FrameRounding;
+    gui::theme::pushEditTheme();
+    CHECK(gui::theme::palette().surfaceBase.x != before.x);
+    CHECK(ImGui::GetStyle().FrameRounding == 1.0f);
+    gui::theme::popEditTheme();
+    CHECK(gui::theme::palette().surfaceBase.x == before.x);
+    CHECK(ImGui::GetStyle().Colors[ImGuiCol_Button].x == buttonBefore.x);
+    CHECK(ImGui::GetStyle().FrameRounding == roundingBefore);
+}
+
 TEST_CASE("a row is where the row arithmetic says", "[tracklist]") {
     constexpr float top = 100.0f;
     CHECK(gui::trackListRowAt(top + 1.0f, top, 3) == 0);

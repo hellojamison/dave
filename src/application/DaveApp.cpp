@@ -1804,7 +1804,11 @@ void DaveApp::drawUI() {
     const float menuH = 0.0f;
     const float baseX = vp->WorkPos.x;
     const float baseY = vp->WorkPos.y;
-    const float toolbarH = 48.0f;
+    // Keep every existing control reachable when the window narrows. Groups
+    // wrap together rather than disappearing beyond the right edge.
+    const float toolbarH = vp->WorkSize.x < 400.0f ? 150.0f
+                         : vp->WorkSize.x < 750.0f ? 116.0f
+                         : vp->WorkSize.x < 1250.0f ? 82.0f : 48.0f;
     const float splitterSize = 6.0f;
     const float contentY = baseY + menuH + toolbarH;
     const float contentH = vp->WorkSize.y - toolbarH;
@@ -1986,19 +1990,17 @@ void DaveApp::drawUI() {
     }
 #endif // __APPLE__
 
+    gui::theme::pushEditTheme();
     // ─── Transport bar (full width, below menu) ──────────────────────────
     ImGui::SetNextWindowPos(ImVec2(baseX, baseY + menuH), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x, toolbarH), ImGuiCond_Always);
-    // One row of 30 px controls inside a 48 px bar: the 14 px window padding
-    // the panels use would need 58 and ImGui answers that with a scrollbar.
-    // The vertical padding is derived from the two so the row is centred, and
-    // scrollbars are off outright — a fixed-height toolbar has nowhere to
-    // scroll to, so one appearing is always a layout bug rather than a
-    // feature.
+    // Controls use compact rows; the bar reserves room for wrapping above.
     const float kToolbarControlH = 30.0f;
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, pal.toolbarSurface);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 1.0f);
     ImGui::PushStyleVar(
         ImGuiStyleVar_WindowPadding,
-        ImVec2(14.0f, std::max(0.0f, (toolbarH - kToolbarControlH) * 0.5f)));
+        ImVec2(6.0f, 6.0f));
     ImGui::Begin("Transport", nullptr,
                  panelFlags | ImGuiWindowFlags_NoScrollbar |
                      ImGuiWindowFlags_NoScrollWithMouse);
@@ -2006,12 +2008,13 @@ void DaveApp::drawUI() {
     {
         const float controlH = kToolbarControlH;
         const bool compactToolbar = vp->WorkSize.x < 1050.0f;
+        const bool narrowToolbar = vp->WorkSize.x < 400.0f;
         // Every framed control derives its height from FramePadding, so one
         // value here makes buttons, combos and the checkbox agree instead of
         // each settling at whatever its own content implies.
         ImGui::PushStyleVar(
             ImGuiStyleVar_FramePadding,
-            ImVec2(10.0f,
+            ImVec2(narrowToolbar ? 5.0f : 10.0f,
                    std::max(0.0f, (controlH - ImGui::GetFontSize()) * 0.5f)));
         // Two gaps, used consistently: tight between a label and the control
         // it names, wider between separate controls.
@@ -2025,7 +2028,13 @@ void DaveApp::drawUI() {
             ImGui::TextColored(pal.textMuted, "%s", text);
             ImGui::SameLine(0.0f, kLabelGap);
         };
-        auto groupSeparator = [&] {
+        auto groupSeparator = [&](float nextGroupWidth) {
+            if (ImGui::GetItemRectMax().x + groupGap * 2.0f +
+                    nextGroupWidth > baseX + vp->WorkSize.x - 6.0f) {
+                ImGui::SetCursorScreenPos(
+                    ImVec2(baseX + 6.0f, ImGui::GetItemRectMax().y + 4.0f));
+                return;
+            }
             ImGui::SameLine(0.0f, groupGap);
             const ImVec2 lineTop = ImGui::GetCursorScreenPos();
             ImGui::Dummy(ImVec2(1.0f, controlH));
@@ -2034,127 +2043,6 @@ void DaveApp::drawUI() {
                 ImGui::GetColorU32(pal.borderStrong));
             ImGui::SameLine(0.0f, groupGap);
         };
-
-        const bool wasRecording = recordingActive();
-        if (gui::theme::iconButton(
-                "##transportRecord", gui::theme::TransportIcon::Record,
-                wasRecording ? "Stop recording (Cmd/Ctrl+R)"
-                             : "Record and roll (Cmd/Ctrl+R)",
-                ImVec2(controlH, controlH),
-                wasRecording ? gui::theme::ButtonVariant::Danger
-                             : gui::theme::ButtonVariant::Normal)) {
-            toggleRecording();
-        }
-
-        // Right-click the record button for its settings. A separate toolbar
-        // button would cost width the row does not have, and the naming
-        // pattern is the only thing here to configure.
-        // Right-click still reaches the take-naming setting, but Preferences
-        // owns it now — two editors for one value is how they drift apart.
-        if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
-            showPreferences_ = true;
-            preferencesJustOpened_ = true;
-        }
-        if (ImGui::IsItemHovered() && !recordingActive()) {
-            ImGui::SetTooltip("Record and roll (Cmd/Ctrl+R)\n"
-                              "Right-click for take file names");
-        }
-
-        ImGui::SameLine(0.0f, kGap);
-        const bool wasPlaying = transport.isPlaying();
-        if (gui::theme::iconButton(
-                "##transportPlay",
-                wasPlaying ? gui::theme::TransportIcon::Stop
-                           : gui::theme::TransportIcon::Play,
-                wasPlaying ? "Stop (Space)" : "Play (Space)",
-                ImVec2(controlH, controlH),
-                wasPlaying ? gui::theme::ButtonVariant::Primary
-                           : gui::theme::ButtonVariant::Normal)) {
-            togglePlayback();
-        }
-
-        ImGui::SameLine(0.0f, kGap);
-        if (gui::theme::iconButton(
-                "##transportRewind", gui::theme::TransportIcon::ReturnToStart,
-                "Stop and return to start (Return)", ImVec2(controlH, controlH))) {
-            transport.stop();
-            transport.seek(0);
-        }
-
-        ImGui::SameLine(0.0f, kGap);
-        {
-            int64_t loopLo = 0, loopHi = 0;
-            const bool haveRange = loopRange(loopLo, loopHi);
-            // Loop covers recording too: with a track armed, every pass
-            // through the range lands a new take on top of the last.
-            const char* loopTip = haveRange
-                ? "Loop over the selection (L) — record for a take per pass"
-                : "Loop (L) — select a range, or add a loop marker, "
-                  "to give it something to loop";
-            if (gui::theme::iconButton(
-                    "##transportLoop", gui::theme::TransportIcon::Loop,
-                    loopTip, ImVec2(controlH, controlH),
-                    loopEnabled_ ? gui::theme::ButtonVariant::Primary
-                                 : gui::theme::ButtonVariant::Normal)) {
-                loopEnabled_ = !loopEnabled_;
-                syncTransportLoop();
-            }
-        }
-        ImGui::SameLine(0.0f, kGap);
-        if (gui::theme::iconButton(
-                "##metronome", gui::theme::TransportIcon::Metronome,
-                "Metronome — a click on every beat while playing",
-                ImVec2(controlH, controlH),
-                metronomeEnabled_ ? gui::theme::ButtonVariant::Primary
-                                  : gui::theme::ButtonVariant::Normal)) {
-            metronomeEnabled_ = !metronomeEnabled_;
-        }
-        // Right-click: the click's settings. Left toggles, right configures,
-        // so the common gesture stays one click.
-        if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
-            ImGui::OpenPopup("##metronomeopts");
-        }
-        if (ImGui::BeginPopup("##metronomeopts")) {
-            ImGui::TextDisabled("Metronome");
-            ImGui::SetNextItemWidth(150.0f);
-            ImGui::SliderInt("##metrodb", &editorPreferences_.metronomeGainDb,
-                             -60, 6, "%d dB");
-            if (gui::theme::altClickedReset()) {
-                editorPreferences_.metronomeGainDb = -6;
-                saveEditorPreferences();
-            }
-            if (ImGui::IsItemDeactivatedAfterEdit()) saveEditorPreferences();
-            // Sound: three synthesised clicks, no sample files to manage.
-            const char* sounds[] = {"Beep", "Wood", "Click"};
-            ImGui::SetNextItemWidth(150.0f);
-            if (ImGui::Combo("##metrosound", &editorPreferences_.metronomeSound,
-                             sounds, 3)) {
-                saveEditorPreferences();
-            }
-            ImGui::Separator();
-            if (ImGui::Checkbox("Accent downbeat",
-                                &editorPreferences_.metronomeAccent)) {
-                saveEditorPreferences();
-            }
-            if (editorPreferences_.metronomeAccent) {
-                ImGui::SetNextItemWidth(150.0f);
-                ImGui::SliderInt("##metroaccent",
-                                 &editorPreferences_.metronomeAccentDb, 0, 12,
-                                 "accent +%d dB");
-                if (ImGui::IsItemDeactivatedAfterEdit()) saveEditorPreferences();
-            }
-            if (ImGui::Checkbox("Eighth-note subdivision",
-                                &editorPreferences_.metronomeEighths)) {
-                saveEditorPreferences();
-            }
-            ImGui::Separator();
-            if (ImGui::Checkbox("Only while recording",
-                                &editorPreferences_.metronomeOnlyWhenRecording)) {
-                saveEditorPreferences();
-            }
-            ImGui::EndPopup();
-        }
-        groupSeparator();
 
         // Position readout — double-click to edit (type a timecode to seek).
         int64_t pos = transport.position();
@@ -2172,6 +2060,10 @@ void DaveApp::drawUI() {
             const ImVec2 counterMin = ImGui::GetCursorScreenPos();
             ImGui::InvisibleButton("##positionCounter",
                                    ImVec2(counterW, controlH));
+            ImGui::GetWindowDrawList()->AddRectFilled(
+                counterMin, ImVec2(counterMin.x + counterW,
+                                   counterMin.y + controlH),
+                IM_COL32(8, 10, 9, 255));
             ImFont* counterFont = gui::theme::fonts().monoLarge != nullptr
                 ? gui::theme::fonts().monoLarge : ImGui::GetFont();
             constexpr float counterFontSize = 20.0f;
@@ -2187,7 +2079,7 @@ void DaveApp::drawUI() {
                 counterFont, counterFontSize,
                 ImVec2(counterMin.x + (counterW - textSize.x) * 0.5f,
                        counterMin.y + (controlH - textSize.y) * 0.5f),
-                ImGui::GetColorU32(pal.accent), tcStr.c_str());
+                IM_COL32(91, 215, 135, 255), tcStr.c_str());
             ImGui::GetWindowDrawList()->PopClipRect();
             if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
                 view_.editingPosition = true;
@@ -2367,7 +2259,7 @@ void DaveApp::drawUI() {
             }
             ImGui::EndPopup();
         }
-        groupSeparator();
+        groupSeparator(compactToolbar ? 190.0f : 235.0f);
 
         // Editable selection start/end — smaller than the main counter. Each
         // field mirrors the selection until you focus it, then parses on blur.
@@ -2411,8 +2303,129 @@ void DaveApp::drawUI() {
             view_.selectionStart = selS;
             view_.selectionEnd = selE;
             if (selE > selS) view_.hasSelection = true;
-            groupSeparator();
+            groupSeparator(190.0f);
         }
+
+        const bool wasRecording = recordingActive();
+        if (gui::theme::iconButton(
+                "##transportRecord", gui::theme::TransportIcon::Record,
+                wasRecording ? "Stop recording (Cmd/Ctrl+R)"
+                             : "Record and roll (Cmd/Ctrl+R)",
+                ImVec2(controlH, controlH),
+                wasRecording ? gui::theme::ButtonVariant::Danger
+                             : gui::theme::ButtonVariant::Normal)) {
+            toggleRecording();
+        }
+
+        // Right-click the record button for its settings. A separate toolbar
+        // button would cost width the row does not have, and the naming
+        // pattern is the only thing here to configure.
+        // Right-click still reaches the take-naming setting, but Preferences
+        // owns it now — two editors for one value is how they drift apart.
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+            showPreferences_ = true;
+            preferencesJustOpened_ = true;
+        }
+        if (ImGui::IsItemHovered() && !recordingActive()) {
+            ImGui::SetTooltip("Record and roll (Cmd/Ctrl+R)\n"
+                              "Right-click for take file names");
+        }
+
+        ImGui::SameLine(0.0f, kGap);
+        const bool wasPlaying = transport.isPlaying();
+        if (gui::theme::iconButton(
+                "##transportPlay",
+                wasPlaying ? gui::theme::TransportIcon::Stop
+                           : gui::theme::TransportIcon::Play,
+                wasPlaying ? "Stop (Space)" : "Play (Space)",
+                ImVec2(controlH, controlH),
+                wasPlaying ? gui::theme::ButtonVariant::Primary
+                           : gui::theme::ButtonVariant::Normal)) {
+            togglePlayback();
+        }
+
+        ImGui::SameLine(0.0f, kGap);
+        if (gui::theme::iconButton(
+                "##transportRewind", gui::theme::TransportIcon::ReturnToStart,
+                "Stop and return to start (Return)", ImVec2(controlH, controlH))) {
+            transport.stop();
+            transport.seek(0);
+        }
+
+        ImGui::SameLine(0.0f, kGap);
+        {
+            int64_t loopLo = 0, loopHi = 0;
+            const bool haveRange = loopRange(loopLo, loopHi);
+            // Loop covers recording too: with a track armed, every pass
+            // through the range lands a new take on top of the last.
+            const char* loopTip = haveRange
+                ? "Loop over the selection (L) — record for a take per pass"
+                : "Loop (L) — select a range, or add a loop marker, "
+                  "to give it something to loop";
+            if (gui::theme::iconButton(
+                    "##transportLoop", gui::theme::TransportIcon::Loop,
+                    loopTip, ImVec2(controlH, controlH),
+                    loopEnabled_ ? gui::theme::ButtonVariant::Primary
+                                 : gui::theme::ButtonVariant::Normal)) {
+                loopEnabled_ = !loopEnabled_;
+                syncTransportLoop();
+            }
+        }
+        ImGui::SameLine(0.0f, kGap);
+        if (gui::theme::iconButton(
+                "##metronome", gui::theme::TransportIcon::Metronome,
+                "Metronome — a click on every beat while playing",
+                ImVec2(controlH, controlH),
+                metronomeEnabled_ ? gui::theme::ButtonVariant::Primary
+                                  : gui::theme::ButtonVariant::Normal)) {
+            metronomeEnabled_ = !metronomeEnabled_;
+        }
+        // Right-click: the click's settings. Left toggles, right configures,
+        // so the common gesture stays one click.
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+            ImGui::OpenPopup("##metronomeopts");
+        }
+        if (ImGui::BeginPopup("##metronomeopts")) {
+            ImGui::TextDisabled("Metronome");
+            ImGui::SetNextItemWidth(150.0f);
+            ImGui::SliderInt("##metrodb", &editorPreferences_.metronomeGainDb,
+                             -60, 6, "%d dB");
+            if (gui::theme::altClickedReset()) {
+                editorPreferences_.metronomeGainDb = -6;
+                saveEditorPreferences();
+            }
+            if (ImGui::IsItemDeactivatedAfterEdit()) saveEditorPreferences();
+            // Sound: three synthesised clicks, no sample files to manage.
+            const char* sounds[] = {"Beep", "Wood", "Click"};
+            ImGui::SetNextItemWidth(150.0f);
+            if (ImGui::Combo("##metrosound", &editorPreferences_.metronomeSound,
+                             sounds, 3)) {
+                saveEditorPreferences();
+            }
+            ImGui::Separator();
+            if (ImGui::Checkbox("Accent downbeat",
+                                &editorPreferences_.metronomeAccent)) {
+                saveEditorPreferences();
+            }
+            if (editorPreferences_.metronomeAccent) {
+                ImGui::SetNextItemWidth(150.0f);
+                ImGui::SliderInt("##metroaccent",
+                                 &editorPreferences_.metronomeAccentDb, 0, 12,
+                                 "accent +%d dB");
+                if (ImGui::IsItemDeactivatedAfterEdit()) saveEditorPreferences();
+            }
+            if (ImGui::Checkbox("Eighth-note subdivision",
+                                &editorPreferences_.metronomeEighths)) {
+                saveEditorPreferences();
+            }
+            ImGui::Separator();
+            if (ImGui::Checkbox("Only while recording",
+                                &editorPreferences_.metronomeOnlyWhenRecording)) {
+                saveEditorPreferences();
+            }
+            ImGui::EndPopup();
+        }
+        groupSeparator(60.0f);
 
         // Pre-roll / post-roll. The button tints when either is on; it opens a
         // popup for the toggles and lengths. Pre-roll rewinds before playback
@@ -2501,7 +2514,7 @@ void DaveApp::drawUI() {
                 }
                 ImGui::EndPopup();
             }
-            groupSeparator();
+            groupSeparator(narrowToolbar ? 280.0f : compactToolbar ? 340.0f : 390.0f);
         }
 
         // No +Track here: the timeline carries a + above its topmost row,
@@ -2587,7 +2600,7 @@ void DaveApp::drawUI() {
             } else {
                 labelFor(target, preview, sizeof(preview));
             }
-            ImGui::SetNextItemWidth(compactToolbar ? 80.0f : 98.0f);
+            ImGui::SetNextItemWidth(narrowToolbar ? 55.0f : compactToolbar ? 80.0f : 98.0f);
             // Selecting "Custom\u2026" only records the intent: the combo closes
             // on any selection, so its popup can't be opened from inside it —
             // OpenPopup and BeginPopup have to sit at this level, after the
@@ -2751,6 +2764,8 @@ void DaveApp::drawUI() {
         ImGui::PopStyleVar();   // FramePadding
     }
     ImGui::End();
+    ImGui::PopStyleVar(); // FrameRounding
+    ImGui::PopStyleColor(); // WindowBg
 
     // ─── Side rails ──────────────────────────────────────────────────────
     // Always present, whatever is open. A panel that can be closed needs a
@@ -2826,11 +2841,13 @@ void DaveApp::drawUI() {
     if (showTrackList_) {
         ImGui::SetNextWindowPos(ImVec2(baseX, contentY), ImGuiCond_Always);
         ImGui::SetNextWindowSize(ImVec2(leftPanelW, contentH), ImGuiCond_Always);
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, gui::theme::hex(0x272727ff));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(5.0f, 3.0f));
         ImGui::Begin("Tracks", nullptr, panelFlags);
-        // No header: the rail eye is the only control this panel needs, and the
-        // list itself says how many tracks are hidden.
         gui::drawTrackList(edit_, view_);
         ImGui::End();
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
 
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
@@ -2883,10 +2900,11 @@ void DaveApp::drawUI() {
     // NoScrollWithMouse: the timeline handles the wheel itself (vertical scroll,
     // Shift for horizontal, Ctrl/Cmd for zoom), so ImGui must not also
     // auto-scroll the window and double it. The scrollbar stays draggable.
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, pal.workspaceBackground);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::Begin("Timeline", nullptr,
                  panelFlags | ImGuiWindowFlags_NoScrollWithMouse |
                      ImGuiWindowFlags_NoScrollbar);
-    gui::theme::panelHeader("Timeline");
     // Taller windows can afford more waveform detail; the gutter itself
     // computes a content minimum so both values remain overlap-safe.
     // PTXExtractor's playlist lane height. drawTimeline raises this if the
@@ -2912,6 +2930,9 @@ void DaveApp::drawUI() {
         navigateTimeline(direction, extend);
     }
     ImGui::End();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+    gui::theme::popEditTheme();
 
     // ─── Mixer (bottom of the timeline column) ───────────────────────────
     if (showMixer_) {
@@ -2977,6 +2998,7 @@ void DaveApp::drawUI() {
     // at it without a second gesture.
     syncTransportLoop();
 
+    gui::theme::pushEditTheme();
     // Picture stays above the plugin chain because sync-to-picture is the
     // primary post-production task — unless it has been popped out or never
     // imported, in which case the sidebar slot disappears entirely rather
@@ -3004,11 +3026,9 @@ void DaveApp::drawUI() {
                                : sidebarContentY),
             ImGuiCond_Always);
         ImGui::SetNextWindowSize(ImVec2(sidebarW, pluginsH), ImGuiCond_Always);
-        // No scrollbar: the strip sizes its fader to fit, so it must never
-        // scroll — a scrolling channel strip hides the fader or the output.
-        ImGui::Begin("Channel Strip", nullptr,
-                     panelFlags | ImGuiWindowFlags_NoScrollbar |
-                         ImGuiWindowFlags_NoScrollWithMouse);
+        // The fader shrinks first. At very short window heights, allow the
+        // remaining controls to scroll rather than clipping the output.
+        ImGui::Begin("Channel Strip", nullptr, panelFlags);
         // No panel header: the strip's own coloured header already names the
         // track, and a second title above it said only what the panel is —
         // which the E button that opened it had just answered. Closing is the
@@ -3020,6 +3040,7 @@ void DaveApp::drawUI() {
                               &builder_.meterTaps(), &view_.meterOptions);
         ImGui::End();
     }
+    gui::theme::popEditTheme();
 
     const ImGuiWindowFlags splitterFlags =
         panelFlags | ImGuiWindowFlags_NoBackground |

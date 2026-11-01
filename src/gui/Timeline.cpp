@@ -480,6 +480,14 @@ float drawTrackGutter(const GutterLayout& g, TimelineViewState& view,
         } else {
             ImFont* nameFont = theme::fonts().label != nullptr
                 ? theme::fonts().label : ImGui::GetFont();
+            if (selected) {
+                dl->AddRectFilled(
+                    ImVec2(origin.x + kGutterContentX - 2.0f, y + g.rowPadding - 1.0f),
+                    ImVec2(origin.x + g.gutterWidth -
+                               (f.recordArm != nullptr ? 110.0f : 86.0f),
+                           y + g.rowPadding + g.headerHeight + 1.0f),
+                    IM_COL32(205, 220, 222, 255));
+            }
             dl->PushClipRect(
                 ImVec2(origin.x + kGutterContentX, y),
                 ImVec2(origin.x + g.gutterWidth -
@@ -488,7 +496,8 @@ float drawTrackGutter(const GutterLayout& g, TimelineViewState& view,
                 true);
             dl->AddText(nameFont, g.labelHeight,
                         ImVec2(origin.x + kGutterContentX, y + g.rowPadding),
-                        C(pal.text), f.name->c_str());
+                        selected ? IM_COL32(24, 28, 29, 255) : C(pal.text),
+                        f.name->c_str());
             dl->PopClipRect();
         }
         const bool overName = g.gutterHovered &&
@@ -2798,13 +2807,9 @@ void drawTimeline(const document::Edit& edit,
 
         bool selected = view.selectedTrackIndex == static_cast<int>(ti) ||
                         view.selectedTrackIds.count(track.id) > 0;
-        // Header and lane get different surfaces rather than one fill across
-        // the row. The lane is the darkest surface in the app so clips and
-        // waveforms read as content sitting in a well, with the header column
-        // stepping lighter as chrome above it — the arrangement PTXExtractor
-        // uses. Alternating lane shading keeps adjacent tracks separable when
-        // several are empty.
-        const ImVec4 headerBg = selected ? pal.trackSelected : pal.trackHeaderSurface;
+        // Selection is marked on the track name, leaving the lane neutral so
+        // clip and time selections remain easy to distinguish.
+        const ImVec4 headerBg = pal.trackHeaderSurface;
         const ImVec4 laneBg = ti % 2 == 0 ? pal.trackLaneSurface : pal.trackLaneAlt;
         dl->AddRectFilled(
             ImVec2(origin.x, y),
@@ -2812,16 +2817,6 @@ void drawTimeline(const document::Edit& edit,
         dl->AddRectFilled(
             ImVec2(origin.x + gutterWidth, y),
             ImVec2(origin.x + totalWidth, y + rowH), C(laneBg));
-        // Selection reads on the lane too, or selecting a track would only
-        // highlight the narrow header and be easy to miss at a glance.
-        if (selected) {
-            dl->AddRectFilled(
-                ImVec2(origin.x + gutterWidth, y),
-                ImVec2(origin.x + totalWidth, y + rowH),
-                IM_COL32(static_cast<int>(pal.accent.x * 255),
-                         static_cast<int>(pal.accent.y * 255),
-                         static_cast<int>(pal.accent.z * 255), 18));
-        }
         drawLaneGrid(y, rowH);
         // Track separator.
         dl->AddLine(ImVec2(origin.x, y + rowH),

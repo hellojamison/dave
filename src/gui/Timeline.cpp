@@ -2860,11 +2860,58 @@ void drawTimeline(const document::Edit& edit,
             ImGui::PushID(send.id.c_str());
             ImGui::SetCursorScreenPos(ImVec2(x + 89.0f, y));
             const auto name = routeTargetLabel(edit, send.target, playbackChannels);
-            if (ImGui::Button(name.c_str(), ImVec2(80.0f, rowH))) {
+            const float sendDb = send.gain <= 0.0001 ? -60.0f
+                : 20.0f * std::log10(static_cast<float>(send.gain));
+            char levelText[16];
+            if (send.gain <= 0.0001) std::snprintf(levelText, sizeof(levelText), "-inf");
+            else std::snprintf(levelText, sizeof(levelText), "%.1f", sendDb);
+            if (ImGui::Button("##sendLevel", ImVec2(80.0f, rowH))) {
                 ImGui::OpenPopup("##editRetargetSend");
             }
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Change send destination: %s", name.c_str());
+            const ImVec2 sendMin = ImGui::GetItemRectMin();
+            const ImVec2 sendMax = ImGui::GetItemRectMax();
+            const float levelWidth = ImGui::CalcTextSize(levelText).x;
+            const float textY = sendMin.y + (rowH - ImGui::GetFontSize()) * 0.5f;
+            const ImU32 sendTextColor = ImGui::GetColorU32(send.muted ? pal.textMuted : pal.text);
+            dl->PushClipRect(ImVec2(sendMin.x + 3.0f, sendMin.y),
+                             ImVec2(sendMax.x - levelWidth - 7.0f, sendMax.y), true);
+            dl->AddText(ImVec2(sendMin.x + 3.0f, textY), sendTextColor, name.c_str());
+            dl->PopClipRect();
+            dl->AddText(ImVec2(sendMax.x - levelWidth - 3.0f, textY),
+                        sendTextColor, levelText);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Send %s: %s dB", name.c_str(), levelText);
             if (ImGui::BeginPopup("##editRetargetSend")) {
+                float db = sendDb;
+                ImGui::SetNextItemWidth(150.0f);
+                if (ImGui::SliderFloat("Level", &db, -60.0f, 6.0f, "%.1f dB")) {
+                    RoutingRequest request;
+                    request.kind = RoutingRequest::Kind::UpdateSend;
+                    request.ownerId = track.id;
+                    request.send = send;
+                    request.send.gain = db <= -59.9f ? 0.0 : std::pow(10.0, db / 20.0);
+                    view.routing.request(std::move(request));
+                }
+                bool muted = send.muted;
+                if (ImGui::Checkbox("Mute", &muted)) {
+                    RoutingRequest request;
+                    request.kind = RoutingRequest::Kind::UpdateSend;
+                    request.ownerId = track.id;
+                    request.send = send;
+                    request.send.muted = muted;
+                    view.routing.request(std::move(request));
+                }
+                ImGui::SameLine();
+                bool preFader = document::sendIsPreFader(track, send.id);
+                if (ImGui::Checkbox("Pre-fader", &preFader)) {
+                    RoutingRequest request;
+                    request.kind = RoutingRequest::Kind::SetSendPreFader;
+                    request.ownerId = track.id;
+                    request.send.id = send.id;
+                    request.enabled = preFader;
+                    view.routing.request(std::move(request));
+                }
+                ImGui::Separator();
+                ImGui::TextDisabled("Destination");
                 const auto options = routingTargetOptions(edit, track.id, playbackChannels, true);
                 for (size_t i = 0; i < options.size(); ++i) {
                     const auto& option = options[i];

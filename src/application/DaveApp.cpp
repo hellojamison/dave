@@ -4312,7 +4312,8 @@ void DaveApp::serviceViewRequests() {
         using Kind = gui::RoutingRequest::Kind;
         const bool topologyChange = request.kind == Kind::SetHardwareInput ||
             request.kind == Kind::SetMainOutput || request.kind == Kind::AddSend ||
-            request.kind == Kind::UpdateSend || request.kind == Kind::RemoveSend ||
+            request.kind == Kind::UpdateSend || request.kind == Kind::SetSendPreFader ||
+            request.kind == Kind::RemoveSend ||
             request.kind == Kind::AddBus || request.kind == Kind::RemoveBus ||
             request.kind == Kind::AddOutput || request.kind == Kind::RemoveOutput ||
             request.kind == Kind::AddBusAndSend ||
@@ -4337,6 +4338,20 @@ void DaveApp::serviceViewRequests() {
             case Kind::UpdateSend:
                 undo_.execute(std::make_unique<editing::UpdateSendCommand>(
                     request.ownerId, request.send)); break;
+            case Kind::SetSendPreFader: {
+                const auto* track = edit_.track(request.ownerId);
+                if (!track || document::sendIsPreFader(*track, request.send.id) == request.enabled) break;
+                const auto send = std::find_if(track->chain.begin(), track->chain.end(),
+                    [&](const auto& slot) { return slot.kind == document::ChainSlot::Kind::Send && slot.id == request.send.id; });
+                const auto fader = std::find_if(track->chain.begin(), track->chain.end(),
+                    [](const auto& slot) { return slot.kind == document::ChainSlot::Kind::Fader; });
+                if (send != track->chain.end() && fader != track->chain.end()) {
+                    undo_.execute(std::make_unique<editing::MoveChainSlotCommand>(
+                        request.ownerId, static_cast<size_t>(send - track->chain.begin()),
+                        static_cast<size_t>(fader - track->chain.begin())));
+                }
+                break;
+            }
             case Kind::RemoveSend:
                 undo_.execute(std::make_unique<editing::RemoveSendCommand>(
                     request.ownerId, request.send.id)); break;

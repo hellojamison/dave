@@ -2136,7 +2136,7 @@ TEST_CASE("track send button changes an existing destination in place", "[timeli
     const ImVec2 popup = stack[0].Window->Pos;
     const float row = ImGui::GetTextLineHeightWithSpacing();
     rig.clickTimelineAt(popup.x + 20.0f,
-                        popup.y + ImGui::GetStyle().WindowPadding.y + 2.5f * row);
+                        popup.y + ImGui::GetStyle().WindowPadding.y + 5.5f * row + 4.0f);
     REQUIRE(rig.view.routing.requests().size() == 1);
     const auto& request = rig.view.routing.requests().front();
     CHECK(request.kind == gui::RoutingRequest::Kind::UpdateSend);
@@ -2187,4 +2187,59 @@ TEST_CASE("compact track volume ignores sideways dragging", "[timelinelayout][ga
     rig.tick(x + 30.0f, y - 10.0f, true);
     CHECK(rig.edit.track(id)->gain > 0.5);
     rig.tick(x + 30.0f, y - 10.0f, false);
+}
+
+TEST_CASE("track send menu controls level mute and pre-fader", "[timelinelayout][sends]") {
+    LayoutRig rig;
+    rig.showEditColumns = true;
+    rig.edit.addMarkerTrack("Markers");
+    const auto track = rig.edit.addTrack("Dialogue");
+    document::AuxSend send;
+    send.target = document::RouteTarget::bus();
+    send.gain = 1.0;
+    send.muted = false;
+    const auto sendId = rig.edit.addSend(track, send);
+    REQUIRE_FALSE(sendId.empty());
+    rig.settle();
+    const float top = rig.origin.y + kRulerHeight + kMarkerLaneHeight;
+    const float x = rig.origin.x + 160.0f + 89.0f + 20.0f;
+    rig.clickTimelineAt(x, top + 10.0f);
+    auto& stack = ImGui::GetCurrentContext()->OpenPopupStack;
+    REQUIRE(stack.Size == 1);
+    REQUIRE(stack[0].Window != nullptr);
+    REQUIRE(rig.view.routing.requests().empty());
+    const ImVec2 popup = stack[0].Window->Pos;
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float row = ImGui::GetTextLineHeightWithSpacing();
+    const float controlY = popup.y + style.WindowPadding.y + row + row * 0.5f;
+    SECTION("mute") {
+        rig.clickTimelineAt(popup.x + style.WindowPadding.x + 7.0f, controlY);
+        REQUIRE(rig.view.routing.requests().size() == 1);
+        const auto& request = rig.view.routing.requests().back();
+        CHECK(request.kind == gui::RoutingRequest::Kind::UpdateSend);
+        CHECK(request.send.id == sendId);
+        CHECK(request.send.muted);
+    }
+    SECTION("pre-fader") {
+        const float preX = popup.x + style.WindowPadding.x +
+            ImGui::GetFrameHeight() + style.ItemInnerSpacing.x +
+            ImGui::CalcTextSize("Mute").x + style.ItemSpacing.x + 7.0f;
+        rig.clickTimelineAt(preX, controlY);
+        REQUIRE(rig.view.routing.requests().size() == 1);
+        const auto& request = rig.view.routing.requests().back();
+        CHECK(request.kind == gui::RoutingRequest::Kind::SetSendPreFader);
+        CHECK(request.ownerId == track);
+        CHECK(request.send.id == sendId);
+        CHECK(request.enabled);
+    }
+    SECTION("level") {
+        rig.clickTimelineAt(popup.x + style.WindowPadding.x + 40.0f,
+                            popup.y + style.WindowPadding.y + row * 0.5f);
+        REQUIRE_FALSE(rig.view.routing.requests().empty());
+        const auto& request = rig.view.routing.requests().back();
+        CHECK(request.kind == gui::RoutingRequest::Kind::UpdateSend);
+        CHECK(request.send.id == sendId);
+        CHECK(request.send.gain < 1.0);
+    }
+    CHECK_FALSE(rig.view.requestChannelStripOpen);
 }

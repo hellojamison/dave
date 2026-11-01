@@ -26,6 +26,7 @@ struct RoutingRequest {
         SetMainOutput,
         AddSend,
         UpdateSend,
+        SetSendPreFader,
         RemoveSend,
         AddBus,
         RemoveBus,

@@ -2323,6 +2323,7 @@ void DaveApp::drawUI() {
                                            &edit_.tempoMap());
             };
             const float selFieldW = compactToolbar ? 74.0f : 92.0f;
+            bool selectionEdited = false;
             auto timeField = [&](const char* id, char* buf, bool& editing,
                                  bool& focusPending, int64_t& value) {
                 const ImVec2 fieldOrigin = ImGui::GetCursorScreenPos();
@@ -2365,7 +2366,10 @@ void DaveApp::drawUI() {
                         const int64_t parsed = gui::parseTimecodeToSamples(
                             buf, view_.tcMode, selSr, 24.0, &edit_.tempoMap(),
                             &edit_.meterMap());
-                        if (parsed >= 0) value = parsed;
+                        if (parsed >= 0 && parsed != value) {
+                            value = parsed;
+                            selectionEdited = true;
+                        }
                         editing = false;
                     } else if (escaped) {
                         editing = false;
@@ -2411,9 +2415,15 @@ void DaveApp::drawUI() {
                 timeField("##selEnd", view_.selEndInput, view_.editingSelEnd,
                           view_.selEndFocusPending, selE);
             }
-            view_.selectionStart = selS;
-            view_.selectionEnd = selE;
-            if (selE > selS) view_.hasSelection = true;
+            // Reading the sorted values must not rewrite a backwards drag:
+            // the timeline retains its anchor and focus until editing commits.
+            if (selectionEdited) {
+                view_.selectionStart = selS;
+                view_.selectionEnd = selE;
+                view_.selectionAnchor = selS;
+                view_.selectionFocus = selE;
+                view_.hasSelection = selS != selE;
+            }
             if (wideToolbar) {
                 // The selection display has two small fields inside the one
                 // row. Resume at its right edge, at the row's original top.

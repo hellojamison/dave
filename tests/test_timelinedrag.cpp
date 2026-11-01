@@ -824,3 +824,47 @@ TEST_CASE("a file dropped off the lanes resolves to a new track",
     REQUIRE(rig.view.resolvedFileDrops.size() == 1);
     CHECK(rig.view.resolvedFileDrops.front().trackId.empty());
 }
+
+TEST_CASE("shift-click before playhead keeps the backwards selection", "[timelinedrag][selection]") {
+    TimelineRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    rig.edit.addTrack("Audio");
+    rig.tick(-100.0f, -100.0f, false);
+    rig.transport.seek(200000);
+    REQUIRE(rig.committedPosition() == 200000);
+    const float x = rig.xOfSample(96000);
+    const float y = 100.0f;
+    ImGui::GetIO().AddKeyEvent(ImGuiMod_Shift, true);
+    rig.tick(x, y, false);
+    rig.tick(x, y, true);
+    // Emulate a sorted readout touching the endpoints between UI frames:
+    // the gesture's independent anchor must still survive mouse release.
+    if (rig.view.selectionStart > rig.view.selectionEnd)
+        std::swap(rig.view.selectionStart, rig.view.selectionEnd);
+    rig.tick(x, y, false);
+    ImGui::GetIO().AddKeyEvent(ImGuiMod_Shift, false);
+    REQUIRE(rig.view.hasSelection);
+    CHECK(std::min(rig.view.selectionStart, rig.view.selectionEnd) == 96000);
+    CHECK(std::max(rig.view.selectionStart, rig.view.selectionEnd) == 200000);
+    CHECK(rig.committedPosition() == 200000);
+}
+
+TEST_CASE("shift-clicking the ruler before the playhead selects the range", "[timelinedrag][selection]") {
+    TimelineRig rig;
+    rig.edit.addMarkerTrack("Markers");
+    rig.edit.addTrack("Audio");
+    rig.tick(-100.0f, -100.0f, false);
+    rig.transport.seek(200000);
+    REQUIRE(rig.committedPosition() == 200000);
+    const float x = rig.xOfSample(96000);
+    const float y = 20.0f;
+    ImGui::GetIO().AddKeyEvent(ImGuiMod_Shift, true);
+    rig.tick(x, y, false);
+    rig.tick(x, y, true);
+    rig.tick(x, y, false);
+    ImGui::GetIO().AddKeyEvent(ImGuiMod_Shift, false);
+    REQUIRE(rig.view.hasSelection);
+    CHECK(std::min(rig.view.selectionStart, rig.view.selectionEnd) == 96000);
+    CHECK(std::max(rig.view.selectionStart, rig.view.selectionEnd) == 200000);
+    CHECK(rig.committedPosition() == 200000);
+}

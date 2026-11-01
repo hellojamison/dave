@@ -4122,6 +4122,7 @@ void drawTimeline(const document::Edit& edit,
     // a drag that runs off the lane — up onto the ruler, or past the window
     // edge — should keep extending rather than freeze where it left.
     if (view.isSelecting && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        view.selectionStart = view.selectionAnchor;
         view.selectionEnd = selectionSampleAtMouseX();
         view.selectionFocus = view.selectionEnd;
         // Dragging onto other rows widens the selection across them; a
@@ -4133,6 +4134,8 @@ void drawTimeline(const document::Edit& edit,
     }
     // End selection on mouse release.
     if (view.isSelecting && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+        view.selectionStart = view.selectionAnchor;
+        view.selectionEnd = view.selectionFocus;
         view.isSelecting = false;
         // If the selection is tiny (just a click, not a drag), treat as seek +
         // clear selection — unless the selector (command) is held, whose whole

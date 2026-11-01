@@ -66,6 +66,7 @@ public:
     void setTimelineSamplesPerPixel(double samplesPerPixel);
     void configureAutomationScreenshot();
     void configureTransientScreenshot();
+    void configureEditScreenshot();
     void setVideoPoppedOut(bool poppedOut);
 
 private:

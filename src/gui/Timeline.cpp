@@ -204,14 +204,8 @@ std::vector<double> formatLadder(TimecodeMode mode, double sr, double fps,
     return ladder;
 }
 
-// The colour band down the left of every track header. Wide enough to hold a
-// disclosure arrow, so the band is both the track's identity colour and the
-// control that opens it — one target instead of a stripe plus a separate
-// twisty squeezed in beside the name.
-// The colour band takes the outer edge, then the meter, then the controls.
-// The band is the track's identity, so it reads as the row's left border; the
-// meter sits inboard of it, still in its own column so a glance down the
-// gutter still catches every track's level at once.
+// The disclosure hit area also contains the track-colour stripe; the meter
+// and controls retain separate columns.
 constexpr float kBandX = 8.0f;
 constexpr float kBandW = 18.0f;
 constexpr float kMeterX = kBandX + kBandW + 5.0f;           // 31
@@ -1261,18 +1255,18 @@ void drawTimeline(const document::Edit& edit,
         }
 
         const ImVec4 color = trackColorValue(savedColor, fallbackColor);
-        dl->AddRectFilled(bandMin, bandMax, C(color), 3.0f);
+        // Keep the generous click target while drawing a narrow colour stripe
+        // and a separate disclosure mark, as in a compact edit track header.
+        dl->AddRectFilled(bandMin, ImVec2(bandMin.x + 4.0f, bandMax.y), C(color));
         if (hovered) {
-            dl->AddRect(bandMin, bandMax, C(pal.text), 3.0f, 0, 1.5f);
+            dl->AddRect(bandMin, bandMax, C(pal.textMuted), 0.0f, 0, 1.0f);
         }
 
-        // The arrow is punched in the darkest surface rather than the text
-        // colour: the band carries saturated identity colours, and a light
-        // glyph on those reads as a smudge.
-        const ImU32 arrowCol = C(pal.trackLaneSurface);
-        const ImVec2 c((bandMin.x + bandMax.x) * 0.5f,
+        // The disclosure mark sits beside the colour stripe.
+        const ImU32 arrowCol = C(pal.textMuted);
+        const ImVec2 c((bandMin.x + bandMax.x) * 0.5f + 2.0f,
                        (bandMin.y + bandMax.y) * 0.5f);
-        constexpr float kArm = 4.0f;
+        constexpr float kArm = 3.0f;
         if (expanded) {
             dl->AddTriangleFilled(ImVec2(c.x - kArm, c.y - kArm * 0.6f),
                                   ImVec2(c.x + kArm, c.y - kArm * 0.6f),

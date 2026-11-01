@@ -16,6 +16,7 @@ namespace dave::gui::theme {
 namespace {
 
 Palette g_palette;
+Palette g_paletteBeforeEdit;
 Fonts g_fonts;
 
 ImU32 color(const ImVec4& value) {
@@ -72,7 +73,7 @@ Palette makePalette() {
     p.bgElevated        = p.surfaceStrong;
     p.panel             = p.surfaceBase;
     p.accentHover       = p.accentStrong;
-    p.trackSelected     = hex(0x4b514dff);
+    p.trackSelected     = hex(0x34566aff);
 
     // Audio colors retain their separate identities, but their saturation and
     // value are pulled toward the taupe/sage shell.
@@ -94,17 +95,14 @@ Palette makePalette() {
     p.clipMidiBorder    = hex(0x9c88a4ff);
     p.midiNote          = hex(0xe6dce9ff);
 
-    // Timeline surfaces, taken from PTXExtractor's CueConverterTheme so a user
-    // moving between the two apps sees one product. Note lanes are darker than
-    // both the header column and the window behind them: content sits in a
-    // well, chrome sits above it.
-    p.rulerSurface        = hex(0x252422ff);
-    p.trackHeaderSurface  = hex(0x302e2bff);
-    p.trackLaneSurface    = hex(0x201f1dff);
-    p.trackLaneAlt        = hex(0x242220ff);
-    p.workspaceBackground = hex(0x242321ff);
-    p.toolbarSurface      = hex(0x302e2cff);
-    p.inspectorSurface    = hex(0x2c2a28ff);
+    // Neutral Edit-window surfaces. Keep these separate from the mixer palette.
+    p.rulerSurface        = hex(0x303030ff);
+    p.trackHeaderSurface  = hex(0x272727ff);
+    p.trackLaneSurface    = hex(0x505050ff);
+    p.trackLaneAlt        = hex(0x505050ff);
+    p.workspaceBackground = hex(0x222222ff);
+    p.toolbarSurface      = hex(0x242424ff);
+    p.inspectorSurface    = hex(0x292929ff);
 
     p.trackMuteActive      = hex(0xe78a31ff);
     p.trackSoloActive      = hex(0xf0cc3aff);
@@ -302,6 +300,54 @@ void applyTheme() {
     colors[ImGuiCol_NavHighlight] = p.accentStrong;
 }
 
+void pushEditTheme() {
+    g_paletteBeforeEdit = g_palette;
+    auto& p = g_palette;
+    p.backgroundTop = p.backgroundMid = p.backgroundBottom =
+        p.workspaceBackground;
+    p.surfaceBase = p.panel = hex(0x292929ff);
+    p.surfaceSoft = p.bgAlt = hex(0x353535ff);
+    p.surfaceStrong = p.bgElevated = hex(0x444444ff);
+    p.text = hex(0xe0e0e0ff);
+    p.textMuted = hex(0xb4b4b4ff);
+    p.textSubtle = hex(0x929292ff);
+    p.accent = hex(0x42b879ff);
+    p.accentStrong = p.accentHover = hex(0x69d99bff);
+    p.accentDeep = hex(0x257b50ff);
+    p.controlTop = hex(0x5b5b5bff);
+    p.controlBottom = hex(0x393939ff);
+    p.controlHoverTop = hex(0x707070ff);
+    p.controlHoverBottom = hex(0x4b4b4bff);
+    p.controlActiveTop = hex(0x454545ff);
+    p.controlActiveBottom = hex(0x303030ff);
+    p.trackControlInactive = hex(0x252525ff);
+    p.primaryTop = p.primaryHoverTop = hex(0x358eb4ff);
+    p.primaryBottom = p.primaryHoverBottom = hex(0x216989ff);
+    p.primaryActiveTop = hex(0x286e89ff);
+    p.primaryActiveBottom = hex(0x1c526aff);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 1.0f);
+    ImGui::PushStyleColor(ImGuiCol_Text, p.text);
+    ImGui::PushStyleColor(ImGuiCol_TextDisabled, p.textMuted);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, p.surfaceBase);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, p.surfaceBase);
+    ImGui::PushStyleColor(ImGuiCol_PopupBg, p.surfaceStrong);
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, p.controlBottom);
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, p.controlHoverBottom);
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, p.controlActiveBottom);
+    ImGui::PushStyleColor(ImGuiCol_Button, p.controlBottom);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, p.controlHoverBottom);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, p.controlActiveBottom);
+    ImGui::PushStyleColor(ImGuiCol_Header, p.surfaceSoft);
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, p.trackSelected);
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive, p.surfaceStrong);
+}
+
+void popEditTheme() {
+    ImGui::PopStyleColor(14);
+    ImGui::PopStyleVar();
+    g_palette = g_paletteBeforeEdit;
+}
+
 void drawVerticalGradient(ImDrawList* drawList, const Rect& rect,
                           ImU32 topColor, ImU32 bottomColor, float rounding) {
     if (drawList == nullptr || rect.max.x <= rect.min.x || rect.max.y <= rect.min.y) {
@@ -412,7 +458,7 @@ bool gradientButton(const char* label, ImVec2 size, ButtonVariant variant) {
     }
 
     ImDrawList* drawList = ImGui::GetWindowDrawList();
-    constexpr float rounding = 5.0f;  // control radius, matches FrameRounding
+    const float rounding = style.FrameRounding;
     drawVerticalGradient(drawList, rect, color(top), color(bottom), rounding);
     drawList->AddRect(
         rect.min, rect.max,
@@ -472,7 +518,7 @@ bool iconButton(const char* id, TransportIcon icon, const char* tooltip,
     }
 
     ImDrawList* drawList = ImGui::GetWindowDrawList();
-    constexpr float rounding = 5.0f;  // control radius, matches FrameRounding
+    const float rounding = ImGui::GetStyle().FrameRounding;
     drawVerticalGradient(drawList, rect, color(top), color(bottom), rounding);
     drawList->AddRect(
         rect.min, rect.max,

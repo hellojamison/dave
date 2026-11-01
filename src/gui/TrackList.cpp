@@ -82,10 +82,9 @@ void drawTrackList(const document::Edit& edit, TimelineViewState& view) {
     ImFont* small = theme::fonts().small != nullptr ? theme::fonts().small
                                                     : ImGui::GetFont();
     ImGui::PushFont(small);
-    if (hiddenCount > 0) {
-        ImGui::Text("%zu OF %zu HIDDEN", hiddenCount, tracks.size());
-    } else {
-        ImGui::TextUnformatted("ALL VISIBLE");
+    ImGui::TextUnformatted("TRACKS");
+    if (hiddenCount > 0 && ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("%zu of %zu tracks hidden", hiddenCount, tracks.size());
     }
     ImGui::PopFont();
     ImGui::PopStyleColor();

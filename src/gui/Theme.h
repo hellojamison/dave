@@ -129,6 +129,9 @@ inline bool loadDefaultFont(float) { return loadDefaultFont(); }
 // Apply the token layer to stock ImGui widgets. Custom gradients are available
 // through the drawing helpers below.
 void applyTheme();
+// Scope the neutral Edit-window chrome without changing the mixer theme.
+void pushEditTheme();
+void popEditTheme();
 
 struct Rect {
     ImVec2 min;

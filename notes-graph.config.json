@@ -15,6 +15,15 @@
         "vault",
         "notes graph"
       ]
+    },
+    {
+      "id": "edit-window-design",
+      "processRel": "Processes/Edit Window Design.md",
+      "aliases": [
+        "Edit Window Design",
+        "edit window",
+        "timeline"
+      ]
     }
   ],
   "vaultMigrationState": {

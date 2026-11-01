@@ -2085,6 +2085,18 @@ void DaveApp::drawUI() {
                 view_.snapEnabled = false;
             }
         }
+        ImGui::SameLine(0.0f, groupGap);
+        if (ImGui::Button("-##timelineZoomOut", ImVec2(controlH, controlH))) {
+            gui::zoomAroundSample(view_, view_.samplesPerPixel * 2.0,
+                                  transport.position());
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Zoom out horizontally");
+        ImGui::SameLine(0.0f, 2.0f);
+        if (ImGui::Button("+##timelineZoomIn", ImVec2(controlH, controlH))) {
+            gui::zoomAroundSample(view_, view_.samplesPerPixel * 0.5,
+                                  transport.position());
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Zoom in horizontally");
         if (wideToolbar) {
             ImGui::SetCursorScreenPos(ImVec2(baseX + vp->WorkSize.x * 0.26f,
                                             baseY + 6.0f));

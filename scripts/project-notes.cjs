@@ -668,18 +668,8 @@ function createNewNote(args, options = {}) {
   ].join('\n');
   const noteText = `---\n${dumpFrontmatter(frontmatter)}\n---\n\n${replaceOrAppendH2Section(body, 'Graph Links', graphLinks)}\n`;
 
-  const dailyPath = path.join(vaultRoot, `${date}.md`);
-  const runbookText = runbookLinks.length > 0 ? ` and ${runbookLinks.join(', ')}` : '';
-  const processText = processLink ? ` linked to ${appLink}, ${processLink}${runbookText}` : ` linked to ${appLink}`;
-  const dailyText = textWithAppendedLine(
-    dailyPath,
-    dailyInitialText(date, appLink),
-    `- ${time} ${timeZoneName}: Created notes graph ${type} ${linkForRel(noteRel, title)}${processText}. Working: note scaffold prepared. Not verified: implementation outcome is not recorded yet.`
-  );
-  const writes = [
-    { filePath: notePath, content: noteText },
-    { filePath: dailyPath, content: dailyText }
-  ];
+  // A new note is already its own evidence. Do not edit the shared daily log.
+  const writes = [{ filePath: notePath, content: noteText }];
 
   let nextConfig = null;
   if (type === 'process') {
@@ -694,7 +684,7 @@ function createNewNote(args, options = {}) {
   return {
     notePath,
     noteRel,
-    dailyPath,
+    dailyPath: null,
     route: route ? routeToJson(route) : null,
     config: nextConfig
   };
@@ -772,7 +762,10 @@ function closeoutNote(args, options = {}) {
   ].join('\n');
   const nextText = `---\n${dumpFrontmatter(nextFrontmatter)}\n---\n${body.trimEnd()}${closeout}\n`;
 
-  const dailyPath = path.join(vaultRoot, `${date}.md`);
+  // One unique file per closeout avoids concurrent edits to a shared daily log.
+  const slug = String(title).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 60) || 'entry';
+  const dailyPath = path.join(vaultRoot, 'Daily', date,
+                              `${time.replace(':', '')}-${slug}-${randomUUID().slice(0, 8)}.md`);
   const dailyText = textWithAppendedLine(
     dailyPath,
     dailyInitialText(date, appLink),
@@ -804,11 +797,13 @@ function main(argv = process.argv.slice(2), options = {}) {
   if (command === 'new') {
     const result = createNewNote(args, options);
     const configOutput = result.config ? 'Updated notes-graph.config.json\n' : '';
-    return `Created ${result.noteRel}\nUpdated ${noteKeyForRel(path.basename(result.dailyPath))}.md\n${configOutput}`;
+    return `Created ${result.noteRel}\n${configOutput}`;
   }
   if (command === 'closeout') {
     const result = closeoutNote(args, options);
-    return `Closed ${result.noteRel}\nUpdated ${noteKeyForRel(path.basename(result.dailyPath))}.md\n`;
+    const vaultRoot = getVaultRoot({ env: options.env || process.env,
+                                     vaultRoot: options.vaultRoot });
+    return `Closed ${result.noteRel}\nCreated ${path.relative(vaultRoot, result.dailyPath)}\n`;
   }
 }
 

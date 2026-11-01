@@ -227,14 +227,12 @@ private:
     // activity bar works: two panels sharing a column would each get half the
     // width and neither would be usable.
     enum class RightPanel { None, Strip };
-    // The channel strip is the right column's default content: the right
-    // Tracks panel was removed (the left list is the only one needed), and an
-    // empty right column reads as a missing panel rather than a clean layout.
-    RightPanel rightPanel_ = RightPanel::Strip;
+    // Start with the track list visible and the optional strip closed, like
+    // the reference Edit window. Both remain available through their rails.
+    RightPanel rightPanel_ = RightPanel::None;
     bool showChannelStrip_ = false;
-    // The track list on the left. Off by default like the strip: a session
-    // with nothing hidden has nothing to look up.
-    bool showTrackList_ = false;
+    // The track list on the left, including hidden tracks.
+    bool showTrackList_ = true;
     float trackListWidth_ = 260.0f;
     float sidebarWidth_ = 260.0f;
     gui::ChannelStripState channelStrip_;
